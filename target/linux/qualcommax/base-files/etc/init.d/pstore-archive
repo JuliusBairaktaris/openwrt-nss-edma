@@ -1,0 +1,16 @@
+#!/bin/sh /etc/rc.common
+# Archive pstore crash dumps to persistent storage early in boot,
+# then clear pstore so the next crash has free records.
+START=11
+
+boot() {
+	grep -q pstore /proc/filesystems || return 0
+	mkdir -p /sys/fs/pstore
+	mountpoint -q /sys/fs/pstore || mount -t pstore pstore /sys/fs/pstore 2>/dev/null
+	ls /sys/fs/pstore/ 2>/dev/null | grep -q . || return 0
+	local dir="/root/pstore/$(date +%Y%m%d-%H%M%S)"
+	mkdir -p "$dir"
+	cp /sys/fs/pstore/* "$dir/" 2>/dev/null
+	rm -f /sys/fs/pstore/*
+	logger -t pstore-archive "crash dumps archived to $dir"
+}
