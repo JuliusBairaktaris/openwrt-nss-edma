@@ -1,108 +1,126 @@
-![OpenWrt logo](include/logo.png)
+# OpenWrt with NSS offload on the upstream EDMA stack
 
-OpenWrt Project is a Linux operating system targeting embedded devices. Instead
-of trying to create a single, static firmware, OpenWrt provides a fully
-writable filesystem with package management. This frees you from the
-application selection and configuration provided by the vendor and allows you
-to customize the device through the use of packages to suit any application.
-For developers, OpenWrt is the framework to build an application without having
-to build a complete firmware around it; for users this means the ability for
-full customization, to use the device in ways never envisioned.
+This tree runs **Qualcomm NSS hardware offloading** (the dual UBI32
+network cores in IPQ807x SoCs) on top of **OpenWrt main's upstream
+`qca_edma`/`qca_ppe` ethernet drivers** from
+[openwrt/openwrt#22381](https://github.com/openwrt/openwrt/pull/22381) —
+not on the vendor `qca-nss-dp`/`qca-ssdk` driver stack that all other
+NSS builds use. As far as we know it is the first NSS integration that
+keeps the upstream drivers.
 
-Sunshine!
+**Measured on a Xiaomi AX3600** (IPQ8071A, 512 MB, PPPoE uplink):
 
-## Download
+| | Host path | NSS offloaded |
+|---|---|---|
+| NAT/PPPoE routing @ ~310 Mbit/s | ~42 % of one core (softirq) | **99.7 % CPU idle** |
+| SQM shaping @ 285 Mbit | (CPU-bound on this device class) | **99 % idle, 16 ms RTT under full load — zero bufferbloat** |
 
-Built firmware images are available for many architectures and come with a
-package selection to be used as WiFi home router. To quickly find a factory
-image usable to migrate from a vendor stock firmware to OpenWrt, try the
-*Firmware Selector*.
+📖 **Documentation lives in the
+[project wiki](https://github.com/JuliusBairaktaris/openwrt-nss-edma/wiki)**:
+architecture, firmware and source-pin rationale, runtime operation,
+SQM, hardware support, development notes, limitations. It is written
+to be self-contained for future contributors.
 
-* [OpenWrt Firmware Selector](https://firmware-selector.openwrt.org/)
+## Layout of this branch (`nss-edma-rework`)
 
-If your device is supported, please follow the **Info** link to see install
-instructions or consult the support resources listed below.
+1. [openwrt/openwrt](https://github.com/openwrt/openwrt) `main` — the
+   upstream base.
+2. The 14 commits of
+   [PR #22381](https://github.com/openwrt/openwrt/pull/22381)
+   (Ansuel's EDMA/PPE driver rework), applied verbatim.
+3. The integration series (~11 commits): ramoops crash forensics, NSS
+   device-tree nodes for every IPQ807x-family board, two `qca_edma`
+   hardening/hook commits, per-port firmware VSIs in `qca_ppe`, the
+   `kmod-qca-ppe-nss` glue module, the ECM and NSS-qdisc kernel
+   patches, and iproute2 `tc` support for the NSS qdiscs.
 
-##
+The NSS packages (driver, ECM, qdisc/PPPoE managers, firmware, SQM
+script) live in the companion feed
+**[JuliusBairaktaris/nss-packages](https://github.com/JuliusBairaktaris/nss-packages)**,
+branch `edma-nss`.
 
-An advanced user may require additional or specific package. (Toolchain, SDK, ...) For everything else than simple firmware download, try the wiki download page:
+## Prebuilt images
 
-* [OpenWrt Wiki Download](https://openwrt.org/downloads)
+**[Qualcommax_NSS_Builder](https://github.com/JuliusBairaktaris/Qualcommax_NSS_Builder)**
+builds this tree (with the `nss-packages` feed, a hardened toolchain
+and sensible defaults) automatically whenever either repository moves —
+grab the latest `edma-nss-*` tag from its
+[Releases](https://github.com/JuliusBairaktaris/Qualcommax_NSS_Builder/releases)
+page.
 
-## Development
+## Quick start
 
-To build your own firmware you need a GNU/Linux, BSD or macOS system (case
-sensitive filesystem required). Cygwin is unsupported because of the lack of a
-case sensitive file system.
-
-### Requirements
-
-You need the following tools to compile OpenWrt, the package names vary between
-distributions. A complete list with distribution specific packages is found in
-the [Build System Setup](https://openwrt.org/docs/guide-developer/build-system/install-buildsystem)
-documentation.
-
+```sh
+git clone -b nss-edma-rework https://github.com/JuliusBairaktaris/openwrt-nss-edma.git
+cd openwrt-nss-edma
+echo "src-link nss /path/to/nss-packages" >> feeds.conf
+./scripts/feeds update -a && ./scripts/feeds install -a
+make menuconfig   # target qualcommax/ipq807x; select the NSS packages;
+                  # NSS_MEM_PROFILE_MEDIUM for 512 MB boards!
+make -j$(nproc)
 ```
-binutils bzip2 diff find flex gawk gcc-6+ getopt grep install libc-dev libz-dev
-make4.1+ perl python3.8+ rsync subversion unzip which
-```
 
-### Quickstart
+The resulting image boots as a completely normal OpenWrt system —
+**nothing NSS-related starts at boot, by design**. The NSS data plane
+is brought up explicitly at runtime; see
+[Runtime Operation](https://github.com/JuliusBairaktaris/openwrt-nss-edma/wiki/Runtime-Operation)
+for the sequence and the safety rules. A plain reboot always returns
+to the stock host-only stack.
 
-1. Run `./scripts/feeds update -a` to obtain all the latest package definitions
-   defined in feeds.conf / feeds.conf.default
+## NSS offload support matrix
 
-2. Run `./scripts/feeds install -a` to install symlinks for all obtained
-   packages into package/feeds/
+What the firmware data plane accelerates on this stack (whole IPQ807x
+family). Legend: ✅ offloaded & validated · 🟨 supported in code, opt-in
+and not validated here · ⬜ deliberately not carried (software path is
+used) · ❌ not available on this platform/firmware.
 
-3. Run `make menuconfig` to select your preferred configuration for the
-   toolchain, target system & firmware packages.
+| Feature | IPQ807x | Notes |
+|---|:---:|---|
+| IPv4 NAT / routing | ✅ | ECM, line rate, host ~idle |
+| IPv6 routing | ✅ | ECM |
+| PPPoE (incl. over 802.1Q VLAN) | ✅ | validated on a PPPoE/VLAN WAN |
+| 802.1Q VLAN | ✅ | ECM VLAN-tagged flows |
+| SQM shaper (nsstbl + nssfq_codel) | ✅ | `nss-edma.qos`; zero-bufferbloat verified |
+| Ingress shaping (IGS / nssmirred) | ✅ | `act_nssmirred` → ifb |
+| DSCP / mark classification | ✅ | ECM DSCP + mark classifiers |
+| CoDel ECN marking | ❌ | 12.5 firmware does not ECN-mark (verified) |
+| Wi-Fi AP (wifili) | ✅ | both radios (QCN5024 + QCN5054) |
+| Wi-Fi STA | 🟨 | wifili path present; AP is what's validated |
+| Wi-Fi WDS | 🟨 | not validated |
+| Wi-Fi mesh | ❌ | needs NSS fw 11.4 (this tree ships 12.5); host mesh works |
+| Wi-Fi AP-VLAN | ❌ | broken in the ath11k driver |
+| Bridge (same-subnet L2) | ⬜ | software bridge; `nss-bridge-mgr` deferred (fw one-port-per-VSI) |
+| Multicast (routed / bridged) | ⬜ | `ECM_MULTICAST` not built; fw mc-connection path unused |
+| GRE | 🟨 | ECM support builds with `kmod-gre`; not in the default config |
+| MAP-T / DS-Lite | 🟨 | needs `kmod-nat46` |
+| 6RD / IPIP6 (SIT) | 🟨 | needs `kmod-sit` / `kmod-ip6-tunnel` |
+| VXLAN | 🟨 | needs `kmod-vxlan` |
+| OVS bridge | 🟨 | needs `kmod-qca-ovsmgr` |
+| MACVLAN | 🟨 | kernel patch carried; needs `kmod-macvlan` |
+| L2TPv2 / PPTP | ⬜ | ECM interface off — those kernel hooks are not ported |
+| Bonding / LAG | ⬜ | kernel bonding hooks not carried |
+| IPsec (ESP) | ❌ | not viable on IPQ807x; `nss-crypto`/`cfi` not carried |
+| TLS / DTLS / CAPWAP | ❌ | not supported (matches the vendor matrix) |
 
-4. Run `make` to build your firmware. This will download all sources, build the
-   cross-compile toolchain and then cross-compile the GNU/Linux kernel & all chosen
-   applications for your target system.
+All IPQ807x-family boards carry the NSS device-tree nodes; per-board
+validation reports are the open item. A plain reboot always returns to
+the stock host-only stack — nothing NSS starts at boot.
 
-### Related Repositories
+## Acknowledgements
 
-The main repository uses multiple sub-repositories to manage packages of
-different categories. All packages are installed via the OpenWrt package
-manager called `opkg`. If you're looking to develop the web interface or port
-packages to OpenWrt, please find the fitting repository below.
-
-* [LuCI Web Interface](https://github.com/openwrt/luci): Modern and modular
-  interface to control the device via a web browser.
-
-* [OpenWrt Packages](https://github.com/openwrt/packages): Community repository
-  of ported packages.
-
-* [OpenWrt Routing](https://github.com/openwrt/routing): Packages specifically
-  focused on (mesh) routing.
-
-* [OpenWrt Video](https://github.com/openwrt/video): Packages specifically
-  focused on display servers and clients (Xorg and Wayland).
-
-## Support Information
-
-For a list of supported devices see the [OpenWrt Hardware Database](https://openwrt.org/supported_devices)
-
-### Documentation
-
-* [Quick Start Guide](https://openwrt.org/docs/guide-quick-start/start)
-* [User Guide](https://openwrt.org/docs/guide-user/start)
-* [Developer Documentation](https://openwrt.org/docs/guide-developer/start)
-* [Technical Reference](https://openwrt.org/docs/techref/start)
-
-### Support Community
-
-* [Forum](https://forum.openwrt.org): For usage, projects, discussions and hardware advise.
-* [Support Chat](https://webchat.oftc.net/#openwrt): Channel `#openwrt` on **oftc.net**.
-
-### Developer Community
-
-* [Bug Reports](https://bugs.openwrt.org): Report bugs in OpenWrt
-* [Dev Mailing List](https://lists.openwrt.org/mailman/listinfo/openwrt-devel): Send patches
-* [Dev Chat](https://webchat.oftc.net/#openwrt-devel): Channel `#openwrt-devel` on **oftc.net**.
+- [Ansuel / Christian Marangi](https://github.com/Ansuel) — the
+  upstream EDMA/PPE driver rework (PR #22381) this is built on.
+- [qosmio](https://github.com/qosmio/openwrt-ipq) — the community NSS
+  builds whose packaging and kernel-compatibility work the package
+  feed is derived from, and the prepackaged firmware tarballs.
+- Qualcomm/CodeLinaro for the open-source NSS host components.
 
 ## License
 
-OpenWrt is licensed under GPL-2.0
+OpenWrt is licensed under GPL-2.0; see [LICENSE](LICENSE). The NSS
+vendor components retain their respective upstream licenses.
+
+---
+
+*This is a development fork. For OpenWrt itself, see
+[openwrt/openwrt](https://github.com/openwrt/openwrt).*
