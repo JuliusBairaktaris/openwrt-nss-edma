@@ -551,6 +551,7 @@ struct qca_ppe_priv {
 	DECLARE_BITMAP(vsi_bitmap, PPE_VSI_MAX);
 	DECLARE_BITMAP(xlt_bitmap, PPE_XLT_TBL_NUM);
 	u32 port_vsi[QCA_PPE_MAX_PORTS];
+	u32 port_fw_vsi[QCA_PPE_MAX_PORTS];
 	struct qca_ppe_bridge_vsi bridges[QCA_PPE_MAX_BRIDGES];
 	struct qca_ppe_vlan_entry vlans[PPE_VSI_MAX];
 	struct net_device *port_br_dev[QCA_PPE_MAX_PORTS];
