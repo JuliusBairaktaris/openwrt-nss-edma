@@ -11,7 +11,9 @@
 #include <linux/phylink.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
+#include <linux/rtnetlink.h>
 #include <linux/if_bridge.h>
+#include <linux/soc/qcom/qca_ppe.h>
 
 #include "qca_ppe.h"
 
@@ -437,8 +439,10 @@ static int qca_ppe_setup(struct dsa_switch *ds)
 
 	port_mask = BIT(num_ports) - 1;
 
-	for (i = 0; i < num_ports; i++)
+	for (i = 0; i < num_ports; i++) {
 		priv->port_vsi[i] = PPE_VSI_INVALID;
+		priv->port_fw_vsi[i] = PPE_VSI_INVALID;
+	}
 
 	regmap_write(priv->regmap, PPE_FDB_OP, 0);
 
@@ -479,8 +483,10 @@ static int qca_ppe_setup(struct dsa_switch *ds)
 	regmap_write(priv->regmap, PPE_VSI_TBL(0) + 4,
 		PPE_VSI_TBL_NEW_ADDR_LRN_EN | PPE_VSI_TBL_STA_MOVE_LRN_EN);
 
-	for (i = 1; i < num_ports; i++)
+	for (i = 1; i < num_ports; i++) {
 		ppe_port_vsi_set(priv, i, 0);
+		priv->port_vsi[i] = 0;
+	}
 
 	ppe_fdb_flush(priv);
 
@@ -622,9 +628,10 @@ static void qca_ppe_port_bridge_leave(struct dsa_switch *ds, int port,
 	if (!bvsi)
 		return;
 
-	priv->port_vsi[port] = PPE_VSI_INVALID;
+	/* Back to the probe-time default VSI, like any standalone port */
+	priv->port_vsi[port] = 0;
 	priv->port_br_dev[port] = NULL;
-	ppe_port_vsi_set(priv, port, PPE_VSI_INVALID);
+	ppe_port_vsi_set(priv, port, 0);
 	bridge_vsi_members_update(priv, bvsi);
 	bridge_vsi_put(priv, bvsi);
 }
@@ -1282,6 +1289,157 @@ static const struct dsa_switch_ops qca_ppe_ops = {
 	.get_sset_count		= qca_ppe_get_sset_count,
 	.get_ethtool_stats	= qca_ppe_get_ethtool_stats,
 };
+
+/*
+ * qca_ppe_port_vsi_get - the PPE VSI this driver intends for a port
+ * @netdev: DSA user netdev on a qca-ppe switch
+ *
+ * Returns the VSI from the driver's own state, NOT the hardware: the
+ * NSS firmware rewrites the L3_VP entry behind our back while it
+ * manages a port, so the register is not authoritative. Every user
+ * port has a VSI by construction (the default VSI 0 from probe, a
+ * bridge VSI while bridged, VSI 0 again after leaving); the hardware
+ * read remains as a fallback only. Returns the VSI number, -ENOENT if
+ * the port has no VSI, or -ENODEV if @netdev is not a qca-ppe user
+ * port.
+ *
+ * VSI assignments change under rtnl (DSA switchdev ops), so callers
+ * must hold rtnl for a stable answer.
+ */
+int qca_ppe_port_vsi_get(struct net_device *netdev)
+{
+	struct qca_ppe_priv *priv;
+	struct dsa_port *dp;
+	u32 val;
+
+	ASSERT_RTNL();
+
+	if (!netdev || !dsa_user_dev_check(netdev))
+		return -ENODEV;
+
+	dp = dsa_port_from_netdev(netdev);
+	if (IS_ERR(dp) || dp->ds->ops != &qca_ppe_ops)
+		return -ENODEV;
+
+	priv = ds_to_priv(dp->ds);
+	if (priv->port_vsi[dp->index] != PPE_VSI_INVALID)
+		return priv->port_vsi[dp->index];
+
+	regmap_read(priv->regmap, PPE_L3_VP_PORT_TBL(dp->index) + 4, &val);
+	if (!(val & PPE_L3_VP_VSI_VALID))
+		return -ENOENT;
+
+	return FIELD_GET(PPE_L3_VP_VSI, val);
+}
+EXPORT_SYMBOL_GPL(qca_ppe_port_vsi_get);
+
+/*
+ * qca_ppe_port_fw_vsi_get - per-port private VSI for the NSS firmware
+ * @netdev: DSA user netdev on a qca-ppe switch
+ *
+ * The NSS firmware's physical-interface model predates this driver's
+ * shared bridge VSIs: the firmware accepts exactly one port per VSI
+ * (the old qca-ssdk stack gave every port a unique default VSI;
+ * bridge VSI sharing went through the firmware's own bridge interface
+ * instead, which is nss-bridge-mgr territory). Allocate a dedicated
+ * VSI for the port on first use, with VSI 0 semantics: the port and
+ * the CPU port as members, all flooding to the CPU port only, so the
+ * Linux bridge remains the forwarding authority and inter-port
+ * traffic takes the firmware slow path.
+ *
+ * The VSI stays allocated for the switch lifetime (one per user port,
+ * out of 32). Callers hold rtnl. Returns the VSI or -errno.
+ */
+static struct qca_ppe_priv *fw_vsi_port_resolve(struct net_device *netdev,
+						int *port)
+{
+	struct dsa_port *dp;
+
+	ASSERT_RTNL();
+
+	if (!netdev || !dsa_user_dev_check(netdev))
+		return NULL;
+
+	dp = dsa_port_from_netdev(netdev);
+	if (IS_ERR(dp) || dp->ds->ops != &qca_ppe_ops)
+		return NULL;
+
+	*port = dp->index;
+	return ds_to_priv(dp->ds);
+}
+
+/*
+ * The private VSI carries the port and the CPU port, but floods only
+ * toward the CPU port copy of each direction: source-port pruning
+ * makes a wire-ingress flood reach the CPU port only and a firmware
+ * (CPU-sourced) flood reach the wire only, so the Linux bridge stays
+ * the forwarding authority with no duplicate delivery.
+ */
+static void fw_vsi_tbl_write(struct qca_ppe_priv *priv, int port, u32 vsi)
+{
+	regmap_write(priv->regmap, PPE_VSI_TBL(vsi),
+		     FIELD_PREP(PPE_VSI_TBL_MEMBER,
+				BIT(port) | BIT(QCA_PPE_CPU_PORT)) |
+		     FIELD_PREP(PPE_VSI_TBL_UUC,
+				BIT(port) | BIT(QCA_PPE_CPU_PORT)) |
+		     FIELD_PREP(PPE_VSI_TBL_UMC,
+				BIT(port) | BIT(QCA_PPE_CPU_PORT)) |
+		     FIELD_PREP(PPE_VSI_TBL_BC,
+				BIT(port) | BIT(QCA_PPE_CPU_PORT)));
+	regmap_write(priv->regmap, PPE_VSI_TBL(vsi) + 4,
+		     PPE_VSI_TBL_NEW_ADDR_LRN_EN | PPE_VSI_TBL_STA_MOVE_LRN_EN);
+}
+
+int qca_ppe_port_fw_vsi_get(struct net_device *netdev)
+{
+	struct qca_ppe_priv *priv;
+	int port, vsi;
+
+	priv = fw_vsi_port_resolve(netdev, &port);
+	if (!priv)
+		return -ENODEV;
+
+	if (priv->port_fw_vsi[port] != PPE_VSI_INVALID)
+		return priv->port_fw_vsi[port];
+
+	vsi = ppe_vsi_alloc(priv);
+	if (vsi < 0)
+		return vsi;
+
+	fw_vsi_tbl_write(priv, port, vsi);
+	priv->port_fw_vsi[port] = vsi;
+
+	return vsi;
+}
+EXPORT_SYMBOL_GPL(qca_ppe_port_fw_vsi_get);
+
+/*
+ * qca_ppe_port_fw_vsi_refresh - re-assert a private VSI's table entry
+ * @netdev: DSA user netdev whose private VSI was assigned to the fw
+ *
+ * The firmware rewrites the VSI table entry of a VSI it is assigned
+ * (measured: members and flood masks read back zeroed), which kills
+ * its own broadcast egress - the firmware floods H2N broadcasts per
+ * the VSI flood masks, so an emptied mask means host-originated ARP
+ * requests never reach the wire while unicast (FDB hit) still flows.
+ * Call after every firmware vsi_assign to re-assert the masks.
+ */
+int qca_ppe_port_fw_vsi_refresh(struct net_device *netdev)
+{
+	struct qca_ppe_priv *priv;
+	int port;
+
+	priv = fw_vsi_port_resolve(netdev, &port);
+	if (!priv)
+		return -ENODEV;
+
+	if (priv->port_fw_vsi[port] == PPE_VSI_INVALID)
+		return -ENOENT;
+
+	fw_vsi_tbl_write(priv, port, priv->port_fw_vsi[port]);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qca_ppe_port_fw_vsi_refresh);
 
 static void ppe_vsi_init(struct qca_ppe_priv *priv)
 {
