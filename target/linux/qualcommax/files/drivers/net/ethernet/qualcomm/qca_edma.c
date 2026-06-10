@@ -1029,9 +1029,9 @@ static int edma_ndo_stop(struct net_device *netdev)
 	return 0;
 }
 
-static netdev_tx_t edma_ndo_xmit(struct sk_buff *skb, struct net_device *netdev)
+static netdev_tx_t edma_xmit(struct edma_priv *priv, struct net_device *netdev,
+			     struct sk_buff *skb)
 {
-	struct edma_priv *priv = netdev_priv(netdev);
 	const struct edma_soc_data *soc = priv->soc;
 	netdev_tx_t ret;
 	u32 nhead, ntail;
@@ -1071,6 +1071,29 @@ drop:
 	return NETDEV_TX_OK;
 }
 
+static netdev_tx_t edma_ndo_xmit(struct sk_buff *skb, struct net_device *netdev)
+{
+	struct edma_priv *priv = netdev_priv(netdev);
+	struct dsa_oob_tag_info *tag_info;
+	struct edma_tx_redirect *rd;
+
+	tag_info = skb_ext_find(skb, SKB_EXT_DSA_OOB);
+	if (tag_info && tag_info->port <= QCA_EDMA_REDIRECT_MAX_PORT) {
+		netdev_tx_t ret;
+
+		rcu_read_lock();
+		rd = rcu_dereference(priv->tx_redirect[tag_info->port]);
+		if (rd) {
+			ret = rd->fn(skb, rd->ctx);
+			rcu_read_unlock();
+			return ret;
+		}
+		rcu_read_unlock();
+	}
+
+	return edma_xmit(priv, netdev, skb);
+}
+
 static const struct net_device_ops edma_netdev_ops = {
 	.ndo_open = edma_ndo_open,
 	.ndo_stop = edma_ndo_stop,
@@ -1079,6 +1102,78 @@ static const struct net_device_ops edma_netdev_ops = {
 	.ndo_validate_addr = eth_validate_addr,
 	.ndo_get_stats64 = dev_get_tstats64,
 };
+
+/* Serializes redirect table mutation across all conduits */
+static DEFINE_MUTEX(edma_redirect_lock);
+
+bool qca_edma_netdev_is_conduit(const struct net_device *netdev)
+{
+	return netdev && netdev->netdev_ops == &edma_netdev_ops;
+}
+EXPORT_SYMBOL_GPL(qca_edma_netdev_is_conduit);
+
+int qca_edma_port_tx_redirect_set(struct net_device *conduit,
+				  unsigned int port,
+				  qca_edma_tx_redirect_fn fn, void *ctx)
+{
+	struct edma_tx_redirect *rd;
+	struct edma_priv *priv;
+	int ret = 0;
+
+	if (!qca_edma_netdev_is_conduit(conduit) || !fn ||
+	    port > QCA_EDMA_REDIRECT_MAX_PORT)
+		return -EINVAL;
+
+	priv = netdev_priv(conduit);
+
+	rd = kzalloc(sizeof(*rd), GFP_KERNEL);
+	if (!rd)
+		return -ENOMEM;
+
+	rd->fn = fn;
+	rd->ctx = ctx;
+
+	mutex_lock(&edma_redirect_lock);
+	if (rcu_dereference_protected(priv->tx_redirect[port],
+				      lockdep_is_held(&edma_redirect_lock))) {
+		kfree(rd);
+		ret = -EBUSY;
+	} else {
+		rcu_assign_pointer(priv->tx_redirect[port], rd);
+	}
+	mutex_unlock(&edma_redirect_lock);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(qca_edma_port_tx_redirect_set);
+
+int qca_edma_port_tx_redirect_clear(struct net_device *conduit,
+				    unsigned int port)
+{
+	struct edma_tx_redirect *rd;
+	struct edma_priv *priv;
+
+	if (!qca_edma_netdev_is_conduit(conduit) ||
+	    port > QCA_EDMA_REDIRECT_MAX_PORT)
+		return -EINVAL;
+
+	priv = netdev_priv(conduit);
+
+	mutex_lock(&edma_redirect_lock);
+	rd = rcu_replace_pointer(priv->tx_redirect[port], NULL,
+				 lockdep_is_held(&edma_redirect_lock));
+	mutex_unlock(&edma_redirect_lock);
+
+	if (!rd)
+		return -ENOENT;
+
+	/* No handler invocation is in flight once this returns. */
+	synchronize_net();
+	kfree(rd);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qca_edma_port_tx_redirect_clear);
 
 static int edma_irq_init(struct edma_priv *priv)
 {
@@ -1240,8 +1335,20 @@ err_page_pool:
 static void edma_remove(struct platform_device *pdev)
 {
 	struct edma_priv *priv = platform_get_drvdata(pdev);
+	struct edma_tx_redirect *rd;
+	int i;
 
 	unregister_netdev(priv->netdev);
+
+	/* Redirect owners detach on NETDEV_UNREGISTER; mop up stragglers */
+	mutex_lock(&edma_redirect_lock);
+	for (i = 0; i <= QCA_EDMA_REDIRECT_MAX_PORT; i++) {
+		rd = rcu_replace_pointer(priv->tx_redirect[i], NULL,
+					 lockdep_is_held(&edma_redirect_lock));
+		if (rd)
+			kfree_rcu(rd, rcu);
+	}
+	mutex_unlock(&edma_redirect_lock);
 	netif_napi_del(&priv->tx_napi);
 	netif_napi_del(&priv->rx_napi);
 	edma_hw_stop(priv);
