@@ -10,6 +10,7 @@
 #include <linux/etherdevice.h>
 #include <linux/netdevice.h>
 #include <linux/platform_device.h>
+#include <linux/soc/qcom/qca_edma.h>
 #include <net/page_pool/helpers.h>
 
 #define EDMA_HW_RESET_ID "edma_rst"
@@ -233,6 +234,12 @@ struct edma_ring {
 	struct sk_buff **skb_store;
 };
 
+struct edma_tx_redirect {
+	qca_edma_tx_redirect_fn fn;
+	void *ctx;
+	struct rcu_head rcu;
+};
+
 struct edma_priv {
 	const struct edma_soc_data *soc;
 	struct napi_struct tx_napi;
@@ -247,6 +254,8 @@ struct edma_priv {
 	struct edma_ring txcmpl_ring;
 	struct edma_ring rxfill_ring;
 	struct edma_ring rxdesc_ring;
+
+	struct edma_tx_redirect __rcu *tx_redirect[QCA_EDMA_REDIRECT_MAX_PORT + 1];
 
 	spinlock_t tx_lock;
 
