@@ -12,6 +12,7 @@
 #include <linux/platform_device.h>
 #include <linux/reset.h>
 #include <linux/if_bridge.h>
+#include <linux/soc/qcom/qca_edma.h>
 #include <linux/version.h>
 
 #include "qca_ppe.h"
@@ -57,6 +58,14 @@ static void ppe_port_bridge_txmac_set(struct qca_ppe_priv *priv, int port,
 	regmap_update_bits(priv->regmap, PPE_PORT_BRIDGE_CTRL(port),
 			   PPE_PORT_BRIDGE_CTRL_TXMAC_EN,
 			   enable ? PPE_PORT_BRIDGE_CTRL_TXMAC_EN : 0);
+}
+
+static struct net_device *ppe_port_conduit(struct dsa_port *dp)
+{
+	if (!dp || !dsa_port_is_user(dp))
+		return NULL;
+
+	return dsa_port_to_conduit(dp);
 }
 
 static void ppe_gmac_link_up(struct qca_ppe_priv *priv, int port,
@@ -521,6 +530,9 @@ static int qca_ppe_port_enable(struct dsa_switch *ds, int port,
 static void qca_ppe_port_disable(struct dsa_switch *ds, int port)
 {
 	struct qca_ppe_priv *priv = ds_to_priv(ds);
+	struct dsa_port *dp = dsa_to_port(ds, port);
+
+	qca_edma_port_transition_begin(ppe_port_conduit(dp), port);
 
 	ppe_port_bridge_txmac_set(priv, port, false);
 }
@@ -963,6 +975,8 @@ static void qca_ppe_mac_config(struct phylink_config *config,
 	struct qca_ppe_priv *priv = ds_to_priv(dp->ds);
 	int port = dp->index;
 
+	qca_edma_port_transition_begin(ppe_port_conduit(dp), port);
+
 	if (state->interface == PHY_INTERFACE_MODE_USXGMII ||
 	    state->interface == PHY_INTERFACE_MODE_10GBASER) {
 		qca_ppe_xgmac_config(priv, port);
@@ -982,6 +996,8 @@ static void qca_ppe_mac_link_down(struct phylink_config *config,
 	struct dsa_port *dp = dsa_phylink_to_port(config);
 	struct qca_ppe_priv *priv = ds_to_priv(dp->ds);
 	int port = dp->index;
+
+	qca_edma_port_transition_begin(ppe_port_conduit(dp), port);
 
 	switch (interface) {
 	case PHY_INTERFACE_MODE_SGMII:
@@ -1037,7 +1053,7 @@ static void qca_ppe_mac_link_up(struct phylink_config *config,
 	     interface == PHY_INTERFACE_MODE_USXGMII ||
 	     interface == PHY_INTERFACE_MODE_10GBASER) &&
 	     port < 5)
-		return;
+		goto out;
 
 	priv->port_xgmac[port] = qca_ppe_port_uses_xgmac(mode, interface);
 
@@ -1063,7 +1079,7 @@ static void qca_ppe_mac_link_up(struct phylink_config *config,
 				  tx_pause, rx_pause);
 		break;
 	default:
-		return;
+		goto out;
 	}
 
 	switch (interface) {
@@ -1138,8 +1154,16 @@ static void qca_ppe_mac_link_up(struct phylink_config *config,
 		ppe_port_xgmac_set(priv, port, true, true);
 		break;
 	default:
-		return;
+		goto out;
 	}
+
+	/*
+	 * The transition mac_config opened must close on every exit path:
+	 * while it is open the conduit drops all host TX for the port, so
+	 * returning early leaves a link-up port unable to transmit.
+	 */
+out:
+	qca_edma_port_transition_end(ppe_port_conduit(dp), port);
 }
 
 /* qca_ppe implements no LPI. The stubs exist only to make
