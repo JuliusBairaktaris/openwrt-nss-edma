@@ -103,4 +103,13 @@ void nss_dp_receive(struct net_device *netdev, struct sk_buff *skb,
 		    struct napi_struct *napi);
 void nss_phy_tstamp_rx_buf(void *app_data, struct sk_buff *skb);
 
+/*
+ * Probe gate: qca-nss-drv calls this at the top of its platform probe.
+ * Returns 0 when the data plane is armed (firmware boot may proceed) or
+ * -EPROBE_DEFER while no port is armed; deferred devices are re-attached
+ * when fw_mask first becomes non-zero. Keeps Wi-Fi's module dependency on
+ * qca-nss-drv from booting the NSS firmware unarmed at boot.
+ */
+int nss_dp_probe_gate(struct device *dev);
+
 #endif /* __NSS_DP_API_IF_H */

@@ -493,6 +493,86 @@ void nss_phy_tstamp_rx_buf(void *app_data, struct sk_buff *skb)
 EXPORT_SYMBOL(nss_phy_tstamp_rx_buf);
 
 /*
+ * ===== nss-drv probe gate =====
+ *
+ * qca-nss-drv defers its platform probe - and with it the NSS firmware
+ * boot - until at least one port is armed here. This keeps the module
+ * dependency chain from Wi-Fi safe: with ath11k NSS offload compiled in,
+ * ath11k.ko and mac80211.ko carry hard symbol references to qca-nss-drv,
+ * so kmodloader pulls it in at every boot. Booting the firmware with no
+ * armed ports kills all wired RX (the fw QID2RID takeover unmaps the
+ * host EDMA ring from every queue), so the probe must wait for arming.
+ * Deferred core devices are recorded and re-attached when fw_mask first
+ * becomes non-zero.
+ */
+
+#define PPE_NSS_GATE_MAX_DEVS 4
+static DEFINE_SPINLOCK(ppe_nss_gate_lock);
+static struct device *ppe_nss_gate_devs[PPE_NSS_GATE_MAX_DEVS];
+
+int nss_dp_probe_gate(struct device *dev)
+{
+	bool recorded = false;
+	int i;
+
+	spin_lock(&ppe_nss_gate_lock);
+	if (READ_ONCE(ppe_nss_fw_mask)) {
+		spin_unlock(&ppe_nss_gate_lock);
+		return 0;
+	}
+	for (i = 0; i < PPE_NSS_GATE_MAX_DEVS; i++) {
+		if (ppe_nss_gate_devs[i] == dev)
+			break;
+		if (!ppe_nss_gate_devs[i]) {
+			ppe_nss_gate_devs[i] = get_device(dev);
+			recorded = true;
+			break;
+		}
+	}
+	spin_unlock(&ppe_nss_gate_lock);
+
+	/* the driver core retries deferred probes often - log once */
+	if (recorded)
+		dev_info(dev, "qca-ppe-nss: deferring NSS core probe until a port is armed\n");
+	return -EPROBE_DEFER;
+}
+EXPORT_SYMBOL(nss_dp_probe_gate);
+
+static void ppe_nss_gate_kick(void)
+{
+	struct device *devs[PPE_NSS_GATE_MAX_DEVS];
+	int i;
+
+	spin_lock(&ppe_nss_gate_lock);
+	memcpy(devs, ppe_nss_gate_devs, sizeof(devs));
+	memset(ppe_nss_gate_devs, 0, sizeof(ppe_nss_gate_devs));
+	spin_unlock(&ppe_nss_gate_lock);
+
+	for (i = 0; i < PPE_NSS_GATE_MAX_DEVS; i++) {
+		if (!devs[i])
+			continue;
+		if (device_attach(devs[i]) < 0)
+			dev_warn(devs[i],
+				 "qca-ppe-nss: deferred NSS core attach failed\n");
+		put_device(devs[i]);
+	}
+}
+
+static void ppe_nss_gate_drop(void)
+{
+	int i;
+
+	spin_lock(&ppe_nss_gate_lock);
+	for (i = 0; i < PPE_NSS_GATE_MAX_DEVS; i++) {
+		if (ppe_nss_gate_devs[i]) {
+			put_device(ppe_nss_gate_devs[i]);
+			ppe_nss_gate_devs[i] = NULL;
+		}
+	}
+	spin_unlock(&ppe_nss_gate_lock);
+}
+
+/*
  * ===== fw_mask arming (debugfs) =====
  */
 
@@ -578,6 +658,10 @@ static ssize_t ppe_nss_fw_mask_write(struct file *file,
 	ret = ppe_nss_fw_mask_apply(mask);
 	if (ret)
 		return ret;
+
+	/* first arming releases any probe-gated NSS core devices */
+	if (ppe_nss_fw_mask)
+		ppe_nss_gate_kick();
 
 	return len;
 }
@@ -986,6 +1070,7 @@ static void __exit qca_ppe_nss_exit(void)
 	}
 	mutex_unlock(&ppe_nss_lock);
 
+	ppe_nss_gate_drop();
 	unregister_netdevice_notifier(&ppe_nss_netdev_nb);
 }
 
