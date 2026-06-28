@@ -13,11 +13,29 @@
 #include <linux/reset.h>
 #include <linux/rtnetlink.h>
 #include <linux/if_bridge.h>
+#include <linux/etherdevice.h>
+#include <linux/slab.h>
+#include <linux/workqueue.h>
 #include <linux/soc/qcom/qca_edma.h>
 #include <linux/soc/qcom/qca_ppe.h>
 #include <linux/version.h>
 
 #include "qca_ppe.h"
+
+/*
+ * The single PPE switch instance on this SoC. Recorded at probe so callers
+ * that key off a bridge netdev or a bare MAC (the NSS bridge manager) can
+ * reach the switch without a DSA user port to resolve through. qca-ppe stays
+ * the single writer of the PPE tables; these callers only request actions.
+ */
+static struct qca_ppe_priv *qca_ppe_instance;
+
+/*
+ * Workqueue for deferred FDB deletes requested from the atomic bridge
+ * FDB-update notifier. Drained in remove() before the PPE clocks are
+ * disabled so a pending delete never touches freed/clock-gated state.
+ */
+static struct workqueue_struct *qca_ppe_wq;
 
 static void ppe_port_gmac_set(struct qca_ppe_priv *priv, int port,
 			     bool tx_en, bool rx_en)
@@ -1654,6 +1672,109 @@ int qca_ppe_port_fw_vsi_refresh(struct net_device *netdev)
 }
 EXPORT_SYMBOL_GPL(qca_ppe_port_fw_vsi_refresh);
 
+/*
+ * qca_ppe_bridge_vsi_get - VSI of the shared bridge a Linux bridge maps to
+ * @br_dev: a Linux bridge netdev
+ *
+ * qca-ppe already allocates one shared VSI per Linux bridge when its DSA user
+ * ports join (port_bridge_join), with the member/flood masks programmed. The
+ * NSS bridge manager reuses that VSI for the firmware bridge interface instead
+ * of allocating its own, so qca-ppe stays the single PPE-table writer. Returns
+ * the VSI, or -ENODEV if the bridge has no qca-ppe ports (nothing to offload).
+ */
+int qca_ppe_bridge_vsi_get(struct net_device *br_dev)
+{
+	struct qca_ppe_priv *priv = qca_ppe_instance;
+	struct qca_ppe_bridge_vsi *bvsi;
+
+	ASSERT_RTNL();	/* reads priv->bridges[]/port_vsi[], mutated under rtnl */
+
+	if (!priv || !br_dev)
+		return -ENODEV;
+
+	bvsi = bridge_vsi_find(priv, br_dev);
+	if (!bvsi)
+		return -ENODEV;
+
+	return bvsi->vsi;
+}
+EXPORT_SYMBOL_GPL(qca_ppe_bridge_vsi_get);
+
+/*
+ * qca_ppe_bridge_vsi_refresh - re-assert a bridge VSI's member/flood masks
+ * @br_dev: a Linux bridge netdev
+ *
+ * The firmware zeroes a VSI's member and flood masks when it is assigned to a
+ * bridge interface (same hazard as the per-port VSI). Re-apply the masks
+ * qca-ppe computed from the bridged ports. Call after every firmware
+ * vsi_assign and after each member join. Returns 0, or -ENODEV.
+ */
+int qca_ppe_bridge_vsi_refresh(struct net_device *br_dev)
+{
+	struct qca_ppe_priv *priv = qca_ppe_instance;
+	struct qca_ppe_bridge_vsi *bvsi;
+
+	ASSERT_RTNL();	/* reads priv->bridges[]/port_vsi[], mutated under rtnl */
+
+	if (!priv || !br_dev)
+		return -ENODEV;
+
+	bvsi = bridge_vsi_find(priv, br_dev);
+	if (!bvsi)
+		return -ENODEV;
+
+	bridge_vsi_members_update(priv, bvsi);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qca_ppe_bridge_vsi_refresh);
+
+/*
+ * qca_ppe_fdb_del - flush a learned FDB entry by MAC + bridge VSI
+ *
+ * Called from the bridge FDB-update notifier when a MAC roams off a physical
+ * port, so the PPE stops forwarding to the stale port before it ages out.
+ * That notifier runs in atomic context (br->hash_lock held) while the PPE
+ * regmap takes a mutex, so the actual delete is deferred to a workqueue.
+ */
+struct qca_ppe_fdb_del_work {
+	struct work_struct work;
+	struct qca_ppe_priv *priv;
+	unsigned char addr[ETH_ALEN];
+	u32 vsi;
+};
+
+static void qca_ppe_fdb_del_worker(struct work_struct *work)
+{
+	struct qca_ppe_fdb_del_work *w =
+		container_of(work, struct qca_ppe_fdb_del_work, work);
+
+	ppe_fdb_op(w->priv, w->addr, 0, w->vsi, PPE_FDB_OP_DEL);
+	kfree(w);
+}
+
+int qca_ppe_fdb_del(const unsigned char *addr, u32 vsi)
+{
+	struct qca_ppe_priv *priv = qca_ppe_instance;
+	struct qca_ppe_fdb_del_work *w;
+
+	if (!priv || !qca_ppe_wq || !addr)
+		return -ENODEV;
+
+	w = kzalloc(sizeof(*w), GFP_ATOMIC);
+	if (!w)
+		return -ENOMEM;
+
+	INIT_WORK(&w->work, qca_ppe_fdb_del_worker);
+	w->priv = priv;
+	ether_addr_copy(w->addr, addr);
+	w->vsi = vsi;
+	/* Dedicated wq so remove() can drain it while the PPE is still live. */
+	queue_work(qca_ppe_wq, &w->work);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qca_ppe_fdb_del);
+
 static void ppe_vsi_init(struct qca_ppe_priv *priv)
 {
 	int i;
@@ -1869,6 +1990,9 @@ static int qca_ppe_probe(struct platform_device *pdev)
 		goto err_clk;
 
 	platform_set_drvdata(pdev, priv);
+	/* Best-effort: a failed wq just disables deferred FDB flush. */
+	qca_ppe_wq = alloc_workqueue("qca_ppe_fdb", 0, 0);
+	qca_ppe_instance = priv;
 
 	return 0;
 
@@ -1881,6 +2005,11 @@ static void qca_ppe_remove(struct platform_device *pdev)
 {
 	struct qca_ppe_priv *priv = platform_get_drvdata(pdev);
 
+	qca_ppe_instance = NULL;	/* no new lookups / queued FDB work after this */
+	if (qca_ppe_wq) {
+		destroy_workqueue(qca_ppe_wq);	/* drain pending FDB deletes while live */
+		qca_ppe_wq = NULL;
+	}
 	dsa_unregister_switch(&priv->ds);
 	clk_bulk_disable_unprepare(priv->num_clks, priv->clks);
 }
