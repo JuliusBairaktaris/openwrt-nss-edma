@@ -14,7 +14,13 @@ PKG_CONFIG_DEPENDS += \
 	CONFIG_ATH10K_THERMAL \
 	CONFIG_ATH11K_THERMAL \
 	CONFIG_ATH12K_THERMAL \
-	CONFIG_ATH_USER_REGD
+	CONFIG_ATH_USER_REGD \
+	CONFIG_ATH11K_NSS_SUPPORT \
+	CONFIG_ATH11K_MEM_PROFILE_1G \
+	CONFIG_ATH11K_MEM_PROFILE_512M \
+	CONFIG_ATH11K_MEM_PROFILE_256M \
+	CONFIG_ATH11K_DEBUGFS_STA \
+	CONFIG_ATH11K_DEBUGFS_HTT_STATS
 
 ifdef CONFIG_PACKAGE_MAC80211_DEBUGFS
   config-y += \
@@ -61,6 +67,12 @@ config-$(CONFIG_ATH10K_LEDS) += ATH10K_LEDS
 config-$(CONFIG_ATH10K_THERMAL) += ATH10K_THERMAL
 config-$(CONFIG_ATH11K_THERMAL) += ATH11K_THERMAL
 config-$(CONFIG_ATH12K_THERMAL) += ATH12K_THERMAL
+config-$(CONFIG_ATH11K_NSS_SUPPORT) += ATH11K_NSS_SUPPORT
+config-$(CONFIG_ATH11K_MEM_PROFILE_1G) += ATH11K_MEM_PROFILE_1G
+config-$(CONFIG_ATH11K_MEM_PROFILE_512M) += ATH11K_MEM_PROFILE_512M
+config-$(CONFIG_ATH11K_MEM_PROFILE_256M) += ATH11K_MEM_PROFILE_256M
+config-$(CONFIG_ATH11K_DEBUGFS_STA) += ATH11K_DEBUGFS_STA
+config-$(CONFIG_ATH11K_DEBUGFS_HTT_STATS) += ATH11K_DEBUGFS_HTT_STATS
 
 config-$(call config_package,ath9k-htc) += ATH9K_HTC
 config-$(call config_package,ath10k,regular) += ATH10K ATH10K_PCI
@@ -319,12 +331,29 @@ define KernelPackage/ath11k
   DEPENDS+= +kmod-ath +@DRIVER_11AC_SUPPORT +@DRIVER_11AX_SUPPORT \
   +kmod-crypto-michael-mic +ATH11K_THERMAL:kmod-hwmon-core \
   +ATH11K_THERMAL:kmod-thermal +kmod-qcom-qmi-helpers
+  # NSS Wi-Fi offload pulls (qca-nss-drv + its wifi-offload flags) are done via
+  # 'select' inside config ATH11K_NSS_SUPPORT below, NOT here: kmod-mac80211's
+  # DEPENDS (package/kernel/mac80211/Makefile:138) carries
+  # '+ATH11K_NSS_SUPPORT:kmod-qca-nss-drv', and ath11k depends on mac80211, so a
+  # conditional dependency on ATH11K_NSS_SUPPORT here too would form a kconfig
+  # recursive-dependency cycle through mac80211.
   FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath11k/ath11k.ko
+ifdef CONFIG_ATH11K_NSS_SUPPORT
+  # ath11k needs its own modules.d entry so frame_mode reaches the module at
+  # boot; NSS offload itself stays opt-in (nss_offload defaults to 0 and is
+  # flipped at runtime before rebinding the radio).
+  AUTOLOAD:=$(call AutoProbe,ath11k)
+  MODPARAMS.ath11k:=frame_mode=2
+endif
 endef
 
 define KernelPackage/ath11k/description
 This module adds support for Qualcomm Technologies 802.11ax family of
 chipsets.
+endef
+
+define KernelPackage/ath11k/conffiles
+/etc/config/pbuf
 endef
 
 define KernelPackage/ath11k/config
@@ -334,6 +363,72 @@ define KernelPackage/ath11k/config
                depends on PACKAGE_kmod-ath11k
                default y if TARGET_qualcommax
 
+       config ATH11K_NSS_SUPPORT
+               bool "Enable NSS WiFi offload"
+               # No 'depends on PACKAGE_kmod-ath11k': kmod-mac80211
+               # (package/kernel/mac80211/Makefile:138) carries
+               # '+ATH11K_NSS_SUPPORT:kmod-qca-nss-drv' and ath11k depends on
+               # mac80211, so gating this symbol on PACKAGE_kmod-ath11k forms a
+               # kconfig recursive-dependency cycle through mac80211. This config
+               # is still emitted inside KernelPackage/ath11k/config and only has
+               # effect when ath11k is built; it pulls the NSS data-plane driver
+               # + wifi-offload feature flags via 'select'.
+               select PACKAGE_kmod-qca-nss-drv
+               select NSS_DRV_WIFIOFFLOAD_ENABLE
+               select NSS_DRV_WIFI_EXT_VDEV_ENABLE
+               select ATH11K_MEM_PROFILE_512M if (TARGET_qualcommax_ipq807x_DEVICE_edimax_cax1800 || \
+               	 TARGET_qualcommax_ipq807x_DEVICE_compex_wpq873 || \
+               	 TARGET_qualcommax_ipq807x_DEVICE_linksys_mx4200v1 || \
+               	 TARGET_qualcommax_ipq807x_DEVICE_redmi_ax6 || \
+               	 TARGET_qualcommax_ipq807x_DEVICE_xiaomi_ax3600 || \
+               	 TARGET_qualcommax_ipq807x_DEVICE_zte_mf269 )
+               select ATH11K_MEM_PROFILE_256M if TARGET_qualcommax_ipq807x_DEVICE_netgear_wax218
+               default n
+               help
+                  Say Y to offload the ath11k data path to the NSS cores
+                  (wifili). Requires the qca-ppe-nss glue to arm the NSS
+                  data plane before the firmware is booted; Wi-Fi starts
+                  in host mode and is rebound with nss_offload=1 at runtime.
+
+       config ATH11K_DEBUGFS_STA
+               bool "Enable ath11k station statistics"
+               depends on PACKAGE_kmod-ath11k
+               depends on PACKAGE_MAC80211_DEBUGFS
+               default y
+               help
+                  Say Y to enable access to the station statistics via debugfs.
+
+       config ATH11K_DEBUGFS_HTT_STATS
+               bool "Enable ath11k HTT statistics"
+               depends on PACKAGE_kmod-ath11k
+               depends on PACKAGE_MAC80211_DEBUGFS
+               default y
+               help
+                  Say Y to enable access to the HTT statistics via debugfs.
+
+       choice
+            prompt "Memory Profile"
+            depends on PACKAGE_kmod-ath11k
+            default ATH11K_MEM_PROFILE_1G
+            help
+            	This option allows you to select the memory profile.
+            	It should correspond to the total RAM of your board.
+
+          config ATH11K_MEM_PROFILE_1G
+               bool "Use 1G memory profile"
+               help
+                  This allows configuring ath11k for boards with 1GB+ memory.
+
+          config ATH11K_MEM_PROFILE_512M
+               bool "Use 512MB memory profile"
+               help
+                  This allows configuring ath11k for boards with 512M memory.
+
+          config ATH11K_MEM_PROFILE_256M
+               bool "Use 256MB memory profile"
+               help
+                  This allows configuring ath11k for boards with 256M memory.
+       endchoice
 endef
 
 define KernelPackage/ath11k-ahb
