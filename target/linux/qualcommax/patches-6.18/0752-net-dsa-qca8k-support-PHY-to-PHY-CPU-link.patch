@@ -47,7 +47,7 @@ Signed-off-by: Ziyang Huang <hzyitc@outlook.com>
  	return -EINVAL;
  }
  
-@@ -1961,7 +1963,7 @@ qca8k_setup(struct dsa_switch *ds)
+@@ -1960,7 +1962,7 @@ qca8k_setup(struct dsa_switch *ds)
  
  	cpu_port = qca8k_find_cpu_port(ds);
  	if (cpu_port < 0) {

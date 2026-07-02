@@ -35,7 +35,7 @@ Signed-off-by: George Moussalem <george.moussalem@outlook.com>
  	struct reset_control *rst;
  	bool set_short_cable_dac;
  };
-@@ -1099,6 +1102,16 @@ static int ipq5018_probe(struct phy_devi
+@@ -1098,6 +1101,16 @@ static int ipq5018_probe(struct phy_devi
  	priv->set_short_cable_dac = of_property_read_bool(dev->of_node,
  							  "qcom,dac-preset-short-cable");
  

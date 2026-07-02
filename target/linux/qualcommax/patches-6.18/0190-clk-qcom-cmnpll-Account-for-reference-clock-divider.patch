@@ -19,7 +19,7 @@ Fixes: f81715a4c87c ("clk: qcom: Add CMN PLL clock controller driver for IPQ SoC
 Signed-off-by: Luo Jie <jie.luo@oss.qualcomm.com>
 --- a/drivers/clk/qcom/ipq-cmn-pll.c
 +++ b/drivers/clk/qcom/ipq-cmn-pll.c
-@@ -186,7 +186,7 @@ static unsigned long clk_cmn_pll_recalc_
+@@ -185,7 +185,7 @@ static unsigned long clk_cmn_pll_recalc_
  					     unsigned long parent_rate)
  {
  	struct clk_cmn_pll *cmn_pll = to_clk_cmn_pll(hw);
@@ -28,7 +28,7 @@ Signed-off-by: Luo Jie <jie.luo@oss.qualcomm.com>
  
  	/*
  	 * The value of CMN_PLL_DIVIDER_CTRL_FACTOR is automatically adjusted
-@@ -194,8 +194,15 @@ static unsigned long clk_cmn_pll_recalc_
+@@ -193,8 +193,15 @@ static unsigned long clk_cmn_pll_recalc_
  	 */
  	regmap_read(cmn_pll->regmap, CMN_PLL_DIVIDER_CTRL, &val);
  	factor = FIELD_GET(CMN_PLL_DIVIDER_CTRL_FACTOR, val);
