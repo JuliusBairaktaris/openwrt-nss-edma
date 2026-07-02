@@ -415,6 +415,7 @@ static void qca_uniphy_pcs_get_state_10base_r(struct qca_uniphy *uniphy,
 }
 
 static void qca_uniphy_pcs_get_state(struct phylink_pcs *pcs,
+				     unsigned int neg_mode,
 				     struct phylink_link_state *state)
 {
 	struct qca_uniphy_pcs *upcs = to_qca_uniphy_pcs(pcs);
@@ -975,7 +976,6 @@ static int qca_uniphy_probe(struct platform_device *pdev)
 
 	for (i = 0; i < QCA_UNIPHY_CHANNELS; i++) {
 		uniphy->port_pcs[i].pcs.ops = &qca_uniphy_pcs_ops;
-		uniphy->port_pcs[i].pcs.neg_mode = true;
 		uniphy->port_pcs[i].pcs.poll = true;
 		uniphy->port_pcs[i].uniphy = uniphy;
 		uniphy->port_pcs[i].channel = i;
