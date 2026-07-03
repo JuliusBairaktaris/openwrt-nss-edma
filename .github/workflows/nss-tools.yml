@@ -1,0 +1,85 @@
+name: NSS tools
+
+# The runtime tools ship as shell, so nothing about them is checked by a build.
+# These jobs are what stands in for that: they lint every shipped script and run
+# the readout against a synthetic /sys tree, under busybox as well as the
+# runner's own shell, because the router has neither bash nor GNU coreutils.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'package/nss/**'
+      - 'package/kernel/qca-ppe-nss/**'
+      - '.github/workflows/nss-tools.yml'
+  pull_request:
+    paths:
+      - 'package/nss/**'
+      - 'package/kernel/qca-ppe-nss/**'
+      - '.github/workflows/nss-tools.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install shellcheck and busybox
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck busybox-static
+
+      # Everything in the package that is not markup or config, so a script
+      # added later is covered without anyone remembering to list it here.
+      # SC1091 only: the sourced files (/lib/nss/functions.sh, /etc/rc.common)
+      # are resolved on the router, not in the checkout.
+      - name: Lint every shipped script
+        run: |
+          set -euo pipefail
+          files=""
+          for f in package/nss/nss-tools/files/*; do
+            case "$f" in *.json|*.js|*.config|*.sysctl) continue ;; esac
+            files="$files $f"
+          done
+          echo "linting:$files"
+          # shellcheck disable=SC2086
+          shellcheck -s dash -S warning -e SC1091 $files
+
+      # The scripts run under busybox ash on the device. A construct dash
+      # accepts and ash does not would otherwise only surface on the router.
+      - name: Parse every shipped script with busybox ash
+        run: |
+          set -euo pipefail
+          for f in package/nss/nss-tools/files/*; do
+            case "$f" in *.json|*.js|*.config|*.sysctl) continue ;; esac
+            busybox sh -n "$f"
+          done
+
+  tests:
+    name: nss-status
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install busybox
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends busybox-static
+
+      - name: Run the suite
+        run: bash package/nss/nss-tools/tests/nss-status.test.sh
+
+      # Same suite, busybox shell and busybox text tools. The parsers lean on
+      # awk and sed behaviour that the two implementations do not share.
+      - name: Run the suite under busybox
+        run: |
+          set -euo pipefail
+          bb="$(mktemp -d)"
+          for a in sh awk sed grep head tr cat cut sort uniq wc dirname mktemp; do
+            ln -sf "$(command -v busybox)" "$bb/$a"
+          done
+          NSS_TEST_SH="$bb/sh" PATH="$bb:$PATH" \
+            bash package/nss/nss-tools/tests/nss-status.test.sh
