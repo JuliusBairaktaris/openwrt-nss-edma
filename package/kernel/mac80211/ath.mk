@@ -16,6 +16,9 @@ PKG_CONFIG_DEPENDS += \
 	CONFIG_ATH12K_THERMAL \
 	CONFIG_ATH_USER_REGD \
 	CONFIG_ATH11K_NSS_SUPPORT \
+	CONFIG_ATH11K_NSS_MESH_SUPPORT \
+	CONFIG_NSS_FIRMWARE_VERSION_11_4 \
+	CONFIG_NSS_FIRMWARE_VERSION_12_5 \
 	CONFIG_ATH11K_MEM_PROFILE_1G \
 	CONFIG_ATH11K_MEM_PROFILE_512M \
 	CONFIG_ATH11K_MEM_PROFILE_256M \
@@ -68,6 +71,7 @@ config-$(CONFIG_ATH10K_THERMAL) += ATH10K_THERMAL
 config-$(CONFIG_ATH11K_THERMAL) += ATH11K_THERMAL
 config-$(CONFIG_ATH12K_THERMAL) += ATH12K_THERMAL
 config-$(CONFIG_ATH11K_NSS_SUPPORT) += ATH11K_NSS_SUPPORT
+config-$(CONFIG_ATH11K_NSS_MESH_SUPPORT) += ATH11K_NSS_MESH_SUPPORT
 config-$(CONFIG_ATH11K_MEM_PROFILE_1G) += ATH11K_MEM_PROFILE_1G
 config-$(CONFIG_ATH11K_MEM_PROFILE_512M) += ATH11K_MEM_PROFILE_512M
 config-$(CONFIG_ATH11K_MEM_PROFILE_256M) += ATH11K_MEM_PROFILE_256M
@@ -389,6 +393,35 @@ define KernelPackage/ath11k/config
                   (wifili). Requires the qca-ppe-nss glue to arm the NSS
                   data plane before the firmware is booted; Wi-Fi starts
                   in host mode and is rebound with nss_offload=1 at runtime.
+
+       config ATH11K_NSS_MESH_SUPPORT
+               bool "Enable NSS 802.11s mesh offload (requires 11.4 firmware)"
+               depends on ATH11K_NSS_SUPPORT
+               # Hard requirement: every published NSS firmware newer than
+               # 11.4 rejects mesh interfaces at the firmware level (the
+               # capability probe reports no mesh support, and forcing past
+               # it gets the mesh-manager interface create NACKed - verified
+               # on 12.5-210 with both memory profiles). Mesh offload only
+               # works on the 11.4 firmware line.
+               # 'depends on' rather than 'select' because
+               # NSS_FIRMWARE_VERSION_11_4 is a choice member and selecting
+               # into a choice is unreliable.
+               depends on NSS_FIRMWARE_VERSION_11_4
+               # Same recursion constraint as ATH11K_NSS_SUPPORT above: the
+               # meshmgr module pull lives on kmod-mac80211's DEPENDS
+               # ('+ATH11K_NSS_MESH_SUPPORT:kmod-qca-nss-drv-wifi-meshmgr'),
+               # feature flags and packages are pulled via 'select' here.
+               select PACKAGE_kmod-qca-nss-drv-wifi-meshmgr
+               select NSS_DRV_WIFI_MESH_ENABLE
+               select PACKAGE_MAC80211_MESH
+               default n
+               help
+                  Say Y to offload 802.11s mesh forwarding (mesh path and
+                  proxy path tables) to the NSS cores via the Wi-Fi mesh
+                  manager. Only available with NSS firmware 11.4, the last
+                  firmware line that supports mesh; on newer firmware
+                  802.11s works on the host path only. Mesh interfaces use
+                  the NSS path only when the radio runs with nss_offload=1.
 
        config ATH11K_DEBUGFS_STA
                bool "Enable ath11k station statistics"

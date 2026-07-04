@@ -29,7 +29,7 @@ function stateBadge(state) {
 
 function row(label, value) {
 	return E('tr', { 'class': 'tr' }, [
-		E('td', { 'class': 'td left', 'width': '30%' }, label),
+		E('td', { 'class': 'td left', 'style': 'min-width:30%' }, label),
 		E('td', { 'class': 'td left' }, value)
 	]);
 }
@@ -51,18 +51,29 @@ function renderStatus(d) {
 		return i.port + (i.active ? ' ✓' : ' ✗');
 	}).join('  ');
 
-	var wifi = d.wifi_offload == 1 ? _('NSS offload active (wifili)') :
-	           d.wifi_offload == 0 ? _('host mode') : _('ath11k not loaded');
+	// d.mesh: {configured, fw_capable} - 802.11s mesh only offloads on the
+	// 11.4 firmware line; everywhere else it stays on the host path.
+	var mesh = d.mesh || {};
+	var wifi = d.wifi_offload == 1 ?
+	               (mesh.configured ? _('NSS offload active (wifili, 802.11s mesh offloaded)')
+	                                : _('NSS offload active (wifili)')) :
+	           d.wifi_offload == 0 ?
+	               (mesh.configured && mesh.fw_capable ? _('host mode (mesh configured; firmware supports mesh offload)') :
+	                mesh.configured ? _('host mode (mesh configured; mesh offload needs the 11.4 NSS firmware)') :
+	                                  _('host mode')) :
+	           _('ath11k not loaded');
 
+	// data-title lets the theme stack table rows into labeled cards on
+	// narrow (mobile) screens.
 	var portRows = (d.ports || []).map(function(p) {
 		return E('tr', { 'class': 'tr' }, [
-			E('td', { 'class': 'td' }, p.netdev),
-			E('td', { 'class': 'td' }, String(p.ifnum)),
-			E('td', { 'class': 'td' }, p.started ? _('yes') : _('no')),
-			E('td', { 'class': 'td' }, offl(p.tx_offloaded, p.tx_offload_pct)),
-			E('td', { 'class': 'td' }, String(p.tx_host_pkts)),
-			E('td', { 'class': 'td' }, offl(p.rx_offloaded, p.rx_offload_pct)),
-			E('td', { 'class': 'td' }, String(p.rx_host_pkts))
+			E('td', { 'class': 'td', 'data-title': _('Port') }, p.netdev),
+			E('td', { 'class': 'td', 'data-title': 'if_num' }, String(p.ifnum)),
+			E('td', { 'class': 'td', 'data-title': _('Started') }, p.started ? _('yes') : _('no')),
+			E('td', { 'class': 'td', 'data-title': _('TX offloaded') }, offl(p.tx_offloaded, p.tx_offload_pct)),
+			E('td', { 'class': 'td', 'data-title': _('TX via host') }, String(p.tx_host_pkts)),
+			E('td', { 'class': 'td', 'data-title': _('RX offloaded') }, offl(p.rx_offloaded, p.rx_offload_pct)),
+			E('td', { 'class': 'td', 'data-title': _('RX to host') }, String(p.rx_host_pkts))
 		]);
 	});
 
