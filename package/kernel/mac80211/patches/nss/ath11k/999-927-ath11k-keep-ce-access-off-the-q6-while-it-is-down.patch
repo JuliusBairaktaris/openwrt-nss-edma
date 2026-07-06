@@ -1,0 +1,119 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] ath11k: keep copy engine access off the Q6 while it is down
+
+On the AHB bus (IPQ8074) the WLAN copy engine register space is only
+accessible while the Q6 subsystem is powered; a read while TrustZone is
+tearing the subsystem down or bringing it back up raises a synchronous
+external abort in interrupt context and takes the whole SoC down.
+Observed on IPQ8074 during firmware recovery:
+
+  ath11k_ahb_ce_interrupt_handler
+    ath11k_ahb_ce_irq_disable        <- CE register read
+  (__scm_smc_call for the wcss stop concurrent on another CPU)
+
+Two paths reach CE registers inside that window:
+
+1. ath11k_core_reset() calls ath11k_hif_ce_irq_disable() before
+   ath11k_hif_power_down(), but the plain AHB hif ops do not implement
+   the ce_irq_enable/ce_irq_disable pair, so the copy engine interrupts
+   stay live across rproc_shutdown(). Implement the ops: mask the CE
+   interrupt-enable bits while the target is still powered, then wait
+   out in-flight handlers and tasklets - the same sequence the PCI bus
+   uses in ath11k_pcic_ce_irq_disable_sync() and ath11k_ahb_stop()
+   already uses on the shutdown path. ath11k_ahb_start() re-enables the
+   interrupts once the recovered firmware is up.
+
+2. When the firmware crashes, the remoteproc core stops the Q6 on its
+   own schedule, tens of milliseconds after the fatal-error IRQ and
+   while the just-crashed firmware's final burst of CE interrupts is
+   still being serviced - the driver gets no say in that ordering.
+   Gate the CE interrupt handler and tasklet on the remoteproc state:
+   it is moved off RPROC_RUNNING before the TrustZone teardown starts
+   and moved back only after the subsystem is powered up again. The CE
+   interrupts are edge triggered, so a skipped event cannot storm, and
+   the recovery path reprograms the rings from scratch anyway.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+
+Link: https://lore.kernel.org/ath11k/20260725141757.1316877-1-julius@bairaktaris.de/
+
+Note for whoever refreshes this tree: item 1 above has been submitted
+upstream on its own. Once it reaches the mac80211 backports this patch
+will no longer apply - drop the ahb.c hunks that implement the
+ce_irq_enable/ce_irq_disable ops and keep only the remoteproc-state gate
+from item 2, which is local to this tree.
+
+diff --git a/drivers/net/wireless/ath/ath11k/ahb.c b/drivers/net/wireless/ath/ath11k/ahb.c
+index 8d10eaa..fe9f451 100644
+--- a/drivers/net/wireless/ath/ath11k/ahb.c
++++ b/drivers/net/wireless/ath/ath11k/ahb.c
+@@ -371,6 +371,20 @@ static void ath11k_ahb_ce_irqs_disable(struct ath11k_base *ab)
+ 	}
+ }
+ 
++static void ath11k_ahb_ce_irq_disable_sync(struct ath11k_base *ab)
++{
++	/*
++	 * Once the firmware has crashed the copy engine register space
++	 * belongs to a subsystem TrustZone is tearing down; masking the
++	 * interrupt enable bits there would fault. Host side sync and
++	 * tasklet kill still have to run.
++	 */
++	if (!test_bit(ATH11K_FLAG_CRASH_FLUSH, &ab->dev_flags))
++		ath11k_ahb_ce_irqs_disable(ab);
++	ath11k_ahb_sync_ce_irqs(ab);
++	ath11k_ahb_kill_tasklets(ab);
++}
++
+ static int ath11k_ahb_start(struct ath11k_base *ab)
+ {
+ 	ath11k_ahb_ce_irqs_enable(ab);
+@@ -403,10 +417,7 @@ static void ath11k_ahb_ext_irq_disable(struct ath11k_base *ab)
+ 
+ static void ath11k_ahb_stop(struct ath11k_base *ab)
+ {
+-	if (!test_bit(ATH11K_FLAG_CRASH_FLUSH, &ab->dev_flags))
+-		ath11k_ahb_ce_irqs_disable(ab);
+-	ath11k_ahb_sync_ce_irqs(ab);
+-	ath11k_ahb_kill_tasklets(ab);
++	ath11k_ahb_ce_irq_disable_sync(ab);
+ 	timer_delete_sync(&ab->rx_replenish_retry);
+ 	ath11k_ce_cleanup_pipes(ab);
+ }
+@@ -478,6 +489,10 @@ static void ath11k_ahb_free_irq(struct ath11k_base *ab)
+ static void ath11k_ahb_ce_tasklet(struct tasklet_struct *t)
+ {
+ 	struct ath11k_ce_pipe *ce_pipe = from_tasklet(ce_pipe, t, intr_tq);
++	struct ath11k_ahb *ab_ahb = ath11k_ahb_priv(ce_pipe->ab);
++
++	if (ab_ahb->tgt_rproc->state != RPROC_RUNNING)
++		return;
+ 
+ 	ath11k_ce_per_engine_service(ce_pipe->ab, ce_pipe->pipe_num);
+ 
+@@ -487,6 +502,16 @@ static void ath11k_ahb_ce_tasklet(struct tasklet_struct *t)
+ static irqreturn_t ath11k_ahb_ce_interrupt_handler(int irq, void *arg)
+ {
+ 	struct ath11k_ce_pipe *ce_pipe = arg;
++	struct ath11k_ahb *ab_ahb = ath11k_ahb_priv(ce_pipe->ab);
++
++	/*
++	 * While the Q6 is stopped or booting, the WLAN CE register space
++	 * is not accessible; a read raises a synchronous external abort.
++	 * The remoteproc core marks the state before it starts the
++	 * TrustZone teardown, so skip the (edge triggered) interrupt.
++	 */
++	if (ab_ahb->tgt_rproc->state != RPROC_RUNNING)
++		return IRQ_HANDLED;
+ 
+ 	/* last interrupt received for this CE */
+ 	ce_pipe->timestamp = jiffies;
+@@ -808,6 +833,8 @@ static const struct ath11k_hif_ops ath11k_ahb_hif_ops_ipq8074 = {
+ 	.map_service_to_pipe = ath11k_ahb_map_service_to_pipe,
+ 	.power_down = ath11k_ahb_power_down,
+ 	.power_up = ath11k_ahb_power_up,
++	.ce_irq_enable = ath11k_ahb_ce_irqs_enable,
++	.ce_irq_disable = ath11k_ahb_ce_irq_disable_sync,
+ };
+ 
+ static const struct ath11k_hif_ops ath11k_ahb_hif_ops_wcn6750 = {
