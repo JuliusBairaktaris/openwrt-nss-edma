@@ -128,6 +128,7 @@
 
 /* QID to ring mapping */
 #define EDMA_QID2RID_TABLE_MEM(q) (0x5a000 + (0x4 * (q)))
+#define EDMA_QID2RID_TABLE_ENTRIES 64
 
 /* TXDESC to TXCMPL ring mapping */
 #define EDMA_REG_TXDESC2CMPL_MAP(n) (0x0c + 0x4 * (n))
