@@ -546,7 +546,13 @@ static int qca_ppe_port_enable(struct dsa_switch *ds, int port,
 {
 	struct qca_ppe_priv *priv = ds_to_priv(ds);
 
-	ppe_port_bridge_txmac_set(priv, port, true);
+	/* A user port's gate is opened by qca_ppe_mac_link_up() once its MAC
+	 * is up. DSA calls this before phylink_start(), so opening it here
+	 * would aim the fabric at a MAC that is still down and about to be
+	 * re-clocked. The CPU port has no MAC of ours to wait for.
+	 */
+	if (dsa_is_cpu_port(ds, port))
+		ppe_port_bridge_txmac_set(priv, port, true);
 
 	return 0;
 }
@@ -1014,6 +1020,45 @@ static void qca_ppe_mac_config(struct phylink_config *config,
 	}
 }
 
+static bool qca_ppe_port_uses_xgmac(unsigned int mode, phy_interface_t interface)
+{
+	switch (interface) {
+	case PHY_INTERFACE_MODE_2500BASEX:
+		return phylink_autoneg_inband(mode);
+	case PHY_INTERFACE_MODE_USXGMII:
+	case PHY_INTERFACE_MODE_10GBASER:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/* Release what is still in an XGMAC port's egress path by looping the
+ * transmitter back into it, as qca-ssdk does on link-down ("release ppe port
+ * egress packets when link down"). RX goes down in the same write: only the
+ * transmitter has to drain, and the loop would otherwise learn the hosts
+ * behind the other ports onto this one.
+ */
+static void ppe_port_xgmac_loopback_pulse(struct qca_ppe_priv *priv, int port,
+					  unsigned int mode,
+					  phy_interface_t interface)
+{
+	int xgmac = port - 5;
+
+	if (!qca_ppe_port_uses_xgmac(mode, interface))
+		return;
+
+	if (port < 5 || port >= priv->data->num_ports)
+		return;
+
+	regmap_update_bits(priv->regmap, PPE_XGMAC_RX_CONF(xgmac),
+			   PPE_XGMAC_LOOPBACK | PPE_XGMAC_RX_ENABLE,
+			   PPE_XGMAC_LOOPBACK);
+	usleep_range(1000, 2000);
+	regmap_clear_bits(priv->regmap, PPE_XGMAC_RX_CONF(xgmac),
+			  PPE_XGMAC_LOOPBACK);
+}
+
 static void qca_ppe_mac_link_down(struct phylink_config *config,
 				  unsigned int mode,
 				  phy_interface_t interface)
@@ -1022,7 +1067,32 @@ static void qca_ppe_mac_link_down(struct phylink_config *config,
 	struct qca_ppe_priv *priv = ds_to_priv(dp->ds);
 	int port = dp->index;
 
+	/* The CPU port is INTERNAL: it falls through both switches below
+	 * without its MAC being touched, and qca_ppe_mac_link_up() would not
+	 * re-open its gate. Leave it alone.
+	 */
+	if (dsa_is_cpu_port(dp->ds, port))
+		return;
+
 	qca_edma_port_transition_begin(ppe_port_conduit(dp), port);
+
+	/* Gate the fabric before the MAC is torn down; qca_ppe_mac_link_up()
+	 * turns it back on once the MAC is up. Left on across a flap, the
+	 * fabric dequeues into a MAC that is still being re-clocked and
+	 * latches the port's egress scheduler in a state only a reboot clears.
+	 */
+	ppe_port_bridge_txmac_set(priv, port, false);
+
+	/* Let the egress path drain before the MAC goes: packets stranded
+	 * there when the link drops wedge the queue manager for good. Same
+	 * 10ms as qca-ssdk, and the loopback pulse it added for XGMAC ports
+	 * to release what the wait does not. The pulse runs before the MAC
+	 * teardown because the loop is only a path for the queued packets
+	 * while the transmitter is still enabled.
+	 */
+	msleep(10);
+
+	ppe_port_xgmac_loopback_pulse(priv, port, mode, interface);
 
 	switch (interface) {
 	case PHY_INTERFACE_MODE_SGMII:
@@ -1046,19 +1116,6 @@ static void qca_ppe_mac_link_down(struct phylink_config *config,
 	}
 
 	return;
-}
-
-static bool qca_ppe_port_uses_xgmac(unsigned int mode, phy_interface_t interface)
-{
-	switch (interface) {
-	case PHY_INTERFACE_MODE_2500BASEX:
-		return phylink_autoneg_inband(mode);
-	case PHY_INTERFACE_MODE_USXGMII:
-	case PHY_INTERFACE_MODE_10GBASER:
-		return true;
-	default:
-		return false;
-	}
 }
 
 static void qca_ppe_mac_link_up(struct phylink_config *config,
@@ -1182,10 +1239,15 @@ static void qca_ppe_mac_link_up(struct phylink_config *config,
 		goto out;
 	}
 
-	/*
-	 * The transition mac_config opened must close on every exit path:
-	 * while it is open the conduit drops all host TX for the port, so
-	 * returning early leaves a link-up port unable to transmit.
+	/* MAC is up, so the fabric may feed the port again. The early exits
+	 * above bring no MAC up, so they skip this and leave the gate closed
+	 * on purpose.
+	 */
+	ppe_port_bridge_txmac_set(priv, port, true);
+
+	/* The transition mac_config opened must close on every exit path,
+	 * gate or no gate: while it is open the conduit drops all host TX for
+	 * the port.
 	 */
 out:
 	qca_edma_port_transition_end(ppe_port_conduit(dp), port);

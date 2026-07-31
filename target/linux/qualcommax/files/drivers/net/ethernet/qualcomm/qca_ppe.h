@@ -5,6 +5,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/bitmap.h>
+#include <linux/delay.h>
 #include <linux/regmap.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
@@ -138,6 +139,7 @@
 #define   PPE_XGMAC_CRC_STRIP_TYPE	BIT(2) /* Called CST */
 #define   PPE_XGMAC_GMII_MPLS_LAYER_CK	BIT(6) /* Called GMPSLCE */
 #define   PPE_XGMAC_WATCHDOG_DISABLE	BIT(7) /* Called WD */
+#define   PPE_XGMAC_LOOPBACK		BIT(10) /* Called LM */
 
 #define PPE_XGMAC_PACKET_FILTER(xgmac)	(PPE_MAC_XGMAC_CSR_BASE + (xgmac) * 0x4000 + 0x8)
 #define   PPE_XGMAC_PROMISCUOUS		BIT(0) /* Called PR */
