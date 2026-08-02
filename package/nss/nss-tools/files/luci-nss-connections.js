@@ -125,7 +125,9 @@ function render_rows() {
 		shown++;
 		dataBody.appendChild(E('tr', { 'class': 'tr' }, cells.map(function(v, i) {
 			// data-title: mobile-stacked rows keep their column labels
-			return E('td', { 'class': 'td', 'data-title': _(COLS[i].title) }, v);
+			// Array, not bare string: E() would assign the cell to innerHTML,
+			// and these carry addresses and names off the wire.
+			return E('td', { 'class': 'td', 'data-title': _(COLS[i].title) }, [ v ]);
 		})));
 	});
 

@@ -24,13 +24,16 @@ function stateBadge(state) {
 	var m = map[state] || ['#757575', state];
 	return E('div', {
 		'style': 'display:inline-block;padding:.3em .8em;border-radius:.3em;color:#fff;font-weight:bold;background:' + m[0]
-	}, m[1]);
+	}, [ m[1] ]);
 }
 
+// Every value below is device-derived (firmware version strings, netdev
+// names, counters). LuCI's E() assigns a bare string to innerHTML and only
+// builds text nodes for array members, so the brackets are load-bearing.
 function row(label, value) {
 	return E('tr', { 'class': 'tr' }, [
 		E('td', { 'class': 'td left', 'style': 'min-width:30%' }, label),
-		E('td', { 'class': 'td left' }, value)
+		E('td', { 'class': 'td left' }, Array.isArray(value) ? value : [ value ])
 	]);
 }
 
@@ -67,13 +70,13 @@ function renderStatus(d) {
 	// narrow (mobile) screens.
 	var portRows = (d.ports || []).map(function(p) {
 		return E('tr', { 'class': 'tr' }, [
-			E('td', { 'class': 'td', 'data-title': _('Port') }, p.netdev),
-			E('td', { 'class': 'td', 'data-title': 'if_num' }, String(p.ifnum)),
-			E('td', { 'class': 'td', 'data-title': _('Started') }, p.started ? _('yes') : _('no')),
-			E('td', { 'class': 'td', 'data-title': _('TX offloaded') }, offl(p.tx_offloaded, p.tx_offload_pct)),
-			E('td', { 'class': 'td', 'data-title': _('TX via host') }, String(p.tx_host_pkts)),
-			E('td', { 'class': 'td', 'data-title': _('RX offloaded') }, offl(p.rx_offloaded, p.rx_offload_pct)),
-			E('td', { 'class': 'td', 'data-title': _('RX to host') }, String(p.rx_host_pkts))
+			E('td', { 'class': 'td', 'data-title': _('Port') }, [ p.netdev ]),
+			E('td', { 'class': 'td', 'data-title': 'if_num' }, [ String(p.ifnum) ]),
+			E('td', { 'class': 'td', 'data-title': _('Started') }, [ p.started ? _('yes') : _('no') ]),
+			E('td', { 'class': 'td', 'data-title': _('TX offloaded') }, [ offl(p.tx_offloaded, p.tx_offload_pct) ]),
+			E('td', { 'class': 'td', 'data-title': _('TX via host') }, [ String(p.tx_host_pkts) ]),
+			E('td', { 'class': 'td', 'data-title': _('RX offloaded') }, [ offl(p.rx_offloaded, p.rx_offload_pct) ]),
+			E('td', { 'class': 'td', 'data-title': _('RX to host') }, [ String(p.rx_host_pkts) ])
 		]);
 	});
 
