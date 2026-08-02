@@ -234,6 +234,7 @@
 #define PPE_XLT_RULE_TBL(idx)		(PPE_IVLAN_BASE + 0x2000 + (idx) * 0x10)
 #define   PPE_XLT_VALID			BIT(0)
 #define   PPE_XLT_PORT_BMP		GENMASK(8, 1)
+#define   PPE_XLT_SKEY_FMT		GENMASK(11, 9)
 #define   PPE_XLT_CKEY_FMT_0		BIT(31)
 
 #define PPE_XLT_RULE_W1(idx)		(PPE_IVLAN_BASE + 0x2000 + (idx) * 0x10 + 0x4)
@@ -257,6 +258,20 @@
 #define PPE_EG_BRIDGE_CONFIG		(PPE_PTX_BASE + 0x6000)
 #define   PPE_EG_L2_EDIT_EN		BIT(1)
 #define   PPE_EG_QUEUE_CNT_EN		BIT(2)
+
+#define PPE_EG_XLT_TBL_NUM		64
+#define PPE_EG_XLT_RULE(idx)		(PPE_PTX_BASE + 0x200 + (idx) * 0x8)
+#define   PPE_EG_XLT_RULE_VALID		BIT(0)
+#define   PPE_EG_XLT_RULE_PORT_BMP	GENMASK(8, 1)
+#define   PPE_EG_XLT_RULE_VSI_INCL	BIT(9)
+#define   PPE_EG_XLT_RULE_VSI		GENMASK(14, 10)
+#define   PPE_EG_XLT_RULE_VSI_VALID	BIT(15)
+#define   PPE_EG_XLT_RULE_SKEY_FMT	GENMASK(18, 16)
+#define   PPE_EG_XLT_RULE_CKEY_FMT_W1	GENMASK(8, 6)
+#define PPE_EG_XLT_ACTION(idx)		(PPE_PTX_BASE + 0xd000 + (idx) * 0x8)
+#define   PPE_EG_XLT_CVID_CMD		GENMASK(16, 15)
+#define   PPE_EG_XLT_CVID_ADDORREPLACE	1
+#define   PPE_EG_XLT_CVID		GENMASK(28, 17)
 
 #define PPE_PORT_EG_VLAN(port)		(PPE_PTX_BASE + 0x420 + (port) * 0x4)
 #define   PPE_PORT_EG_VLAN_CTAG_MODE	GENMASK(2, 1)
@@ -539,6 +554,7 @@ struct qca_ppe_vlan_entry {
 	u8 pvid_ports;
 	int xlt_idx;
 	int xlt_pvid_idx;
+	int eg_xlt_idx;
 };
 
 struct qca_ppe_priv {
@@ -550,6 +566,7 @@ struct qca_ppe_priv {
 	spinlock_t fdb_lock;
 	DECLARE_BITMAP(vsi_bitmap, PPE_VSI_MAX);
 	DECLARE_BITMAP(xlt_bitmap, PPE_XLT_TBL_NUM);
+	DECLARE_BITMAP(eg_xlt_bitmap, PPE_EG_XLT_TBL_NUM);
 	u32 port_vsi[QCA_PPE_MAX_PORTS];
 	u32 port_fw_vsi[QCA_PPE_MAX_PORTS];
 	struct qca_ppe_bridge_vsi bridges[QCA_PPE_MAX_BRIDGES];
@@ -575,6 +592,8 @@ static inline struct qca_ppe_priv *ds_to_priv(struct dsa_switch *ds)
 
 void ppe_scheduler_init(struct qca_ppe_priv *priv);
 
+struct qca_ppe_priv *qca_ppe_user_port_resolve(struct net_device *netdev,
+					       int *port);
 int ppe_vsi_alloc(struct qca_ppe_priv *priv);
 void ppe_vsi_free(struct qca_ppe_priv *priv, u32 vsi);
 void ppe_vsi_member_set(struct qca_ppe_priv *priv, u32 vsi, u32 portmask);

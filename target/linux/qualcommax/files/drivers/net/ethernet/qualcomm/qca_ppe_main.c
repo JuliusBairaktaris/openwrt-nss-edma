@@ -1581,8 +1581,8 @@ static const struct dsa_switch_ops qca_ppe_ops = {
  * The VSI stays allocated for the switch lifetime (one per user port,
  * out of 32). Callers hold rtnl. Returns the VSI or -errno.
  */
-static struct qca_ppe_priv *fw_vsi_port_resolve(struct net_device *netdev,
-						int *port)
+struct qca_ppe_priv *qca_ppe_user_port_resolve(struct net_device *netdev,
+					       int *port)
 {
 	struct dsa_port *dp;
 
@@ -1626,7 +1626,7 @@ int qca_ppe_port_fw_vsi_get(struct net_device *netdev)
 	struct qca_ppe_priv *priv;
 	int port, vsi;
 
-	priv = fw_vsi_port_resolve(netdev, &port);
+	priv = qca_ppe_user_port_resolve(netdev, &port);
 	if (!priv)
 		return -ENODEV;
 
@@ -1660,7 +1660,7 @@ int qca_ppe_port_fw_vsi_refresh(struct net_device *netdev)
 	struct qca_ppe_priv *priv;
 	int port;
 
-	priv = fw_vsi_port_resolve(netdev, &port);
+	priv = qca_ppe_user_port_resolve(netdev, &port);
 	if (!priv)
 		return -ENODEV;
 
