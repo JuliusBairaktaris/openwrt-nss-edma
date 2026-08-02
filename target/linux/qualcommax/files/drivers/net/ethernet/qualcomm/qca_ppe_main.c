@@ -1007,6 +1007,19 @@ static void qca_ppe_mac_link_down(struct phylink_config *config,
 	return;
 }
 
+static bool qca_ppe_port_uses_xgmac(unsigned int mode, phy_interface_t interface)
+{
+	switch (interface) {
+	case PHY_INTERFACE_MODE_2500BASEX:
+		return phylink_autoneg_inband(mode);
+	case PHY_INTERFACE_MODE_USXGMII:
+	case PHY_INTERFACE_MODE_10GBASER:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static void qca_ppe_mac_link_up(struct phylink_config *config,
 				     struct phy_device *phydev,
 				     unsigned int mode,
@@ -1025,6 +1038,8 @@ static void qca_ppe_mac_link_up(struct phylink_config *config,
 	     interface == PHY_INTERFACE_MODE_10GBASER) &&
 	     port < 5)
 		return;
+
+	priv->port_xgmac[port] = qca_ppe_port_uses_xgmac(mode, interface);
 
 	switch (interface) {
 	case PHY_INTERFACE_MODE_SGMII:
@@ -1208,52 +1223,245 @@ static const struct qca_ppe_mib_desc qca_ppe_mib[] = {
 	MIB32(PPE_MIB_TXUNI,		"tx_unicast"),
 };
 
+static const struct qca_ppe_mib_desc qca_ppe_xgmib[] = {
+	MIB64(PPE_XGMIB_RXPKT_GB,	"rx_packets"),
+	MIB64(PPE_XGMIB_RXBYTE_GB,	"rx_bytes"),
+	MIB64(PPE_XGMIB_RXBYTE,		"rx_good_bytes"),
+	MIB64(PPE_XGMIB_RXUNI,		"rx_unicast"),
+	MIB64(PPE_XGMIB_RXBROAD,	"rx_broadcast"),
+	MIB64(PPE_XGMIB_RXMULTI,	"rx_multicast"),
+	MIB64(PPE_XGMIB_RXPAUSE,	"rx_pause"),
+	MIB64(PPE_XGMIB_RXVLAN_GB,	"rx_vlan"),
+	MIB64(PPE_XGMIB_RXFCSERR,	"rx_fcs_error"),
+	MIB32(PPE_XGMIB_RXRUNT,		"rx_runt"),
+	MIB32(PPE_XGMIB_RXJABBER,	"rx_jabber"),
+	MIB32(PPE_XGMIB_RXUNDERSIZE,	"rx_undersize"),
+	MIB32(PPE_XGMIB_RXOVERSIZE,	"rx_oversize"),
+	MIB32(PPE_XGMIB_RXWATCHDOG,	"rx_watchdog_error"),
+	MIB64(PPE_XGMIB_RXLENGTHERR,	"rx_length_error"),
+	MIB64(PPE_XGMIB_RXOUTOFRANGE,	"rx_out_of_range"),
+	MIB64(PPE_XGMIB_RXFIFOOVER,	"rx_fifo_overflow"),
+	MIB64(PPE_XGMIB_RXDISCARD,	"rx_discard"),
+	MIB64(PPE_XGMIB_RXDISCARDBYTE,	"rx_discard_bytes"),
+	MIB64(PPE_XGMIB_RXPKT64,	"rx_64byte"),
+	MIB64(PPE_XGMIB_RXPKT65TO127,	"rx_65_127byte"),
+	MIB64(PPE_XGMIB_RXPKT128TO255,	"rx_128_255byte"),
+	MIB64(PPE_XGMIB_RXPKT256TO511,	"rx_256_511byte"),
+	MIB64(PPE_XGMIB_RXPKT512TO1023,	"rx_512_1023byte"),
+	MIB64(PPE_XGMIB_RXPKT1024TOX,	"rx_1024_maxbyte"),
+	MIB64(PPE_XGMIB_TXPKT_GB,	"tx_packets"),
+	MIB64(PPE_XGMIB_TXBYTE_GB,	"tx_bytes"),
+	MIB64(PPE_XGMIB_TXPKT,		"tx_good_packets"),
+	MIB64(PPE_XGMIB_TXBYTE,		"tx_good_bytes"),
+	MIB64(PPE_XGMIB_TXUNI_GB,	"tx_unicast"),
+	MIB64(PPE_XGMIB_TXBROAD_GB,	"tx_broadcast"),
+	MIB64(PPE_XGMIB_TXMULTI_GB,	"tx_multicast"),
+	MIB64(PPE_XGMIB_TXPAUSE,	"tx_pause"),
+	MIB64(PPE_XGMIB_TXVLAN,		"tx_vlan"),
+	MIB64(PPE_XGMIB_TXUNDERFLOW,	"tx_underflow"),
+	MIB64(PPE_XGMIB_TXPKT64,	"tx_64byte"),
+	MIB64(PPE_XGMIB_TXPKT65TO127,	"tx_65_127byte"),
+	MIB64(PPE_XGMIB_TXPKT128TO255,	"tx_128_255byte"),
+	MIB64(PPE_XGMIB_TXPKT256TO511,	"tx_256_511byte"),
+	MIB64(PPE_XGMIB_TXPKT512TO1023,	"tx_512_1023byte"),
+	MIB64(PPE_XGMIB_TXPKT1024TOX,	"tx_1024_maxbyte"),
+};
+
+/*
+ * Ports 5 and 6 carry a GMAC and an XGMAC each and only the one the port is
+ * muxed to counts, so both the counter set and its register block follow the
+ * mux rather than the port number.
+ */
+static const struct qca_ppe_mib_desc *qca_ppe_port_mib(struct qca_ppe_priv *priv,
+						       int port, unsigned int *base,
+						       size_t *count)
+{
+	if (priv->port_xgmac[port]) {
+		*base = PPE_XGMAC_MIB(port - 5);
+		*count = ARRAY_SIZE(qca_ppe_xgmib);
+		return qca_ppe_xgmib;
+	}
+
+	*base = PPE_GMAC_MIB(port - 1, 0);
+	*count = ARRAY_SIZE(qca_ppe_mib);
+	return qca_ppe_mib;
+}
+
+static u32 qca_ppe_mib_read(struct qca_ppe_priv *priv, unsigned int base,
+			    unsigned int offset)
+{
+	u32 val = 0;
+
+	regmap_read(priv->regmap, base + offset, &val);
+
+	return val;
+}
+
+static u64 qca_ppe_mib_read64(struct qca_ppe_priv *priv, unsigned int base,
+			      unsigned int offset)
+{
+	u32 lo = qca_ppe_mib_read(priv, base, offset);
+	u32 hi = qca_ppe_mib_read(priv, base, offset + 4);
+
+	return (u64)hi << 32 | lo;
+}
+
 static void qca_ppe_get_strings(struct dsa_switch *ds, int port,
 				    u32 stringset, uint8_t *data)
 {
-	int i;
+	struct qca_ppe_priv *priv = ds_to_priv(ds);
+	const struct qca_ppe_mib_desc *mib;
+	unsigned int base;
+	size_t i, count;
 
 	if (stringset != ETH_SS_STATS)
 		return;
 
-	for (i = 0; i < ARRAY_SIZE(qca_ppe_mib); i++)
-		ethtool_puts(&data, qca_ppe_mib[i].name);
+	mib = qca_ppe_port_mib(priv, port, &base, &count);
+	for (i = 0; i < count; i++)
+		ethtool_puts(&data, mib[i].name);
 }
 
 static int qca_ppe_get_sset_count(struct dsa_switch *ds, int port,
 				      int sset)
 {
+	struct qca_ppe_priv *priv = ds_to_priv(ds);
+	unsigned int base;
+	size_t count;
+
 	if (sset != ETH_SS_STATS)
 		return 0;
 
-	return ARRAY_SIZE(qca_ppe_mib);
+	qca_ppe_port_mib(priv, port, &base, &count);
+
+	return count;
 }
 
 static void qca_ppe_get_ethtool_stats(struct dsa_switch *ds, int port,
 					  uint64_t *data)
 {
 	struct qca_ppe_priv *priv = ds_to_priv(ds);
-	int gmac = port - 1;
-	int i;
+	const struct qca_ppe_mib_desc *mib;
+	unsigned int base;
+	size_t i, count;
+
+	mib = qca_ppe_port_mib(priv, port, &base, &count);
 
 	if (port < 1 || port >= ds->num_ports) {
-		memset(data, 0, sizeof(u64) * ARRAY_SIZE(qca_ppe_mib));
+		memset(data, 0, sizeof(u64) * count);
 		return;
 	}
 
-	for (i = 0; i < ARRAY_SIZE(qca_ppe_mib); i++) {
-		const struct qca_ppe_mib_desc *mib = &qca_ppe_mib[i];
-		u32 val, hi;
-
-		regmap_read(priv->regmap, PPE_GMAC_MIB(gmac, mib->offset), &val);
-		if (mib->size == 2)
-			regmap_read(priv->regmap,
-				    PPE_GMAC_MIB(gmac, mib->offset + 4), &hi);
-
-		data[i] = val;
-		if (mib->size == 2)
-			data[i] |= (u64)hi << 32;
+	for (i = 0; i < count; i++) {
+		if (mib[i].size == 2)
+			data[i] = qca_ppe_mib_read64(priv, base, mib[i].offset);
+		else
+			data[i] = qca_ppe_mib_read(priv, base, mib[i].offset);
 	}
+}
+
+static void qca_ppe_get_gmac_stats64(struct qca_ppe_priv *priv,
+				     unsigned int base,
+				     struct rtnl_link_stats64 *s)
+{
+	u32 rx_multi, tx_multi;
+
+	rx_multi = qca_ppe_mib_read(priv, base, PPE_MIB_RXMULTI);
+	tx_multi = qca_ppe_mib_read(priv, base, PPE_MIB_TXMULTI);
+
+	s->rx_packets = qca_ppe_mib_read(priv, base, PPE_MIB_RXUNI) +
+			qca_ppe_mib_read(priv, base, PPE_MIB_RXBROAD) +
+			rx_multi;
+	s->tx_packets = qca_ppe_mib_read(priv, base, PPE_MIB_TXUNI) +
+			qca_ppe_mib_read(priv, base, PPE_MIB_TXBROAD) +
+			tx_multi;
+	s->rx_bytes = qca_ppe_mib_read64(priv, base, PPE_MIB_RXGOODBYTE_L);
+	s->tx_bytes = qca_ppe_mib_read64(priv, base, PPE_MIB_TXBYTE_L);
+	s->multicast = rx_multi;
+
+	s->rx_crc_errors = qca_ppe_mib_read(priv, base, PPE_MIB_RXFCSERR) +
+			   qca_ppe_mib_read(priv, base, PPE_MIB_RXJUMBOFCSERR);
+	s->rx_frame_errors = qca_ppe_mib_read(priv, base, PPE_MIB_RXALIGNERR) +
+			     qca_ppe_mib_read(priv, base,
+					      PPE_MIB_RXJUMBOALIGNERR);
+	s->rx_length_errors = qca_ppe_mib_read(priv, base, PPE_MIB_RXRUNT) +
+			      qca_ppe_mib_read(priv, base, PPE_MIB_RXFRAG) +
+			      qca_ppe_mib_read(priv, base, PPE_MIB_RXTOOLONG);
+	s->rx_errors = s->rx_crc_errors + s->rx_frame_errors +
+		       s->rx_length_errors;
+
+	s->tx_fifo_errors = qca_ppe_mib_read(priv, base, PPE_MIB_TXUNDERRUN);
+	s->tx_aborted_errors = qca_ppe_mib_read(priv, base, PPE_MIB_TXABORTCOL);
+	s->tx_window_errors = qca_ppe_mib_read(priv, base, PPE_MIB_TXLATECOL);
+	s->tx_errors = s->tx_fifo_errors + s->tx_aborted_errors +
+		       s->tx_window_errors;
+
+	s->collisions = qca_ppe_mib_read(priv, base, PPE_MIB_TXCOLLISIONS);
+}
+
+/*
+ * The XGMAC has no alignment-error or collision counters - it is full duplex
+ * only - so the fields the GMAC fills from those stay zero.
+ */
+static void qca_ppe_get_xgmac_stats64(struct qca_ppe_priv *priv,
+				      unsigned int base,
+				      struct rtnl_link_stats64 *s)
+{
+	u64 rx_multi;
+
+	rx_multi = qca_ppe_mib_read64(priv, base, PPE_XGMIB_RXMULTI);
+
+	s->rx_packets = qca_ppe_mib_read64(priv, base, PPE_XGMIB_RXUNI) +
+			qca_ppe_mib_read64(priv, base, PPE_XGMIB_RXBROAD) +
+			rx_multi;
+	s->tx_packets = qca_ppe_mib_read64(priv, base, PPE_XGMIB_TXPKT);
+	s->rx_bytes = qca_ppe_mib_read64(priv, base, PPE_XGMIB_RXBYTE);
+	s->tx_bytes = qca_ppe_mib_read64(priv, base, PPE_XGMIB_TXBYTE);
+	s->multicast = rx_multi;
+
+	s->rx_crc_errors = qca_ppe_mib_read64(priv, base, PPE_XGMIB_RXFCSERR);
+	s->rx_length_errors = qca_ppe_mib_read64(priv, base,
+						 PPE_XGMIB_RXLENGTHERR) +
+			      qca_ppe_mib_read(priv, base, PPE_XGMIB_RXRUNT) +
+			      qca_ppe_mib_read(priv, base, PPE_XGMIB_RXJABBER);
+	s->rx_fifo_errors = qca_ppe_mib_read64(priv, base,
+					       PPE_XGMIB_RXFIFOOVER);
+	s->rx_missed_errors = qca_ppe_mib_read64(priv, base,
+						 PPE_XGMIB_RXDISCARD);
+	s->rx_errors = s->rx_crc_errors + s->rx_length_errors +
+		       s->rx_fifo_errors;
+
+	s->tx_fifo_errors = qca_ppe_mib_read64(priv, base,
+					       PPE_XGMIB_TXUNDERFLOW);
+	s->tx_errors = s->tx_fifo_errors;
+}
+
+static void qca_ppe_get_stats64(struct dsa_switch *ds, int port,
+				struct rtnl_link_stats64 *s)
+{
+	struct qca_ppe_priv *priv = ds_to_priv(ds);
+	unsigned int base;
+	size_t count;
+
+	if (port < 1 || port >= ds->num_ports)
+		return;
+
+	qca_ppe_port_mib(priv, port, &base, &count);
+
+	if (priv->port_xgmac[port])
+		qca_ppe_get_xgmac_stats64(priv, base, s);
+	else
+		qca_ppe_get_gmac_stats64(priv, base, s);
+
+	/*
+	 * The MIB counts what the MAC put on the wire, so it cannot see a frame
+	 * dropped on the way to it. Software drops live in the netdev's own
+	 * counters - notably every frame the NSS firmware data plane refuses,
+	 * which nss-drv counts here and reports to us as NETDEV_TX_OK - and
+	 * rebuilding the whole struct from the MIB erased them. Carry them over.
+	 */
+	s->tx_dropped = dsa_to_port(ds, port)->user->stats.tx_dropped;
+	s->rx_dropped = dsa_to_port(ds, port)->user->stats.rx_dropped;
 }
 
 static void qca_ppe_port_stp_state_set(struct dsa_switch *ds, int port,
@@ -1304,6 +1512,7 @@ static const struct dsa_switch_ops qca_ppe_ops = {
 	.get_strings		= qca_ppe_get_strings,
 	.get_sset_count		= qca_ppe_get_sset_count,
 	.get_ethtool_stats	= qca_ppe_get_ethtool_stats,
+	.get_stats64		= qca_ppe_get_stats64,
 };
 
 static void ppe_vsi_init(struct qca_ppe_priv *priv)

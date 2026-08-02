@@ -155,6 +155,51 @@
 #define PPE_XGMAC_RX_FLOW_CTRL(xgmac)	(PPE_MAC_XGMAC_CSR_BASE + (xgmac) * 0x4000 + 0x90)
 #define   PPE_XGMAC_RX_FLOW_ENABLE	BIT(0)
 
+#define PPE_XGMAC_MIB(xgmac)		(PPE_MAC_XGMAC_CSR_BASE + (xgmac) * 0x4000)
+#define   PPE_XGMIB_TXBYTE_GB		0x814
+#define   PPE_XGMIB_TXPKT_GB		0x81c
+#define   PPE_XGMIB_TXBROAD		0x824
+#define   PPE_XGMIB_TXMULTI		0x82c
+#define   PPE_XGMIB_TXPKT64		0x834
+#define   PPE_XGMIB_TXPKT65TO127	0x83c
+#define   PPE_XGMIB_TXPKT128TO255	0x844
+#define   PPE_XGMIB_TXPKT256TO511	0x84c
+#define   PPE_XGMIB_TXPKT512TO1023	0x854
+#define   PPE_XGMIB_TXPKT1024TOX	0x85c
+#define   PPE_XGMIB_TXUNI_GB		0x864
+#define   PPE_XGMIB_TXMULTI_GB		0x86c
+#define   PPE_XGMIB_TXBROAD_GB		0x874
+#define   PPE_XGMIB_TXUNDERFLOW		0x87c
+#define   PPE_XGMIB_TXBYTE		0x884
+#define   PPE_XGMIB_TXPKT		0x88c
+#define   PPE_XGMIB_TXPAUSE		0x894
+#define   PPE_XGMIB_TXVLAN		0x89c
+#define   PPE_XGMIB_RXPKT_GB		0x900
+#define   PPE_XGMIB_RXBYTE_GB		0x908
+#define   PPE_XGMIB_RXBYTE		0x910
+#define   PPE_XGMIB_RXBROAD		0x918
+#define   PPE_XGMIB_RXMULTI		0x920
+#define   PPE_XGMIB_RXFCSERR		0x928
+#define   PPE_XGMIB_RXRUNT		0x930
+#define   PPE_XGMIB_RXJABBER		0x934
+#define   PPE_XGMIB_RXUNDERSIZE		0x938
+#define   PPE_XGMIB_RXOVERSIZE		0x93c
+#define   PPE_XGMIB_RXPKT64		0x940
+#define   PPE_XGMIB_RXPKT65TO127	0x948
+#define   PPE_XGMIB_RXPKT128TO255	0x950
+#define   PPE_XGMIB_RXPKT256TO511	0x958
+#define   PPE_XGMIB_RXPKT512TO1023	0x960
+#define   PPE_XGMIB_RXPKT1024TOX	0x968
+#define   PPE_XGMIB_RXUNI		0x970
+#define   PPE_XGMIB_RXLENGTHERR		0x978
+#define   PPE_XGMIB_RXOUTOFRANGE	0x980
+#define   PPE_XGMIB_RXPAUSE		0x988
+#define   PPE_XGMIB_RXFIFOOVER		0x990
+#define   PPE_XGMIB_RXVLAN_GB		0x998
+#define   PPE_XGMIB_RXWATCHDOG		0x9a0
+#define   PPE_XGMIB_RXDISCARD		0x9ac
+#define   PPE_XGMIB_RXDISCARDBYTE	0x9b4
+
 /* --- PRX (base 0x00b000) --- */
 #define PPE_PRX_BASE			0x00b000
 
@@ -513,6 +558,7 @@ struct qca_ppe_priv {
 	struct clk *port_rx_clk[QCA_PPE_MAX_PORTS];
 	struct clk *port_tx_clk[QCA_PPE_MAX_PORTS];
 	struct reset_control *port_rst[QCA_PPE_MAX_PORTS];
+	bool port_xgmac[QCA_PPE_MAX_PORTS];
 };
 
 extern const struct psch_tdm_data cppe_psch_tdm_data;
