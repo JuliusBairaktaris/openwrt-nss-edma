@@ -19,7 +19,7 @@ ath11k_ce_send() already has for the WMI path.
 Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 
 diff --git a/drivers/net/wireless/ath/ath11k/dp_tx.c b/drivers/net/wireless/ath/ath11k/dp_tx.c
-index cd0013a..aa2cda3 100644
+index e1fd2b7..7072dad 100644
 --- a/drivers/net/wireless/ath/ath11k/dp_tx.c
 +++ b/drivers/net/wireless/ath/ath11k/dp_tx.c
 @@ -142,6 +142,17 @@ int ath11k_dp_tx(struct ath11k *ar, struct ath11k_vif *arvif,

@@ -22,10 +22,10 @@ Signed-off-by: Rameshkumar Sundaram <ramess@codeaurora.org>
  2 files changed, 26 insertions(+), 29 deletions(-)
 
 diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
-index c7a1751..d1bedda 100644
+index 36a9b8d..caab1f2 100644
 --- a/drivers/net/wireless/ath/ath11k/mac.c
 +++ b/drivers/net/wireless/ath/ath11k/mac.c
-@@ -7602,8 +7602,10 @@ err_vdev_del:
+@@ -7605,8 +7605,10 @@ err_vdev_del:
  	kfree(arvif->vlan_keyid_map);
  	ath11k_peer_cleanup(ar, arvif->vdev_id);
  

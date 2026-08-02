@@ -12,10 +12,10 @@ Signed-off-by: Sathishkumar Muruganandam <murugana@codeaurora.org>
  2 files changed, 473 insertions(+), 28 deletions(-)
 
 diff --git a/drivers/net/wireless/ath/ath11k/nss.c b/drivers/net/wireless/ath/ath11k/nss.c
-index 3aeb999..fd2ff3e 100644
+index c8d49eb..e6bac3c 100644
 --- a/drivers/net/wireless/ath/ath11k/nss.c
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
-@@ -307,6 +307,22 @@ void ath11k_nss_wifili_event_receive(struct ath11k_base *ab, struct nss_wifili_m
+@@ -319,6 +319,22 @@ void ath11k_nss_wifili_event_receive(struct ath11k_base *ab, struct nss_wifili_m
  	case NSS_WIFILI_TID_REOQ_SETUP_MSG:
  		/* TODO setup tidq */
  		break;
@@ -38,7 +38,7 @@ index 3aeb999..fd2ff3e 100644
  	default:
  		ath11k_dbg(ab, ATH11K_DBG_NSS, "unhandled event %d\n", msg_type);
  		break;
-@@ -417,13 +433,6 @@ static void ath11k_nss_vdev_event_receive(void *dev, struct nss_cmn_msg *vdev_ms
+@@ -429,13 +445,6 @@ static void ath11k_nss_vdev_event_receive(void *dev, struct nss_cmn_msg *vdev_ms
  	/*TODO*/
  }
  
@@ -52,7 +52,7 @@ index 3aeb999..fd2ff3e 100644
  /* TODO: move to mac80211 after cleanups/refactoring required after feature completion */
  static int ath11k_nss_deliver_rx(struct ieee80211_vif *vif, struct sk_buff *skb,
  				 bool eth,  int data_offs, struct napi_struct *napi)
-@@ -547,11 +556,239 @@ static int ath11k_nss_undecap_nwifi(struct ath11k_vif *arvif, struct sk_buff *sk
+@@ -559,11 +568,239 @@ static int ath11k_nss_undecap_nwifi(struct ath11k_vif *arvif, struct sk_buff *sk
  	return 0;
  }
  
@@ -293,7 +293,7 @@ index 3aeb999..fd2ff3e 100644
  	struct wireless_dev *wdev = NULL;
  	struct ieee80211_vif *vif = NULL;
  	struct ath11k_vif *arvif;
-@@ -591,28 +828,16 @@ ath11k_nss_vdev_data_receive(struct net_device *dev, struct sk_buff *skb,
+@@ -603,28 +840,16 @@ ath11k_nss_vdev_data_receive(struct net_device *dev, struct sk_buff *skb,
  	ath11k_dbg_dump(ab, ATH11K_DBG_DP_RX, "", "dp rx msdu from nss: ",
  			skb->data, skb->len);
  
@@ -329,7 +329,7 @@ index 3aeb999..fd2ff3e 100644
  		dev_kfree_skb_any(skb);
  		return;
  	}
-@@ -1324,7 +1549,7 @@ void ath11k_nss_update_sta_rxrate(struct hal_rx_mon_ppdu_info *ppdu_info,
+@@ -1336,7 +1561,7 @@ void ath11k_nss_update_sta_rxrate(struct hal_rx_mon_ppdu_info *ppdu_info,
  	peer->nss.nss_stats->rxrate.bw = ath11k_mac_bw_to_mac80211_bw(ppdu_info->bw);
  }
  
@@ -338,7 +338,7 @@ index 3aeb999..fd2ff3e 100644
  {
  	struct nss_wifili_peer_msg *peer_msg;
  	struct nss_wifili_msg *wlmsg = NULL;
-@@ -1338,9 +1563,10 @@ int ath11k_nss_peer_delete(struct ath11k_base *ab, const u8 *addr)
+@@ -1350,9 +1575,10 @@ int ath11k_nss_peer_delete(struct ath11k_base *ab, const u8 *addr)
  
  	spin_lock_bh(&ab->base_lock);
  
@@ -351,7 +351,7 @@ index 3aeb999..fd2ff3e 100644
  		spin_unlock_bh(&ab->base_lock);
  		return -EINVAL;
  	}
-@@ -1413,8 +1639,9 @@ free_peer:
+@@ -1423,8 +1649,9 @@ free_peer:
  	return ret;
  }
  
@@ -362,7 +362,7 @@ index 3aeb999..fd2ff3e 100644
  	struct nss_wifili_peer_msg *peer_msg;
  	struct nss_wifili_msg *wlmsg = NULL;
  	nss_wifili_msg_callback_t msg_cb;
-@@ -1471,17 +1698,23 @@ int ath11k_nss_peer_create(struct ath11k_base *ab, struct ath11k_peer *peer)
+@@ -1482,17 +1709,23 @@ int ath11k_nss_peer_create(struct ath11k_base *ab, struct ath11k_peer *peer)
  	status = nss_wifili_tx_msg(ab->nss.ctx, wlmsg);
  	if (status != NSS_TX_SUCCESS) {
  		ret = -EINVAL;
@@ -389,7 +389,7 @@ index 3aeb999..fd2ff3e 100644
  	peer->nss.nss_stats = kzalloc(sizeof(*peer->nss.nss_stats), GFP_ATOMIC);
  	if (!peer->nss.nss_stats) {
  		ret = -ENOMEM;
-@@ -1500,6 +1733,199 @@ msg_free:
+@@ -1509,6 +1742,199 @@ msg_free:
  	return ret;
  }
  
@@ -589,7 +589,7 @@ index 3aeb999..fd2ff3e 100644
  /*-------------------------------INIT/DEINIT---------------------------------*/
  
  static int ath11k_nss_radio_buf_cfg(struct ath11k *ar, int range, int buf_sz)
-@@ -1893,7 +2319,7 @@ static int ath11k_nss_init(struct ath11k_base *ab)
+@@ -1902,7 +2328,7 @@ static int ath11k_nss_init(struct ath11k_base *ab)
  
  	status = nss_wifili_tx_msg(nss_contex, wlmsg);
  	if (status != NSS_TX_SUCCESS) {
@@ -598,7 +598,7 @@ index 3aeb999..fd2ff3e 100644
  		goto unregister;
  	}
  
-@@ -1947,7 +2373,8 @@ static int ath11k_nss_stats_cfg(struct ath11k *ar, int nss_msg, int enable)
+@@ -1956,7 +2382,8 @@ static int ath11k_nss_stats_cfg(struct ath11k *ar, int nss_msg, int enable)
  
  	status = nss_wifili_tx_msg(ar->nss.ctx, wlmsg);
  	if (status != NSS_TX_SUCCESS) {

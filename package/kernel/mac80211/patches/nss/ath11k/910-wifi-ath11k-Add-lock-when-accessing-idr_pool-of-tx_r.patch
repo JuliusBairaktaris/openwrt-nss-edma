@@ -16,7 +16,7 @@ Signed-off-by: Aishwarya R <quic_aisr@quicinc.com>
  1 file changed, 11 insertions(+), 3 deletions(-)
 
 diff --git a/drivers/net/wireless/ath/ath11k/dp_tx.c b/drivers/net/wireless/ath/ath11k/dp_tx.c
-index 306721d..dcd614c 100644
+index eda6fff..d1ed12d 100644
 --- a/drivers/net/wireless/ath/ath11k/dp_tx.c
 +++ b/drivers/net/wireless/ath/ath11k/dp_tx.c
 @@ -363,8 +363,10 @@ fail_remove_idr:

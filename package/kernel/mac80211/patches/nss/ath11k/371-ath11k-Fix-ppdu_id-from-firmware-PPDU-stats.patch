@@ -25,7 +25,7 @@ index 08081c9..648c2dc 100644
  struct htt_ppdu_stats_usr_cmpltn_ack_ba_status {
  	u32 ppdu_id;
 diff --git a/drivers/net/wireless/ath/ath11k/dp_rx.c b/drivers/net/wireless/ath/ath11k/dp_rx.c
-index 3c242d7..c0d0709 100644
+index 0f2a263..6127db9 100644
 --- a/drivers/net/wireless/ath/ath11k/dp_rx.c
 +++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
 @@ -1279,7 +1279,7 @@ static int ath11k_htt_tlv_ppdu_stats_parse(struct ath11k_base *ab,
@@ -37,7 +37,7 @@ index 3c242d7..c0d0709 100644
  
  	ppdu_info = data;
  
-@@ -1360,6 +1360,8 @@ static int ath11k_htt_tlv_ppdu_stats_parse(struct ath11k_base *ab,
+@@ -1369,6 +1369,8 @@ static int ath11k_htt_tlv_ppdu_stats_parse(struct ath11k_base *ab,
  			return -EINVAL;
  		}
  
@@ -46,7 +46,7 @@ index 3c242d7..c0d0709 100644
  		peer_id =
  		((struct htt_ppdu_stats_usr_cmpltn_ack_ba_status *)ptr)->sw_peer_id;
  		cur_user = ath11k_get_ppdu_user_index(&ppdu_info->ppdu_stats,
-@@ -1371,6 +1373,7 @@ static int ath11k_htt_tlv_ppdu_stats_parse(struct ath11k_base *ab,
+@@ -1380,6 +1382,7 @@ static int ath11k_htt_tlv_ppdu_stats_parse(struct ath11k_base *ab,
  		user_stats->is_valid_peer_id = true;
  		memcpy((void *)&user_stats->ack_ba, ptr,
  		       sizeof(struct htt_ppdu_stats_usr_cmpltn_ack_ba_status));

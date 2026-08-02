@@ -14,10 +14,10 @@ Signed-off-by: Sathishkumar Muruganandam <murugana@codeaurora.org>
  2 files changed, 109 insertions(+), 9 deletions(-)
 
 diff --git a/drivers/net/wireless/ath/ath11k/nss.c b/drivers/net/wireless/ath/ath11k/nss.c
-index 90266a9..12496cb 100644
+index ebd55f9..d0786d2 100644
 --- a/drivers/net/wireless/ath/ath11k/nss.c
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
-@@ -1530,14 +1530,11 @@ static int ath11k_nss_ext_vdev_register(struct ath11k_vif *arvif,
+@@ -1542,14 +1542,11 @@ static int ath11k_nss_ext_vdev_register(struct ath11k_vif *arvif,
  	struct ath11k *ar = arvif->ar;
  	struct ath11k_base *ab = ar->ab;
  	nss_tx_status_t status;
@@ -32,7 +32,7 @@ index 90266a9..12496cb 100644
  	arvif->nss.ctx = nss_wifi_ext_vdev_register_if(arvif->nss.if_num,
  						       ath11k_nss_ext_vdev_data_receive,
  						       ath11k_nss_ext_vdev_special_data_receive,
-@@ -1565,7 +1562,8 @@ static void ath11k_nss_ext_vdev_free(struct ath11k_vif *arvif)
+@@ -1577,7 +1574,8 @@ static void ath11k_nss_ext_vdev_free(struct ath11k_vif *arvif)
  
  	status = nss_dynamic_interface_dealloc_node(
  					arvif->nss.if_num,
@@ -42,7 +42,7 @@ index 90266a9..12496cb 100644
  	if (status != NSS_TX_SUCCESS)
  		ath11k_warn(ab, "failed to free nss ext vdev err:%d\n",
  			    status);
-@@ -1574,14 +1572,19 @@ static void ath11k_nss_ext_vdev_free(struct ath11k_vif *arvif)
+@@ -1586,14 +1584,19 @@ static void ath11k_nss_ext_vdev_free(struct ath11k_vif *arvif)
  			   "nss ext vdev interface deallocated\n");
  }
  
@@ -64,7 +64,7 @@ index 90266a9..12496cb 100644
  	if_num = nss_dynamic_interface_alloc_node(di_type);
  	if (if_num < 0) {
  		ath11k_warn(ab, "failed to allocate nss ext vdev\n");
-@@ -1590,8 +1593,8 @@ static int ath11k_nss_ext_vdev_alloc(struct ath11k_vif *arvif)
+@@ -1602,8 +1605,8 @@ static int ath11k_nss_ext_vdev_alloc(struct ath11k_vif *arvif)
  
  	arvif->nss.if_num = if_num;
  	ath11k_dbg(ab, ATH11K_DBG_NSS_WDS,
@@ -75,7 +75,7 @@ index 90266a9..12496cb 100644
  
  	return 0;
  }
-@@ -1620,7 +1623,7 @@ int ath11k_nss_ext_vdev_create(struct ath11k_vif *arvif)
+@@ -1632,7 +1635,7 @@ int ath11k_nss_ext_vdev_create(struct ath11k_vif *arvif)
  		return -EINVAL;
  	}
  
@@ -84,7 +84,7 @@ index 90266a9..12496cb 100644
  	if (ret)
  		return ret;
  
-@@ -1736,6 +1739,86 @@ free:
+@@ -1748,6 +1751,86 @@ free:
  	return ret;
  }
  

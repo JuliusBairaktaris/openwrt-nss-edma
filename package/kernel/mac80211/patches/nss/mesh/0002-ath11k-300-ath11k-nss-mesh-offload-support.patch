@@ -1075,21 +1075,23 @@ index 4c51d38..b81f2a5 100644
  
  #define HTT_PPDU_STATS_MAX_USERS	37
 diff --git a/drivers/net/wireless/ath/ath11k/dp_rx.c b/drivers/net/wireless/ath/ath11k/dp_rx.c
-index ac13ea0..a9b8bff 100644
+index d2142c0..efdb6d0 100644
 --- a/drivers/net/wireless/ath/ath11k/dp_rx.c
 +++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
-@@ -1529,6 +1529,70 @@ static int ath11k_htt_tlv_ppdu_stats_parse(struct ath11k_base *ab, struct ath11k
+@@ -1551,6 +1551,81 @@ static int ath11k_htt_tlv_ppdu_stats_parse(struct ath11k_base *ab, struct ath11k
  	return 0;
  }
  
-+static void ath11k_dp_ppdu_stats_flush_tlv_parse(struct ath11k_base *ab, struct ath11k *ar,
++static void ath11k_dp_ppdu_stats_flush_tlv_parse(struct ath11k_base *ab,
 +					  struct htt_ppdu_stats_cmpltn_flush *msg)
 +{
 +	struct ieee80211_sta *sta;
 +	struct ath11k_sta *arsta;
++	struct ath11k *ar;
 +	struct ath11k_peer *peer = NULL;
 +	struct ieee80211_tx_status status;
 +	struct ieee80211_rate_status status_rate = { 0 };
++	int i;
 +
 +	if (!ab->nss.mesh_nss_offload_enabled)
 +		return;
@@ -1097,8 +1099,17 @@ index ac13ea0..a9b8bff 100644
 +	rcu_read_lock();
 +
 +	spin_lock_bh(&ab->base_lock);
-+	peer = ath11k_peer_find_by_id(ar, msg->sw_peer_id);
-+	if (!peer)
++
++	/* This TLV arrives with pdev_id 0, so it names no radio: the peer
++	 * lists are per-radio, so search them all.
++	 */
++	for (i = 0; i < ab->num_radios; i++) {
++		peer = ath11k_peer_find_by_id(ab->pdevs[i].ar, msg->sw_peer_id);
++		if (peer)
++			break;
++	}
++
++	if (!peer || !peer->sta || !peer->vif)
 +		goto exit;
 +
 +	if (peer->vif->type != NL80211_IFTYPE_MESH_POINT)
@@ -1137,7 +1148,7 @@ index ac13ea0..a9b8bff 100644
 +				    len, tag);
 +			return -EINVAL;
 +		}
-+		ath11k_dp_ppdu_stats_flush_tlv_parse(ab, ar, (struct htt_ppdu_stats_cmpltn_flush *)ptr);
++		ath11k_dp_ppdu_stats_flush_tlv_parse(ab, (struct htt_ppdu_stats_cmpltn_flush *)ptr);
 +		break;
 +	default:
 +		break;
@@ -1149,7 +1160,7 @@ index ac13ea0..a9b8bff 100644
  static void
  ath11k_update_per_peer_tx_stats(struct ath11k *ar,
  				struct htt_ppdu_stats *ppdu_stats, u8 user)
-@@ -1552,6 +1616,9 @@ ath11k_update_per_peer_tx_stats(struct ath11k *ar,
+@@ -1574,6 +1649,9 @@ ath11k_update_per_peer_tx_stats(struct ath11k *ar,
  	if (!(usr_stats->tlv_flags & BIT(HTT_PPDU_STATS_TAG_USR_RATE)))
  		return;
  
@@ -1159,7 +1170,7 @@ index ac13ea0..a9b8bff 100644
  	if (usr_stats->tlv_flags & BIT(HTT_PPDU_STATS_TAG_USR_COMPLTN_COMMON))
  		is_ampdu =
  			HTT_USR_CMPLTN_IS_AMPDU(usr_stats->cmpltn_cmn.flags);
-@@ -1685,6 +1752,8 @@ ath11k_update_per_peer_tx_stats(struct ath11k *ar,
+@@ -1707,6 +1785,8 @@ ath11k_update_per_peer_tx_stats(struct ath11k *ar,
  			ath11k_debugfs_sta_add_tx_stats(arsta, peer_stats, rate_idx);
  	}
  
@@ -1168,7 +1179,7 @@ index ac13ea0..a9b8bff 100644
  	spin_unlock_bh(&ab->base_lock);
  	rcu_read_unlock();
  }
-@@ -1805,6 +1874,69 @@ int ath11k_dp_htt_tlv_iter(struct ath11k_base *ab, struct ath11k *ar, const void
+@@ -1827,6 +1907,69 @@ int ath11k_dp_htt_tlv_iter(struct ath11k_base *ab, struct ath11k *ar, const void
  	return 0;
  }
  
@@ -1201,7 +1212,7 @@ index ac13ea0..a9b8bff 100644
 +		peer_id = usr_stats->peer_id;
 +		spin_lock_bh(&ab->base_lock);
 +		peer = ath11k_peer_find_by_id(ar, peer_id);
-+		if (!peer) {
++		if (!peer || !peer->sta || !peer->vif) {
 +			spin_unlock_bh(&ab->base_lock);
 +			continue;
 +		}
@@ -1238,12 +1249,12 @@ index ac13ea0..a9b8bff 100644
  static int ath11k_htt_pull_ppdu_stats(struct ath11k_base *ab,
  				      struct sk_buff *skb)
  {
-@@ -1823,6 +1955,15 @@ static int ath11k_htt_pull_ppdu_stats(struct ath11k_base *ab,
+@@ -1845,6 +1988,15 @@ static int ath11k_htt_pull_ppdu_stats(struct ath11k_base *ab,
  	pdev_id = FIELD_GET(HTT_T2H_PPDU_STATS_INFO_PDEV_ID, msg->info);
  	ppdu_id = msg->ppdu_id;
  
 +	if (pdev_id == 0) {
-+		ret = ath11k_dp_htt_tlv_iter(ab, ar, msg->data, len,
++		ret = ath11k_dp_htt_tlv_iter(ab, NULL, msg->data, len,
 +					     ath11k_htt_tlv_ppdu_soc_stats_parse,
 +					     NULL);
 +		if (ret)
@@ -1254,7 +1265,7 @@ index ac13ea0..a9b8bff 100644
  	rcu_read_lock();
  	ar = ath11k_mac_get_ar_by_pdev_id(ab, pdev_id);
  	if (!ar) {
-@@ -1890,6 +2031,12 @@ static int ath11k_htt_pull_ppdu_stats(struct ath11k_base *ab,
+@@ -1912,6 +2064,12 @@ static int ath11k_htt_pull_ppdu_stats(struct ath11k_base *ab,
  		}
  	}
  
@@ -1268,10 +1279,10 @@ index ac13ea0..a9b8bff 100644
  	spin_unlock_bh(&ar->data_lock);
  
 diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
-index 477b5df..353a496 100644
+index 00c2897..42066e4 100644
 --- a/drivers/net/wireless/ath/ath11k/mac.c
 +++ b/drivers/net/wireless/ath/ath11k/mac.c
-@@ -3573,6 +3573,18 @@ static void ath11k_mac_op_nss_bss_info_changed(struct ieee80211_hw *hw,
+@@ -3574,6 +3574,18 @@ static void ath11k_mac_op_nss_bss_info_changed(struct ieee80211_hw *hw,
  			ath11k_warn(ar->ab, "failed to set ap_isolate in nss %d\n", ret);
  	}
  
@@ -1290,7 +1301,7 @@ index 477b5df..353a496 100644
  	mutex_unlock(&ar->conf_mutex);
  }
  
-@@ -10511,6 +10523,28 @@ static int ath11k_mac_op_sta_state(struct ieee80211_hw *hw,
+@@ -10514,6 +10526,28 @@ static int ath11k_mac_op_sta_state(struct ieee80211_hw *hw,
  	return ret;
  }
  
@@ -1319,7 +1330,7 @@ index 477b5df..353a496 100644
  static const struct ieee80211_ops ath11k_ops = {
  	.tx				= ath11k_mac_op_tx,
  	.wake_tx_queue			= ieee80211_handle_wake_tx_queue,
-@@ -10570,6 +10604,9 @@ static const struct ieee80211_ops ath11k_ops = {
+@@ -10573,6 +10607,9 @@ static const struct ieee80211_ops ath11k_ops = {
  	.set_sar_specs			= ath11k_mac_op_set_bios_sar_specs,
  	.remain_on_channel		= ath11k_mac_op_remain_on_channel,
  	.cancel_remain_on_channel	= ath11k_mac_op_cancel_remain_on_channel,
@@ -1329,7 +1340,7 @@ index 477b5df..353a496 100644
  };
  
  static void ath11k_mac_update_ch_list(struct ath11k *ar,
-@@ -11088,6 +11125,8 @@ static int __ath11k_mac_register(struct ath11k *ar)
+@@ -11091,6 +11128,8 @@ static int __ath11k_mac_register(struct ath11k *ar)
  		ieee80211_hw_set(ar->hw, SUPPORTS_NSS_OFFLOAD);
  		wiphy_ext_feature_set(ar->hw->wiphy,
  				      NL80211_EXT_FEATURE_VLAN_OFFLOAD);
@@ -1339,10 +1350,10 @@ index 477b5df..353a496 100644
  
  	ret = ieee80211_register_hw(ar->hw);
 diff --git a/drivers/net/wireless/ath/ath11k/nss.c b/drivers/net/wireless/ath/ath11k/nss.c
-index 861a241..54e2624 100644
+index d6bfae3..445e10a 100644
 --- a/drivers/net/wireless/ath/ath11k/nss.c
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
-@@ -7,6 +7,7 @@
+@@ -6,6 +6,7 @@
  #include "debug.h"
  #include "mac.h"
  #include "nss.h"
@@ -1350,7 +1361,7 @@ index 861a241..54e2624 100644
  #include "core.h"
  #include "peer.h"
  #include "dp_rx.h"
-@@ -15,6 +16,11 @@
+@@ -14,6 +15,11 @@
  #include "wmi.h"
  #include "../../../../../net/mac80211/sta_info.h"
  
@@ -1362,7 +1373,7 @@ index 861a241..54e2624 100644
  /*-----------------------------ATH11K-NSS Helpers--------------------------*/
  
  static enum ath11k_nss_opmode
-@@ -352,7 +358,6 @@ static void ath11k_nss_wifili_event_receive(struct ath11k_base *ab, struct nss_w
+@@ -363,7 +369,6 @@ static void ath11k_nss_wifili_event_receive(struct ath11k_base *ab, struct nss_w
  		ab->nss.response = response;
  		complete(&ab->nss.complete);
  		break;
@@ -1370,7 +1381,7 @@ index 861a241..54e2624 100644
  	case NSS_WIFILI_PEER_CREATE_MSG:
  		if (response != NSS_CMN_RESPONSE_EMSG)
  			break;
-@@ -422,6 +427,13 @@ static void ath11k_nss_wifili_event_receive(struct ath11k_base *ab, struct nss_w
+@@ -433,6 +438,13 @@ static void ath11k_nss_wifili_event_receive(struct ath11k_base *ab, struct nss_w
  		ath11k_dbg(ab, ATH11K_DBG_NSS_WDS, "nss wifili peer 4addr event received %d response %d error %d\n",
  			   msg_type, response, error);
  		break;
@@ -1384,7 +1395,7 @@ index 861a241..54e2624 100644
  	case NSS_WIFILI_LINK_DESC_INFO_MSG:
  		ath11k_nss_wifili_link_desc_return(ab,
  						   (void *)&msg->msg.linkdescinfomsg);
-@@ -521,7 +533,9 @@ ath11k_nss_wifili_ext_callback_fn(struct ath11k_base *ab, struct sk_buff *skb,
+@@ -532,7 +544,9 @@ ath11k_nss_wifili_ext_callback_fn(struct ath11k_base *ab, struct sk_buff *skb,
  		ath11k_nss_process_mic_error(ab, skb);
  		break;
  	default:
@@ -1395,7 +1406,7 @@ index 861a241..54e2624 100644
  		break;
  	}
  }
-@@ -891,8 +905,6 @@ ath11k_nss_vdev_special_data_receive(struct net_device *dev, struct sk_buff *skb
+@@ -904,8 +918,6 @@ ath11k_nss_vdev_special_data_receive(struct net_device *dev, struct sk_buff *skb
  {
  	struct nss_wifi_vdev_per_packet_metadata *wifi_metadata = NULL;
  	struct nss_wifi_vdev_wds_per_packet_metadata *wds_metadata = NULL;
@@ -1404,7 +1415,7 @@ index 861a241..54e2624 100644
  	struct ath11k_vif *arvif;
  	struct ath11k_base *ab;
  	bool eth_decap = false;
-@@ -904,24 +916,7 @@ ath11k_nss_vdev_special_data_receive(struct net_device *dev, struct sk_buff *skb
+@@ -917,24 +929,7 @@ ath11k_nss_vdev_special_data_receive(struct net_device *dev, struct sk_buff *skb
  	struct ath11k_peer *ta_peer = NULL;
  #endif
  
@@ -1430,7 +1441,7 @@ index 861a241..54e2624 100644
  	if (!arvif) {
  		dev_kfree_skb_any(skb);
  		return;
-@@ -1055,55 +1050,1143 @@ static void
+@@ -1068,55 +1063,1185 @@ static void
  ath11k_nss_ext_vdev_data_receive(struct net_device *dev, struct sk_buff *skb,
  				 __attribute__((unused)) struct napi_struct *napi)
  {
@@ -1742,6 +1753,29 @@ index 861a241..54e2624 100644
 +		ath11k_dbg(ab, ATH11K_DBG_NSS_MESH, "failed to notify proxy update event %d\n", ret);
 +}
 +
++/* Both mesh table dumps carry a firmware-chosen entry count in front of a
++ * variable-length array. Refuse a count the message cannot actually hold.
++ */
++static bool ath11k_nss_mesh_dump_entries_valid(struct ath11k_vif *arvif,
++					       const struct nss_cmn_msg *cm,
++					       size_t hdr_len, size_t entry_size,
++					       u32 num_entries)
++{
++	/* cm->len excludes the common header, so it is exactly the payload the
++	 * dump struct starts at - do not use nss_cmn_get_msg_len(), which adds
++	 * the header back in and would over-count by its size.
++	 */
++	size_t avail = cm->len;
++
++	if (avail >= hdr_len && num_entries <= (avail - hdr_len) / entry_size)
++		return true;
++
++	ath11k_warn(arvif->ar->ab,
++		    "nss mesh dump claims %u entries, message payload is %zu bytes\n",
++		    num_entries, avail);
++	return false;
++}
++
 +static int
 +ath11k_nss_mesh_process_path_table_dump_msg(struct ath11k_vif *arvif,
 +				     struct nss_wifi_mesh_msg *msg)
@@ -1750,6 +1784,18 @@ index 861a241..54e2624 100644
 +	struct ath11k_nss_mpath_entry *entry;
 +	struct ath11k *ar = arvif->ar;
 +	ssize_t len;
++
++	/* nss_wifi_mesh_rx_msg_handler() deliberately exempts the two table-dump
++	 * types from its length check, so num_entries is unvalidated firmware
++	 * input: bound it by what the message actually carries before it sizes a
++	 * copy out of the message buffer.
++	 */
++	if (!ath11k_nss_mesh_dump_entries_valid(arvif, &msg->cm,
++						offsetof(struct nss_wifi_mesh_path_table_dump,
++							 path_entry),
++						sizeof(struct nss_wifi_mesh_path_dump_entry),
++						mpath_dump->num_entries))
++		return -EINVAL;
 +
 +	len = sizeof(struct nss_wifi_mesh_path_dump_entry) * mpath_dump->num_entries;
 +	entry = kzalloc(sizeof(*entry) + len, GFP_ATOMIC);
@@ -1784,6 +1830,13 @@ index 861a241..54e2624 100644
 +
 +	if (!mpp_dump->num_entries)
 +		return 0;
++
++	if (!ath11k_nss_mesh_dump_entries_valid(arvif, &msg->cm,
++						offsetof(struct nss_wifi_mesh_proxy_path_table_dump,
++							 path_entry),
++						sizeof(struct nss_wifi_mesh_proxy_path_dump_entry),
++						mpp_dump->num_entries))
++		return -EINVAL;
 +
 +	len = sizeof(struct nss_wifi_mesh_proxy_path_dump_entry) * mpp_dump->num_entries;
 +	entry = kzalloc(sizeof(*entry) + len, GFP_ATOMIC);
@@ -2596,7 +2649,7 @@ index 861a241..54e2624 100644
  
  int ath11k_nss_tx(struct ath11k_vif *arvif, struct sk_buff *skb)
  {
-@@ -1111,8 +2194,9 @@ int ath11k_nss_tx(struct ath11k_vif *arvif, struct sk_buff *skb)
+@@ -1124,8 +2207,9 @@ int ath11k_nss_tx(struct ath11k_vif *arvif, struct sk_buff *skb)
  	nss_tx_status_t status;
  	int encap_type = ath11k_dp_tx_get_encap_type(arvif, skb);
  	struct ath11k_soc_dp_stats *soc_stats = &ar->ab->soc_stats;
@@ -2607,7 +2660,7 @@ index 861a241..54e2624 100644
  		ath11k_dbg(ar->ab, ATH11K_DBG_DP_TX, "encap mismatch in nss tx skb encap type %d" \
  			    " vif encap type %d\n", encap_type, arvif->nss.encap);
  		ath11k_dbg_dump(ar->ab, (ATH11K_DBG_NSS | ATH11K_DBG_DP_TX), "", "nss tx msdu: ",
-@@ -1129,16 +2213,45 @@ int ath11k_nss_tx(struct ath11k_vif *arvif, struct sk_buff *skb)
+@@ -1142,16 +2226,45 @@ int ath11k_nss_tx(struct ath11k_vif *arvif, struct sk_buff *skb)
  		ath11k_nss_tx_encap_nwifi(skb);
  
  send:
@@ -2661,7 +2714,7 @@ index 861a241..54e2624 100644
  
  	if (status != NSS_TX_SUCCESS) {
  		ath11k_dbg(ar->ab, (ATH11K_DBG_NSS | ATH11K_DBG_DP_TX),
-@@ -1244,6 +2357,9 @@ static int ath11k_nss_vdev_configure(struct ath11k_vif *arvif)
+@@ -1257,6 +2370,9 @@ static int ath11k_nss_vdev_configure(struct ath11k_vif *arvif)
  
  	vdev_cfg = &vdev_msg->msg.vdev_config;
  
@@ -2671,7 +2724,7 @@ index 861a241..54e2624 100644
  	vdev_cfg->radio_ifnum = ar->nss.if_num;
  	vdev_cfg->vdev_id = arvif->vdev_id;
  
-@@ -1282,6 +2398,39 @@ free:
+@@ -1295,6 +2411,39 @@ free:
  	return ret;
  }
  
@@ -2711,7 +2764,7 @@ index 861a241..54e2624 100644
  static void ath11k_nss_vdev_unregister(struct ath11k_vif *arvif)
  {
  	struct ath11k_base *ab = arvif->ar->ab;
-@@ -1293,6 +2442,14 @@ static void ath11k_nss_vdev_unregister(struct ath11k_vif *arvif)
+@@ -1306,6 +2455,14 @@ static void ath11k_nss_vdev_unregister(struct ath11k_vif *arvif)
  		ath11k_dbg(ab, ATH11K_DBG_NSS, "unregistered nss vdev %d \n",
  			   arvif->nss.if_num);
  		break;
@@ -2726,7 +2779,7 @@ index 861a241..54e2624 100644
  	default:
  		ath11k_warn(ab, "unsupported interface type %d for nss vdev unregister\n",
  			    arvif->vif->type);
-@@ -1300,6 +2457,78 @@ static void ath11k_nss_vdev_unregister(struct ath11k_vif *arvif)
+@@ -1313,6 +2470,78 @@ static void ath11k_nss_vdev_unregister(struct ath11k_vif *arvif)
  	}
  }
  
@@ -2805,7 +2858,7 @@ index 861a241..54e2624 100644
  static int ath11k_nss_vdev_register(struct ath11k_vif *arvif,
  				    struct net_device *netdev)
  {
-@@ -1327,6 +2556,15 @@ static int ath11k_nss_vdev_register(struct ath11k_vif *arvif,
+@@ -1340,6 +2569,15 @@ static int ath11k_nss_vdev_register(struct ath11k_vif *arvif,
  			   arvif->nss.if_num);
  
  		break;
@@ -2821,7 +2874,7 @@ index 861a241..54e2624 100644
  	default:
  		ath11k_warn(ab, "unsupported interface type %d for nss vdev register\n",
  			    arvif->vif->type);
-@@ -1336,7 +2574,63 @@ static int ath11k_nss_vdev_register(struct ath11k_vif *arvif,
+@@ -1349,7 +2587,62 @@ static int ath11k_nss_vdev_register(struct ath11k_vif *arvif,
  	return 0;
  }
  
@@ -2833,7 +2886,7 @@ index 861a241..54e2624 100644
 +	struct ath11k *ar = arvif->ar;
 +	struct ath11k_nss_mpath_entry *mpath_entry, *mpath_tmp;
 +	struct ath11k_nss_mpp_entry *mpp_entry, *mpp_tmp;
-+	struct arvif_nss *nss = &arvif->nss, *nss_entry, *nss_tmp;
++	struct arvif_nss *nss = &arvif->nss;
 +	LIST_HEAD(mpath_local_entry);
 +	LIST_HEAD(mpp_local_entry);
 +	nss_tx_status_t status;
@@ -2858,8 +2911,7 @@ index 861a241..54e2624 100644
 +		kfree(mpp_entry);
 +	}
 +
-+	list_for_each_entry_safe(nss_entry, nss_tmp, &mesh_vaps, list)
-+		list_del(&nss_entry->list);
++	list_del(&nss->list);
 +
 +	status = nss_dynamic_interface_dealloc_node(
 +						arvif->nss.if_num,
@@ -2886,7 +2938,7 @@ index 861a241..54e2624 100644
  {
  	struct ath11k_base *ab = arvif->ar->ab;
  	nss_tx_status_t status;
-@@ -1355,6 +2649,11 @@ void ath11k_nss_vdev_free(struct ath11k_vif *arvif)
+@@ -1368,6 +2661,11 @@ void ath11k_nss_vdev_free(struct ath11k_vif *arvif)
  				   "nss vdev interface deallocated\n");
  
  		return;
@@ -2898,7 +2950,7 @@ index 861a241..54e2624 100644
  	default:
  		ath11k_warn(ab, "unsupported interface type %d for nss vdev dealloc\n",
  			    arvif->vif->type);
-@@ -1362,11 +2661,96 @@ void ath11k_nss_vdev_free(struct ath11k_vif *arvif)
+@@ -1375,11 +2673,96 @@ void ath11k_nss_vdev_free(struct ath11k_vif *arvif)
  	}
  }
  
@@ -2996,7 +3048,7 @@ index 861a241..54e2624 100644
  
  	/* Initialize completion for verifying NSS message response */
  	init_completion(&arvif->nss.complete);
-@@ -1388,6 +2772,16 @@ static int ath11k_nss_vdev_alloc(struct ath11k_vif *arvif)
+@@ -1401,6 +2784,16 @@ static int ath11k_nss_vdev_alloc(struct ath11k_vif *arvif)
  			   arvif->nss.if_num);
  
  		break;
@@ -3013,7 +3065,7 @@ index 861a241..54e2624 100644
  	default:
  		ath11k_warn(ab, "unsupported interface type %d for nss vdev alloc\n",
  			    arvif->vif->type);
-@@ -1425,7 +2819,7 @@ int ath11k_nss_vdev_create(struct ath11k_vif *arvif)
+@@ -1438,7 +2831,7 @@ int ath11k_nss_vdev_create(struct ath11k_vif *arvif)
  		return -EINVAL;
  	}
  
@@ -3022,7 +3074,7 @@ index 861a241..54e2624 100644
  	if (ret)
  		return ret;
  
-@@ -1460,6 +2854,45 @@ int ath11k_nss_vdev_create(struct ath11k_vif *arvif)
+@@ -1473,6 +2866,45 @@ int ath11k_nss_vdev_create(struct ath11k_vif *arvif)
  			goto unregister_vdev;
  		}
  		break;
@@ -3068,7 +3120,7 @@ index 861a241..54e2624 100644
  	default:
  		ret = -ENOTSUPP;
  		goto unregister_vdev;
-@@ -1516,6 +2949,15 @@ int ath11k_nss_vdev_up(struct ath11k_vif *arvif)
+@@ -1529,6 +2961,15 @@ int ath11k_nss_vdev_up(struct ath11k_vif *arvif)
  	if (arvif->vdev_type == WMI_VDEV_TYPE_MONITOR)
  		return 0;
  
@@ -3084,7 +3136,7 @@ index 861a241..54e2624 100644
  	vdev_msg = kzalloc(sizeof(struct nss_wifi_vdev_msg), GFP_ATOMIC);
  	if (!vdev_msg)
  		return -ENOMEM;
-@@ -1563,6 +3005,15 @@ int ath11k_nss_vdev_down(struct ath11k_vif *arvif)
+@@ -1576,6 +3017,15 @@ int ath11k_nss_vdev_down(struct ath11k_vif *arvif)
  	if (arvif->vdev_type == WMI_VDEV_TYPE_MONITOR)
  		return 0;
  
@@ -3100,7 +3152,7 @@ index 861a241..54e2624 100644
  	vdev_msg = kzalloc(sizeof(struct nss_wifi_vdev_msg), GFP_ATOMIC);
  	if (!vdev_msg)
  		return -ENOMEM;
-@@ -2936,6 +4387,51 @@ static int ath11k_nss_get_dynamic_interface_type(struct ath11k_base *ab)
+@@ -2946,6 +4396,51 @@ static int ath11k_nss_get_dynamic_interface_type(struct ath11k_base *ab)
  	}
  }
  
@@ -3152,7 +3204,7 @@ index 861a241..54e2624 100644
  static int ath11k_nss_init(struct ath11k_base *ab)
  {
  	struct nss_wifili_init_msg *wim = NULL;
-@@ -3072,6 +4568,27 @@ static int ath11k_nss_init(struct ath11k_base *ab)
+@@ -3079,6 +4574,27 @@ static int ath11k_nss_init(struct ath11k_base *ab)
  
  	kfree(wlmsg);
  
@@ -3180,7 +3232,7 @@ index 861a241..54e2624 100644
  	ath11k_dbg(ab, ATH11K_DBG_NSS, "NSS Init Message TX Success %p %d\n",
  		   ab->nss.ctx, ab->nss.if_num);
  	return 0;
-@@ -3167,6 +4684,7 @@ static int ath11k_nss_pdev_init(struct ath11k_base *ab, int radio_id)
+@@ -3172,6 +4688,7 @@ static int ath11k_nss_pdev_init(struct ath11k_base *ab, int radio_id)
  	 * for messages related to vdev/radio
  	 */
  	ar->nss.if_num = radio_if_num;
@@ -3189,7 +3241,7 @@ index 861a241..54e2624 100644
  	/* No callbacks are registered for radio specific events/data */
  	ar->nss.ctx = nss_register_wifili_radio_if((u32)radio_if_num, NULL,
 diff --git a/drivers/net/wireless/ath/ath11k/nss.h b/drivers/net/wireless/ath/ath11k/nss.h
-index 3e3c5d0..af1c248 100644
+index 5f4b48d..d52b456 100644
 --- a/drivers/net/wireless/ath/ath11k/nss.h
 +++ b/drivers/net/wireless/ath/ath11k/nss.h
 @@ -10,8 +10,12 @@
@@ -3226,7 +3278,7 @@ index 3e3c5d0..af1c248 100644
  /* Init Flags */
  #define WIFILI_NSS_CCE_DISABLED 0x1
  #define WIFILI_ADDTL_MEM_SEG_SET 0x000000002
-@@ -127,6 +133,8 @@ enum ath11k_nss_opmode {
+@@ -124,6 +130,8 @@ enum ath11k_nss_opmode {
  	ATH11K_NSS_OPMODE_MONITOR,
  };
  
@@ -3235,7 +3287,7 @@ index 3e3c5d0..af1c248 100644
  struct peer_stats {
  	u64 last_rx;
  	u64 last_ack;
-@@ -181,10 +189,30 @@ struct ath11k_nss_peer {
+@@ -178,10 +186,30 @@ struct ath11k_nss_peer {
  	struct completion complete;
  };
  
@@ -3266,7 +3318,7 @@ index 3e3c5d0..af1c248 100644
  	/* Used for completion status for vdev config nss messages */
  	struct completion complete;
  	/* Keep the copy of encap type for nss */
-@@ -206,6 +234,25 @@ struct arvif_nss {
+@@ -203,6 +231,25 @@ struct arvif_nss {
  	/* WDS cfg should be done only once for ext vdev */
  	bool wds_cfg_done;
  	bool created;
@@ -3292,7 +3344,7 @@ index 3e3c5d0..af1c248 100644
  };
  
  /* Structure to hold the pdev/radio related info for nss offload support */
-@@ -214,6 +261,8 @@ struct ath11k_nss {
+@@ -211,6 +258,8 @@ struct ath11k_nss {
  	int if_num;
  	/* Radio/pdev Context obtained on pdev register */
  	void* ctx;
@@ -3301,7 +3353,7 @@ index 3e3c5d0..af1c248 100644
  };
  
  /* Structure to hold the soc related info for nss offload support */
-@@ -222,6 +271,8 @@ struct ath11k_soc_nss {
+@@ -219,6 +268,8 @@ struct ath11k_soc_nss {
  	bool enabled;
  	/* turn on/off nss stats support in ath11k */
  	bool stats_enabled;
@@ -3310,7 +3362,7 @@ index 3e3c5d0..af1c248 100644
  	/* soc nss ctx */
  	void* ctx;
  	/* if_num to be used for soc related nss messages */
-@@ -287,6 +338,29 @@ int ath11k_nss_setup(struct ath11k_base *ab);
+@@ -282,6 +333,29 @@ int ath11k_nss_setup(struct ath11k_base *ab);
  int ath11k_nss_teardown(struct ath11k_base *ab);
  int ath11k_nss_pre_reconfigure(struct ath11k_base *ab);
  void ath11k_nss_ext_rx_stats(struct ath11k_base *ab, struct htt_rx_ring_tlv_filter *tlv_filter);
@@ -3340,7 +3392,7 @@ index 3e3c5d0..af1c248 100644
  #else
  static inline int ath11k_nss_tx(struct ath11k_vif *arvif, struct sk_buff *skb)
  {
-@@ -463,5 +537,38 @@ static inline void ath11k_nss_ext_rx_stats(struct ath11k_base *ab,
+@@ -458,5 +532,38 @@ static inline void ath11k_nss_ext_rx_stats(struct ath11k_base *ab,
  {
  	return;
  }

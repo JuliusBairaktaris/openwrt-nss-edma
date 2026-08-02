@@ -35,10 +35,10 @@ Signed-off-by: Rajat Soni <quic_rajson@quicinc.com>
  2 files changed, 3 insertions(+)
 
 diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
-index 5d91253..5bd7ef5 100644
+index 99b3c2e..8c1beaf 100644
 --- a/drivers/net/wireless/ath/ath11k/mac.c
 +++ b/drivers/net/wireless/ath/ath11k/mac.c
-@@ -6714,7 +6714,9 @@ static int ath11k_mac_op_start(struct ieee80211_hw *hw)
+@@ -6715,7 +6715,9 @@ static int ath11k_mac_op_start(struct ieee80211_hw *hw)
  		break;
  	case ATH11K_STATE_RESTARTING:
  		ar->state = ATH11K_STATE_RESTARTED;

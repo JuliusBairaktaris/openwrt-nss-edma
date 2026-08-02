@@ -110,10 +110,10 @@ index c30c89e..5038a81 100644
  		debugfs_create_file("tx_stats", 0400, dir, sta,
  				    &fops_tx_stats);
 diff --git a/drivers/net/wireless/ath/ath11k/nss.c b/drivers/net/wireless/ath/ath11k/nss.c
-index 8c21d96..3198f38 100644
+index 907a000..46546c1 100644
 --- a/drivers/net/wireless/ath/ath11k/nss.c
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
-@@ -205,6 +205,27 @@ static void ath11k_nss_get_peer_stats(struct ath11k_base *ab, struct nss_wifili_
+@@ -204,6 +204,27 @@ static void ath11k_nss_get_peer_stats(struct ath11k_base *ab, struct nss_wifili_
  			pstats->rx.err.decrypt_err;
  		peer->nss.nss_stats->rx_dropped += rx_dropped;
  
@@ -142,10 +142,10 @@ index 8c21d96..3198f38 100644
  			ATH11K_NSS_TXRX_NETDEV_STATS(rx, peer->nss.ext_vif, rx_bytes, rx_packets);
  		else
 diff --git a/drivers/net/wireless/ath/ath11k/nss.h b/drivers/net/wireless/ath/ath11k/nss.h
-index 928d87c..e6fb9c9 100644
+index 0cafda3..41284d7 100644
 --- a/drivers/net/wireless/ath/ath11k/nss.h
 +++ b/drivers/net/wireless/ath/ath11k/nss.h
-@@ -139,6 +139,21 @@ struct peer_stats {
+@@ -136,6 +136,21 @@ struct peer_stats {
  	u32 rx_dropped;
  	u32 last_rxdrop;
  	struct rate_info rxrate;

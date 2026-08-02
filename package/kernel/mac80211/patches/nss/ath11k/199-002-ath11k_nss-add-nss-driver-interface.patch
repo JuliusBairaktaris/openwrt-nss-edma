@@ -17,6 +17,15 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
  create mode 100644 drivers/net/wireless/ath/ath11k/nss.c
  create mode 100644 drivers/net/wireless/ath/ath11k/nss.h
 
+Release the NSS peer buffer through one helper that clears peer->nss.vaddr.
+Every release path left the pointer live, so the re-entry check in
+ath11k_nss_peer_delete() never fired and a second delete, or a delete racing
+the firmware's own peer-free event, unmapped and freed the buffer again while
+the NSS still held its physical address. The helper also unmaps in the
+direction the buffer was mapped in.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+
 diff --git a/drivers/net/wireless/ath/ath11k/Kconfig b/drivers/net/wireless/ath/ath11k/Kconfig
 index f50a905..f40a6d6 100644
 --- a/drivers/net/wireless/ath/ath11k/Kconfig
@@ -72,7 +81,7 @@ index 9cea16b..b86d1c3 100644
  	void __iomem *mem;
  	void __iomem *mem_ce;
 diff --git a/drivers/net/wireless/ath/ath11k/dp_rx.c b/drivers/net/wireless/ath/ath11k/dp_rx.c
-index 2f61218..b427f22 100644
+index cc389c1..e803b1e 100644
 --- a/drivers/net/wireless/ath/ath11k/dp_rx.c
 +++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
 @@ -994,6 +994,29 @@ unlock_exit:
@@ -204,10 +213,10 @@ index 940d7d1..1865032 100644
  	/* TODO: Do we need to enable ANI? */
 diff --git a/drivers/net/wireless/ath/ath11k/nss.c b/drivers/net/wireless/ath/ath11k/nss.c
 new file mode 100644
-index 0000000..3b1fe13
+index 0000000..94b8f30
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
-@@ -0,0 +1,2399 @@
+@@ -0,0 +1,2408 @@
 +// SPDX-License-Identifier: BSD-3-Clause-Clear
 +/*
 + * Copyright (c) 2020 The Linux Foundation. All rights reserved.
@@ -409,6 +418,21 @@ index 0000000..3b1fe13
 +		skb_put(skb, IEEE80211_TKIP_ICV_LEN);
 +}
 +
++/* Idempotent: several paths release the peer buffer, and ath11k_nss_peer_delete
++ * relies on the NULL to reject a second delete.
++ */
++static void ath11k_nss_peer_buf_put(struct ath11k_base *ab,
++				    struct ath11k_peer *peer)
++{
++	if (!peer->nss.vaddr)
++		return;
++
++	dma_unmap_single(ab->dev, peer->nss.paddr,
++			 WIFILI_NSS_PEER_BYTE_SIZE, DMA_TO_DEVICE);
++	kfree(peer->nss.vaddr);
++	peer->nss.vaddr = NULL;
++}
++
 +static void ath11k_nss_peer_mem_free(struct ath11k_base *ab, u32 peer_id)
 +{
 +	struct ath11k_peer *peer;
@@ -424,10 +448,7 @@ index 0000000..3b1fe13
 +		return;
 +	}
 +
-+	dma_unmap_single(ab->dev, peer->nss.paddr,
-+			 WIFILI_NSS_PEER_BYTE_SIZE, DMA_FROM_DEVICE);
-+
-+	kfree(peer->nss.vaddr);
++	ath11k_nss_peer_buf_put(ab, peer);
 +	if (peer->nss.nss_stats) {
 +		kfree(peer->nss.nss_stats);
 +		peer->nss.nss_stats = NULL;
@@ -1590,9 +1611,7 @@ index 0000000..3b1fe13
 +	return 0;
 +
 +free_peer:
-+	dma_unmap_single(ab->dev, peer->nss.paddr,
-+		 WIFILI_NSS_PEER_BYTE_SIZE, DMA_FROM_DEVICE);
-+	kfree(peer->nss.vaddr);
++	ath11k_nss_peer_buf_put(ab, peer);
 +	if (peer->nss.nss_stats) {
 +		kfree(peer->nss.nss_stats);
 +		peer->nss.nss_stats = NULL;
@@ -1642,6 +1661,7 @@ index 0000000..3b1fe13
 +	if (ret) {
 +		ath11k_warn(ab, "error during nss peer info  memalloc\n");
 +		kfree(peer->nss.vaddr);
++		peer->nss.vaddr = NULL;
 +		ret = -ENOMEM;
 +		goto msg_free;
 +	}
@@ -1680,9 +1700,7 @@ index 0000000..3b1fe13
 +	goto msg_free;
 +
 +peer_mem_free:
-+	dma_unmap_single(ab->dev, peer->nss.paddr,
-+			 WIFILI_NSS_PEER_BYTE_SIZE, DMA_FROM_DEVICE);
-+	kfree(peer->nss.vaddr);
++	ath11k_nss_peer_buf_put(ab, peer);
 +msg_free:
 +	kfree(wlmsg);
 +	return ret;

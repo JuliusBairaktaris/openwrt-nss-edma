@@ -6,10 +6,10 @@
 Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 
 diff --git a/drivers/net/wireless/ath/ath11k/dp_rx.c b/drivers/net/wireless/ath/ath11k/dp_rx.c
-index 9a4cdd1..cc709ff 100644
+index 3efa314..a2c412b 100644
 --- a/drivers/net/wireless/ath/ath11k/dp_rx.c
 +++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
-@@ -5534,8 +5534,11 @@ int ath11k_dp_rx_process_mon_status(struct ath11k_base *ab, int mac_id,
+@@ -5543,8 +5543,11 @@ int ath11k_dp_rx_process_mon_status(struct ath11k_base *ab, int mac_id,
  			goto next_skb;
  		}
  

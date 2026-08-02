@@ -13,6 +13,14 @@ Signed-off-by: Miles Hu <milehu@codeaurora.org>
  drivers/net/wireless/ath/ath11k/rx_desc.h     |   5 +
  5 files changed, 185 insertions(+), 8 deletions(-)
 
+Bound the two user_stats[] walks this patch introduces. common.num_users is
+copied verbatim out of the firmware TLV and bar_num_users was a free-running
+counter that is never reset for a given ppdu_id, while the array it indexes
+holds HTT_PPDU_STATS_MAX_USERS entries. Returning -EINVAL from the TLV
+callback would not help: ath11k_dp_htt_tlv_iter() only propagates -ENOMEM.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+
 diff --git a/drivers/net/wireless/ath/ath11k/core.h b/drivers/net/wireless/ath/ath11k/core.h
 index c935710..d04a785 100644
 --- a/drivers/net/wireless/ath/ath11k/core.h
@@ -447,7 +455,7 @@ index 7a55afd..66e48aa 100644
  	struct list_head list;
  };
 diff --git a/drivers/net/wireless/ath/ath11k/dp_rx.c b/drivers/net/wireless/ath/ath11k/dp_rx.c
-index 76df9c1..9a4cdd1 100644
+index 76df9c1..3efa314 100644
 --- a/drivers/net/wireless/ath/ath11k/dp_rx.c
 +++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
 @@ -1243,9 +1243,10 @@ static int ath11k_htt_tlv_ppdu_stats_parse(struct ath11k_base *ab,
@@ -462,10 +470,14 @@ index 76df9c1..9a4cdd1 100644
  
  	ppdu_info = data;
  
-@@ -1258,6 +1259,26 @@ static int ath11k_htt_tlv_ppdu_stats_parse(struct ath11k_base *ab,
+@@ -1258,6 +1259,30 @@ static int ath11k_htt_tlv_ppdu_stats_parse(struct ath11k_base *ab,
  		}
  		memcpy((void *)&ppdu_info->ppdu_stats.common, ptr,
  		       sizeof(struct htt_ppdu_stats_common));
++		if (ppdu_info->ppdu_stats.common.num_users >
++		    HTT_PPDU_STATS_MAX_USERS)
++			ppdu_info->ppdu_stats.common.num_users =
++				HTT_PPDU_STATS_MAX_USERS;
 +		frame_type =
 +			FIELD_GET(HTT_PPDU_STATS_CMN_FLAGS_FRAME_TYPE_M,
 +				  ppdu_info->ppdu_stats.common.flags);
@@ -489,15 +501,20 @@ index 76df9c1..9a4cdd1 100644
  		break;
  	case HTT_PPDU_STATS_TAG_USR_RATE:
  		if (len < sizeof(struct htt_ppdu_stats_user_rate)) {
-@@ -1290,6 +1311,7 @@ static int ath11k_htt_tlv_ppdu_stats_parse(struct ath11k_base *ab,
+@@ -1290,6 +1315,12 @@ static int ath11k_htt_tlv_ppdu_stats_parse(struct ath11k_base *ab,
  						      peer_id);
  		if (cur_user < 0)
  			return -EINVAL;
-+		ppdu_info->bar_num_users += 1;
++		/* high-water mark: the index reuses a slot on a repeated
++		 * sw_peer_id, so a running count would both outgrow the array
++		 * and shrink the walk below the slots already in use
++		 */
++		if (ppdu_info->bar_num_users < cur_user + 1)
++			ppdu_info->bar_num_users = cur_user + 1;
  		user_stats = &ppdu_info->ppdu_stats.user_stats[cur_user];
  		user_stats->peer_id = peer_id;
  		user_stats->is_valid_peer_id = true;
-@@ -1318,44 +1340,30 @@ static int ath11k_htt_tlv_ppdu_stats_parse(struct ath11k_base *ab,
+@@ -1318,44 +1349,30 @@ static int ath11k_htt_tlv_ppdu_stats_parse(struct ath11k_base *ab,
  		       sizeof(struct htt_ppdu_stats_usr_cmpltn_ack_ba_status));
  		user_stats->tlv_flags |= BIT(tag);
  		break;
@@ -562,7 +579,7 @@ index 76df9c1..9a4cdd1 100644
  	return 0;
  }
  
-@@ -1373,8 +1381,8 @@ ath11k_update_per_peer_tx_stats(struct ath11k *ar,
+@@ -1373,8 +1390,8 @@ ath11k_update_per_peer_tx_stats(struct ath11k *ar,
  	struct htt_ppdu_stats_common *common = &ppdu_stats->common;
  	int ret;
  	u8 flags, mcs, nss, bw, sgi, dcm, rate_idx = 0;
@@ -573,7 +590,7 @@ index 76df9c1..9a4cdd1 100644
  	u32 tx_duration = 0;
  	u8 tid = HTT_PPDU_STATS_NON_QOS_TID;
  	bool is_ampdu = false;
-@@ -1405,6 +1413,11 @@ ath11k_update_per_peer_tx_stats(struct ath11k *ar,
+@@ -1405,6 +1422,11 @@ ath11k_update_per_peer_tx_stats(struct ath11k *ar,
  	mcs = HTT_USR_RATE_MCS(user_rate->rate_flags);
  	sgi = HTT_USR_RATE_GI(user_rate->rate_flags);
  	dcm = HTT_USR_RATE_DCM(user_rate->rate_flags);
@@ -585,7 +602,7 @@ index 76df9c1..9a4cdd1 100644
  
  	/* Note: If host configured fixed rates and in some other special
  	 * cases, the broadcast/management frames are sent in different rates.
-@@ -1499,6 +1512,12 @@ ath11k_update_per_peer_tx_stats(struct ath11k *ar,
+@@ -1499,6 +1521,12 @@ ath11k_update_per_peer_tx_stats(struct ath11k *ar,
  		peer_stats->ba_fails =
  			HTT_USR_CMPLTN_LONG_RETRY(usr_stats->cmpltn_cmn.flags) +
  			HTT_USR_CMPLTN_SHORT_RETRY(usr_stats->cmpltn_cmn.flags);
@@ -598,7 +615,7 @@ index 76df9c1..9a4cdd1 100644
  
  		if (ath11k_debugfs_is_extd_tx_stats_enabled(ar))
  			ath11k_debugfs_sta_add_tx_stats(arsta, peer_stats, rate_idx);
-@@ -1551,13 +1570,89 @@ struct htt_ppdu_stats_info *ath11k_dp_htt_get_ppdu_desc(struct ath11k *ar,
+@@ -1551,13 +1579,89 @@ struct htt_ppdu_stats_info *ath11k_dp_htt_get_ppdu_desc(struct ath11k *ar,
  	return ppdu_info;
  }
  
@@ -689,7 +706,7 @@ index 76df9c1..9a4cdd1 100644
  	u8 pdev_id;
  	u32 ppdu_id, len;
  
-@@ -1592,6 +1687,47 @@ static int ath11k_htt_pull_ppdu_stats(struct ath11k_base *ab,
+@@ -1592,6 +1696,47 @@ static int ath11k_htt_pull_ppdu_stats(struct ath11k_base *ab,
  		goto out_unlock_data;
  	}
  

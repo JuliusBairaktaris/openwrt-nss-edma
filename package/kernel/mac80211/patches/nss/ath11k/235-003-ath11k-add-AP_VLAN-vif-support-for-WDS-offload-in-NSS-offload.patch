@@ -44,7 +44,7 @@ index 13db2ed..444d1b6 100644
  	 *
  	 * FIXME: Driver should not copy struct ieee80211_chanctx_conf,
 diff --git a/drivers/net/wireless/ath/ath11k/dp_rx.c b/drivers/net/wireless/ath/ath11k/dp_rx.c
-index ef70bad..720f1c6 100644
+index 54f30f3..99bbb19 100644
 --- a/drivers/net/wireless/ath/ath11k/dp_rx.c
 +++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
 @@ -1113,12 +1113,13 @@ int ath11k_peer_rx_tid_setup(struct ath11k *ar, const u8 *peer_mac, int vdev_id,
@@ -425,7 +425,7 @@ index a697d6f..354c57e 100644
  
  #if IS_ENABLED(CONFIG_IPV6)
 diff --git a/drivers/net/wireless/ath/ath11k/nss.c b/drivers/net/wireless/ath/ath11k/nss.c
-index 3cd88a4..90266a9 100644
+index c09d42f..ebd55f9 100644
 --- a/drivers/net/wireless/ath/ath11k/nss.c
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
 @@ -124,7 +124,10 @@ static void ath11k_nss_get_peer_stats(struct ath11k_base *ab, struct nss_wifili_
@@ -452,7 +452,7 @@ index 3cd88a4..90266a9 100644
  
  		spin_unlock_bh(&ab->base_lock);
  		rcu_read_unlock();
-@@ -1000,6 +1006,9 @@ int ath11k_nss_vdev_set_cmd(struct ath11k_vif *arvif, enum ath11k_nss_vdev_cmd n
+@@ -1012,6 +1018,9 @@ int ath11k_nss_vdev_set_cmd(struct ath11k_vif *arvif, enum ath11k_nss_vdev_cmd n
  	case ATH11K_NSS_WIFI_VDEV_DECAP_TYPE_CMD:
  		cmd = NSS_WIFI_VDEV_DECAP_TYPE_CMD;
  		break;

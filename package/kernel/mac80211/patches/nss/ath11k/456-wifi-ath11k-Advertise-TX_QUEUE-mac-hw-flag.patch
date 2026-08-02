@@ -12,10 +12,10 @@ Signed-off-by: Yuvasree Sivasankaran <quic_ysivasan@quicinc.com>
  1 file changed, 1 insertion(+)
 
 diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
-index b1145e8..ce37ec3 100644
+index c1274df..efe2a4e 100644
 --- a/drivers/net/wireless/ath/ath11k/mac.c
 +++ b/drivers/net/wireless/ath/ath11k/mac.c
-@@ -10953,6 +10953,7 @@ static int __ath11k_mac_register(struct ath11k *ar)
+@@ -10956,6 +10956,7 @@ static int __ath11k_mac_register(struct ath11k *ar)
  	ieee80211_hw_set(ar->hw, QUEUE_CONTROL);
  	ieee80211_hw_set(ar->hw, SUPPORTS_TX_FRAG);
  	ieee80211_hw_set(ar->hw, REPORTS_LOW_ACK);

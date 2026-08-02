@@ -16,10 +16,10 @@ nothing it does: none of its hunks is kernel-version dependent.
 Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 
 diff --git a/drivers/net/wireless/ath/ath11k/dp_rx.c b/drivers/net/wireless/ath/ath11k/dp_rx.c
-index 9c46286..7e528ed 100644
+index 62b8af6..939ade2 100644
 --- a/drivers/net/wireless/ath/ath11k/dp_rx.c
 +++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
-@@ -1732,7 +1732,7 @@ struct htt_ppdu_stats_info *ath11k_dp_htt_get_ppdu_desc(struct ath11k *ar,
+@@ -1741,7 +1741,7 @@ struct htt_ppdu_stats_info *ath11k_dp_htt_get_ppdu_desc(struct ath11k *ar,
  	return ppdu_info;
  }
  
@@ -28,7 +28,7 @@ index 9c46286..7e528ed 100644
  				  struct htt_ppdu_user_stats* usr_stats)
  {
  	peer->ppdu_stats_delayba.reserved0 = usr_stats->rate.reserved0;
-@@ -1747,7 +1747,7 @@ void ath11k_copy_to_delay_stats(struct ath11k_peer *peer,
+@@ -1756,7 +1756,7 @@ void ath11k_copy_to_delay_stats(struct ath11k_peer *peer,
  	peer->delayba_flag = true;
  }
  
@@ -38,10 +38,10 @@ index 9c46286..7e528ed 100644
  {
  	usr_stats->rate.reserved0 = peer->ppdu_stats_delayba.reserved0;
 diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
-index f34cf7c..477b5df 100644
+index b5abce3..cd4f988 100644
 --- a/drivers/net/wireless/ath/ath11k/mac.c
 +++ b/drivers/net/wireless/ath/ath11k/mac.c
-@@ -719,7 +719,7 @@ u8 ath11k_mac_get_target_pdev_id(struct ath11k *ar)
+@@ -720,7 +720,7 @@ u8 ath11k_mac_get_target_pdev_id(struct ath11k *ar)
  		return ar->ab->target_pdev_ids[0].pdev_id;
  }
  
@@ -51,10 +51,10 @@ index f34cf7c..477b5df 100644
  {
  	int i;
 diff --git a/drivers/net/wireless/ath/ath11k/nss.c b/drivers/net/wireless/ath/ath11k/nss.c
-index 7224636..8c21d96 100644
+index 27dfd70..907a000 100644
 --- a/drivers/net/wireless/ath/ath11k/nss.c
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
-@@ -307,7 +307,7 @@ static void ath11k_nss_peer_mem_free(struct ath11k_base *ab, u32 peer_id)
+@@ -318,7 +318,7 @@ static void ath11k_nss_peer_mem_free(struct ath11k_base *ab, u32 peer_id)
  
  /*-----------------------------Events/Callbacks------------------------------*/
  
@@ -63,7 +63,7 @@ index 7224636..8c21d96 100644
  {
  	u32 msg_type = msg->cm.type;
  	enum nss_cmn_response response = msg->cm.response;
-@@ -411,7 +411,7 @@ void ath11k_nss_wifili_event_receive(struct ath11k_base *ab, struct nss_wifili_m
+@@ -422,7 +422,7 @@ void ath11k_nss_wifili_event_receive(struct ath11k_base *ab, struct nss_wifili_m
  	}
  }
  
@@ -72,7 +72,7 @@ index 7224636..8c21d96 100644
  {
  	struct ath11k_vif *arvif;
  	struct ath11k *ar;
-@@ -505,7 +505,7 @@ ath11k_nss_wifili_ext_callback_fn(struct ath11k_base *ab, struct sk_buff *skb,
+@@ -516,7 +516,7 @@ ath11k_nss_wifili_ext_callback_fn(struct ath11k_base *ab, struct sk_buff *skb,
  	}
  }
  
@@ -81,7 +81,7 @@ index 7224636..8c21d96 100644
  {
  	struct ath11k_vif *arvif = (struct ath11k_vif *)app_data;
  
-@@ -3119,7 +3119,7 @@ void ath11k_nss_peer_stats_enable(struct ath11k *ar)
+@@ -3124,7 +3124,7 @@ void ath11k_nss_peer_stats_enable(struct ath11k *ar)
  			     ATH11K_NSS_STATS_ENABLE);
  }
  
@@ -90,7 +90,7 @@ index 7224636..8c21d96 100644
  {
  	struct ath11k *ar = ab->pdevs[radio_id].ar;
  	struct nss_wifili_pdev_init_msg *pdevmsg;
-@@ -3253,7 +3253,7 @@ dealloc:
+@@ -3244,7 +3244,7 @@ dealloc:
  /* TODO : Check if start, reset and stop messages can be done using single function as
   * body is similar, having it now for clarity */
  
@@ -99,7 +99,7 @@ index 7224636..8c21d96 100644
  {
  	struct nss_wifili_msg *wlmsg = NULL;
  	nss_wifili_msg_callback_t msg_cb;
-@@ -3418,7 +3418,7 @@ free:
+@@ -3409,7 +3409,7 @@ free:
  	return ret;
  }
  

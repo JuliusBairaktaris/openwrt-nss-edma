@@ -3,10 +3,10 @@ ath11k-add-8023-undecap-support
 Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 
 diff --git a/drivers/net/wireless/ath/ath11k/dp_rx.c b/drivers/net/wireless/ath/ath11k/dp_rx.c
-index cc709ff..2f61218 100644
+index a2c412b..cc389c1 100644
 --- a/drivers/net/wireless/ath/ath11k/dp_rx.c
 +++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
-@@ -2295,6 +2295,42 @@ static void ath11k_dp_rx_h_undecap_eth(struct ath11k *ar,
+@@ -2304,6 +2304,42 @@ static void ath11k_dp_rx_h_undecap_eth(struct ath11k *ar,
  	ether_addr_copy(ieee80211_get_SA(hdr), sa);
  }
  
@@ -49,7 +49,7 @@ index cc709ff..2f61218 100644
  static void ath11k_dp_rx_h_undecap(struct ath11k *ar, struct sk_buff *msdu,
  				   struct hal_rx_desc *rx_desc,
  				   enum hal_encrypt_type enctype,
-@@ -2336,7 +2372,8 @@ static void ath11k_dp_rx_h_undecap(struct ath11k *ar, struct sk_buff *msdu,
+@@ -2345,7 +2381,8 @@ static void ath11k_dp_rx_h_undecap(struct ath11k *ar, struct sk_buff *msdu,
  						   enctype, status);
  		break;
  	case DP_RX_DECAP_TYPE_8023:

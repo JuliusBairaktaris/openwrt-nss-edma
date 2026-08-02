@@ -3,10 +3,10 @@ ath11k-add-fw-11-4-check
 Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 
 diff --git a/drivers/net/wireless/ath/ath11k/nss.c b/drivers/net/wireless/ath/ath11k/nss.c
-index 3db0103..c934f69 100644
+index ae6d466..00d8536 100644
 --- a/drivers/net/wireless/ath/ath11k/nss.c
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
-@@ -782,9 +782,11 @@ ath11k_nss_vdev_special_data_receive(struct net_device *dev, struct sk_buff *skb
+@@ -793,9 +793,11 @@ ath11k_nss_vdev_special_data_receive(struct net_device *dev, struct sk_buff *skb
  	bool eth_decap = false;
  	int data_offs = 0;
  	int ret = 0;
@@ -19,7 +19,7 @@ index 3db0103..c934f69 100644
  
  	if (!dev) {
  		dev_kfree_skb_any(skb);
-@@ -853,6 +855,7 @@ ath11k_nss_vdev_special_data_receive(struct net_device *dev, struct sk_buff *skb
+@@ -864,6 +866,7 @@ ath11k_nss_vdev_special_data_receive(struct net_device *dev, struct sk_buff *skb
  		rxcb->is_mcbc = true;
  		ath11k_dp_rx_from_nss(arvif->ar, skb, napi);
  	break;
@@ -27,7 +27,7 @@ index 3db0103..c934f69 100644
  	case NSS_WIFI_VDEV_EXT_DATA_PKT_TYPE_4ADDR:
  		if (eth_decap) {
  			addr4_metadata = &wifi_metadata->metadata.addr4_metadata;
-@@ -872,6 +875,7 @@ ath11k_nss_vdev_special_data_receive(struct net_device *dev, struct sk_buff *skb
+@@ -883,6 +886,7 @@ ath11k_nss_vdev_special_data_receive(struct net_device *dev, struct sk_buff *skb
  			spin_unlock_bh(&ab->base_lock);
  		}
  		dev_kfree_skb_any(skb);

@@ -16,6 +16,14 @@ Signed-off-by: Venkateswara Naralasetty <quic_vnaralas@quicinc.com>
  drivers/net/wireless/ath/ath11k/dp_tx.c | 61 ++++++++++++++++++---------------
  3 files changed, 69 insertions(+), 36 deletions(-)
 
+Initialise msdu in ath11k_dp_tx_htt_tx_complete_buf() too. Replacing the
+unconditional idr_remove() with a conditional idr_pool lookup left the "unknown
+msdu_id" guard reading an uninitialised pointer, which the compiler is free to
+keep in a callee-saved register that the false branch never writes. The two
+sibling handlers here already got the initialiser.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+
 diff --git a/drivers/net/wireless/ath/ath11k/dp.c b/drivers/net/wireless/ath/ath11k/dp.c
 index a5411f8..debeedb 100644
 --- a/drivers/net/wireless/ath/ath11k/dp.c
@@ -147,7 +155,7 @@ index 73908db..08081c9 100644
  #define DP_TCL_CMD_RING_SIZE		32
  #define DP_TCL_STATUS_RING_SIZE		32
 diff --git a/drivers/net/wireless/ath/ath11k/dp_tx.c b/drivers/net/wireless/ath/ath11k/dp_tx.c
-index cf5fc49..8957aa6 100644
+index cf5fc49..a2dff7b 100644
 --- a/drivers/net/wireless/ath/ath11k/dp_tx.c
 +++ b/drivers/net/wireless/ath/ath11k/dp_tx.c
 @@ -136,6 +136,7 @@ int ath11k_dp_tx(struct ath11k *ar, struct ath11k_vif *arvif,
@@ -232,7 +240,13 @@ index cf5fc49..8957aa6 100644
  
  	if (unlikely(!msdu)) {
  		ath11k_warn(ab, "tx completion for unknown msdu_id %d\n",
-@@ -406,11 +413,15 @@ ath11k_dp_tx_htt_tx_complete_buf(struct ath11k_base *ab,
+@@ -401,16 +408,20 @@ ath11k_dp_tx_htt_tx_complete_buf(struct ath11k_base *ab,
+ 				 struct ath11k_dp_htt_wbm_tx_status *ts)
+ {
+ 	struct ieee80211_tx_status status = {};
+-	struct sk_buff *msdu;
++	struct sk_buff *msdu = NULL;
+ 	struct ieee80211_tx_info *info;
  	struct ath11k_skb_cb *skb_cb;
  	struct ath11k *ar;
  	struct ath11k_peer *peer;

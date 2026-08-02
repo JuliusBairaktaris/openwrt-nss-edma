@@ -621,10 +621,10 @@ index 46d17ab..7558b4f 100644
 +				  struct hal_srng *srng, enum hal_ring_type type);
  #endif
 diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
-index 61fe114..c7a1751 100644
+index f0c4f65..36a9b8d 100644
 --- a/drivers/net/wireless/ath/ath11k/mac.c
 +++ b/drivers/net/wireless/ath/ath11k/mac.c
-@@ -6617,12 +6617,22 @@ static void ath11k_mac_op_tx(struct ieee80211_hw *hw,
+@@ -6618,12 +6618,22 @@ static void ath11k_mac_op_tx(struct ieee80211_hw *hw,
  	if (control->sta)
  		arsta = ath11k_sta_to_arsta(control->sta);
  
@@ -648,7 +648,7 @@ index 61fe114..c7a1751 100644
  		ieee80211_free_txskb(ar->hw, skb);
  		return;
  	}
-@@ -7595,7 +7605,7 @@ err_vdev_del:
+@@ -7598,7 +7608,7 @@ err_vdev_del:
  	idr_for_each(&ar->txmgmt_idr,
  		     ath11k_mac_vif_txmgmt_idr_remove, vif);
  

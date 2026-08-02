@@ -31,7 +31,7 @@ Signed-off-by: Sarika Sharma <quic_sarishar@quicinc.com>
  1 file changed, 7 insertions(+), 7 deletions(-)
 
 diff --git a/drivers/net/wireless/ath/ath11k/dp_tx.c b/drivers/net/wireless/ath/ath11k/dp_tx.c
-index b12c104..550c4bc 100644
+index 6664caa..30143e4 100644
 --- a/drivers/net/wireless/ath/ath11k/dp_tx.c
 +++ b/drivers/net/wireless/ath/ath11k/dp_tx.c
 @@ -465,7 +465,7 @@ ath11k_dp_tx_htt_tx_complete_buf(struct ath11k_base *ab,

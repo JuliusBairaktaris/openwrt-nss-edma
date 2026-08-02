@@ -15,7 +15,7 @@ Signed-off-by: Tamizh Chelvam Raja <quic_tamizhr@quicinc.com>
  1 file changed, 43 insertions(+)
 
 diff --git a/drivers/net/wireless/ath/ath11k/nss.c b/drivers/net/wireless/ath/ath11k/nss.c
-index a769b65..f942893 100644
+index 658c246..93c4881 100644
 --- a/drivers/net/wireless/ath/ath11k/nss.c
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
 @@ -71,6 +71,43 @@ static void ath11k_nss_wifili_stats_sync(struct ath11k_base *ab,
@@ -62,7 +62,7 @@ index a769b65..f942893 100644
  static void ath11k_nss_get_peer_stats(struct ath11k_base *ab, struct nss_wifili_peer_stats *stats)
  {
  	struct ath11k_peer *peer;
-@@ -333,6 +370,10 @@ void ath11k_nss_wifili_event_receive(struct ath11k_base *ab, struct nss_wifili_m
+@@ -345,6 +382,10 @@ void ath11k_nss_wifili_event_receive(struct ath11k_base *ab, struct nss_wifili_m
  		ath11k_dbg(ab, ATH11K_DBG_NSS_WDS, "nss wifili peer 4addr event received %d response %d error %d\n",
  			   msg_type, response, error);
  		break;
