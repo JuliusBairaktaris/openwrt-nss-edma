@@ -1,12 +1,15 @@
 ---
-blank_issues_enabled: true
+blank_issues_enabled: false
 contact_links:
-  - name: Feature request
-    url: https://forum.openwrt.org/c/feature-requests
-    about: The OpenWrt project relies on volunteers. While we appreciate feature requests, we might lack the manpower to handle them. Ideally, you get familiar with the codebase and attempt to contribute the feature yourself. We recommend to post in the forum, as this is the most likely place to receive feedback on feature requests.
-  - name: OpenWrt community
-    url: https://openwrt.org/contact
-    about: Consider reaching out to our community to get help. OpenWrt is a complex software project with many pitfalls; there is a good chance someone can help you solve your issue in no time.
-  - name: OpenWrt documentation
-    url: https://openwrt.org/docs/start
-    about: The OpenWrt documentation contains a lot of valuable information.
+  - name: The bug also happens on an official OpenWrt image
+    url: https://github.com/openwrt/openwrt/issues/new/choose
+    about: Then it is not this fork's bug. Report it to OpenWrt itself — this tracker only covers what the NSS offload path adds on top.
+  - name: qosmio/openwrt-ipq images
+    url: https://github.com/qosmio/openwrt-ipq/issues
+    about: A different NSS build with a different driver stack. Its bugs belong to it.
+  - name: Help, configuration and general NSS questions
+    url: https://forum.openwrt.org/t/ipq807x-nss-build/148529
+    about: The forum thread. Questions answered there stay findable for the next person.
+  - name: Documentation and known limitations
+    url: https://github.com/JuliusBairaktaris/openwrt-nss-edma/wiki
+    about: Hardware support, runtime operation, SQM, and what is deliberately not supported.
