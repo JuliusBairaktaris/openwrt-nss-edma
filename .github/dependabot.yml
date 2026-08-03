@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # The workflows pin actions by major tag, which stops moving the day an action
+  # cuts a new major - actions/stale@v9 sat unnoticed through v10 and v11. One
+  # grouped pull request a week carries every bump, disabled workflows included.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: .github
