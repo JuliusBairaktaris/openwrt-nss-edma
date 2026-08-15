@@ -1,0 +1,16 @@
+name: Anything else
+description: Device support, a proposal, a tracking note — not a bug report
+labels: ["needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Something broken on an image from this tree goes in the **Bug report** form
+        instead; this one is not triaged for completeness. Questions belong in the
+        [forum thread](https://forum.openwrt.org/t/ipq807x-nss-build/148529).
+  - type: textarea
+    id: body
+    attributes:
+      label: What and why
+    validations:
+      required: true
