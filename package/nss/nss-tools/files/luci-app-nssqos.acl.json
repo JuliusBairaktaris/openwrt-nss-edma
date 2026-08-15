@@ -1,0 +1,23 @@
+{
+	"luci-app-nssqos": {
+		"description": "Grant access to the NSS QoS marking settings and connections viewer",
+		"read": {
+			"uci": [
+				"nssqos"
+			],
+			"cgi-io": [
+				"exec"
+			],
+			"file": {
+				"/usr/sbin/nssqos-conns": [
+					"exec"
+				]
+			}
+		},
+		"write": {
+			"uci": [
+				"nssqos"
+			]
+		}
+	}
+}
