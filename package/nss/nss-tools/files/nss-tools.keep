@@ -1,0 +1,5 @@
+# Captures taken at the moment a port died. A sysupgrade rebuilds the overlay,
+# so without this the one state that explains a wedge is destroyed by the very
+# flash that carries the fix - which is exactly how one occurrence was lost.
+/root/auto-recovery
+/root/pstore
