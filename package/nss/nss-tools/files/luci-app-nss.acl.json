@@ -1,0 +1,10 @@
+{
+	"luci-app-nss": {
+		"description": "Grant access to the NSS offload status page",
+		"read": {
+			"file": {
+				"/usr/sbin/nss-status -j": [ "exec" ]
+			}
+		}
+	}
+}
