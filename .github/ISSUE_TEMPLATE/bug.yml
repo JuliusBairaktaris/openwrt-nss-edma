@@ -1,0 +1,187 @@
+name: Bug report
+description: Something is broken on an image built from this tree
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This tree is OpenWrt plus the NSS offload path. **A bug that also happens on an
+        official OpenWrt image is an OpenWrt bug and belongs at
+        [openwrt/openwrt](https://github.com/openwrt/openwrt/issues), not here** — the
+        first two questions decide that, and a misrouted report is closed automatically
+        with the link.
+
+        Answer everything: the report is worked from what is in it, on hardware that is
+        probably not yours. An incomplete one gets a single comment listing what is
+        missing and **closes itself 7 days later**. Supply what is missing by *editing
+        this issue* — the check re-runs on every edit.
+
+        **Reproduce it on the prebuilt image for your device first.**
+        [Every IPQ807x device has one](https://github.com/JuliusBairaktaris/Qualcommax_NSS_Builder/releases/latest)
+        — pick `...-<your device>-squashfs-sysupgrade.bin`. A self-built image carries a
+        config nobody else has, so "does it happen on the prebuilt image too" is the
+        difference between a bug that can be worked and one that starts with a day of
+        rebuilding yours.
+
+  - type: checkboxes
+    id: ack
+    attributes:
+      label: Before filing
+      options:
+        - label: I searched the open **and closed** issues and the [wiki](https://github.com/JuliusBairaktaris/openwrt-nss-edma/wiki) — this is neither already reported nor a documented limitation.
+          required: true
+        - label: I understand that **NSS firmware 11.4 and 802.11s mesh offload are provided as is**. They live in a closed firmware line that cannot be changed here; a bug in them may be diagnosed and still never fixed, and this issue may be closed on that ground.
+          required: true
+        - label: This is a bug report, not a configuration or support question (those belong in the [forum thread](https://forum.openwrt.org/t/ipq807x-nss-build/148529)).
+          required: true
+
+  - type: dropdown
+    id: image
+    attributes:
+      label: Which image
+      description: |
+        The prebuilt images are at
+        [Qualcommax_NSS_Builder → Releases](https://github.com/JuliusBairaktaris/Qualcommax_NSS_Builder/releases/latest),
+        one per IPQ807x device, rebuilt as this tree moves.
+      options:
+        - Prebuilt release image (Qualcommax NSS Builder)
+        - Self-built from this repo (nss-edma-rework)
+        - Self-built with Qualcommax NSS Builder
+        - qosmio/openwrt-ipq image
+        - Official OpenWrt image (no NSS)
+        - Another NSS build
+    validations:
+      required: true
+
+  - type: dropdown
+    id: gate
+    attributes:
+      label: Does it still happen with the offload off
+      description: |
+        `uci set nss.general.enabled='0'; uci commit nss; reboot` leaves the box on the
+        plain EDMA datapath — the same one an official OpenWrt image runs. If it is
+        still broken there, flash the official OpenWrt image for the device and try
+        once more: that answer is what decides whose bug this is.
+      options:
+        - No — with the offload off the box is fine
+        - Yes — and an official OpenWrt image is broken the same way
+        - Yes — but an official OpenWrt image is fine
+        - Yes — this device has no official OpenWrt image to compare against
+        - Not applicable — the bug is that the offload itself will not come up
+        - Not tested yet
+    validations:
+      required: true
+
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      placeholder: Xiaomi AX3600 / Netgear MX4300 / Zyxel NBG7815
+    validations:
+      required: true
+
+  - type: textarea
+    id: state
+    attributes:
+      label: Build and runtime state
+      description: |
+        Paste the output of, over SSH on the affected box:
+
+        ```sh
+        ubus call system board; uci show nss; nss-status -d
+        ```
+
+        A screenshot is not usable. If a command is missing, say so instead of dropping it.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: diffconfig
+    attributes:
+      label: Diffconfig
+      description: Self-built images only — the output of `./scripts/diffconfig.sh` in the build tree.
+      render: text
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: What the box does, and how you noticed. Not the cause — the symptom.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: |
+        Numbered, from a freshly booted box, precise enough for someone else's hardware.
+        "Browsing the web" is not a reproduction; "iperf3 -c 10.0.0.2 -R for 60 s from a
+        Wi-Fi client while SQM is on" is.
+      placeholder: |
+        1. Flash <image>, reset to defaults
+        2. Configure <the one thing that matters>
+        3. Run <command>
+        4. Within <time>, <what breaks>
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: How often
+      options:
+        - Every time, within minutes
+        - After hours of uptime
+        - Randomly, days apart
+        - Seen once so far
+    validations:
+      required: true
+
+  - type: input
+    id: regression
+    attributes:
+      label: Last image that worked
+      description: Release tag or commit hash of the newest image without this bug. "unknown" and "never worked" are valid answers — a guess is not.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        `logread` and `dmesg` from the boot that shows the bug, not a hand-picked line.
+
+        **If the box crashed, panicked or rebooted itself**, the crash log is the report:
+        attach the whole newest `/root/pstore/*/console-ramoops-*` file (drag it into the
+        comment box — do not paste a truncated tail), and say which boot it belongs to.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: netcfg
+    attributes:
+      label: Network and wireless config
+      description: |
+        `uci export network; uci export wireless; uci export firewall` — **with every
+        passphrase, PPPoE credential and public IP removed by you before pasting.**
+        Include `uci export sqm` if SQM is on.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Custom patches, extra packages, what you already tried, what changed it.
