@@ -1,0 +1,118 @@
+name: Issue triage
+
+# Routes bug reports that belong to OpenWrt (or another NSS build) back out with
+# the link, tells an incomplete report exactly what it is missing, and closes it
+# a week later if nothing arrives. The judgement lives in
+# .github/workflows/scripts/issue-triage.js, which has its own test.
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/issue-triage.yml'
+      - '.github/workflows/scripts/issue-triage*.js'
+      - '.github/ISSUE_TEMPLATE/bug.yml'
+  pull_request:
+    paths:
+      - '.github/workflows/issue-triage.yml'
+      - '.github/workflows/scripts/issue-triage*.js'
+      - '.github/ISSUE_TEMPLATE/bug.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: self-test
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - run: node .github/workflows/scripts/issue-triage.test.js
+
+  triage:
+    name: check report
+    # Maintainers file their own tracking issues; the form is for everyone else.
+    if: >-
+      github.event_name == 'issues' &&
+      !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/github-script@v9
+        with:
+          script: |
+            const { triage } = require(`${process.env.GITHUB_WORKSPACE}/.github/workflows/scripts/issue-triage.js`);
+            const issue = context.payload.issue;
+            const has = (n) => issue.labels.some((l) => l.name === n);
+            if (has('confirmed')) return;
+
+            const r = triage(issue.body);
+            if (!r) return;
+
+            const ref = { ...context.repo, issue_number: issue.number };
+            const MARK = '<!-- issue-triage -->';
+            const body = r.comment ? `${r.comment}\n\n${MARK}`
+              : `Everything the report needs is here now - thanks.\n\n${MARK}`;
+
+            const { data: comments } = await github.rest.issues.listComments({ ...ref, per_page: 100 });
+            const mine = comments.find((c) => c.body.includes(MARK));
+            if (mine) {
+              if (mine.body !== body)
+                await github.rest.issues.updateComment({ ...context.repo, comment_id: mine.id, body });
+            } else if (r.comment) {
+              await github.rest.issues.createComment({ ...ref, body });
+            }
+
+            const add = r.add.filter((l) => !has(l));
+            if (add.length) await github.rest.issues.addLabels({ ...ref, labels: add });
+            for (const name of r.remove.filter(has))
+              await github.rest.issues.removeLabel({ ...ref, name }).catch(() => {});
+
+            if (r.close)
+              await github.rest.issues.update({ ...ref, state: 'closed', state_reason: 'not_planned' });
+
+  reap:
+    name: close unanswered
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/stale@v11
+        with:
+          only-issue-labels: needs-info
+          exempt-issue-labels: confirmed,pinned
+          # Warning on day 5, close on day 7 - nobody is closed without being told
+          # first, and any comment or edit resets both clocks.
+          days-before-issue-stale: 5
+          days-before-issue-close: 2
+          stale-issue-label: no-response
+          stale-issue-message: >
+            Heads-up: this report is still missing the information listed above, and
+            it will close on its own in **2 days** unless something arrives. That is
+            not a judgement on the bug - it is only that it cannot be worked as it
+            stands.
+
+
+            Edit the issue with the missing pieces and this check clears itself. If
+            one of them is impossible to get on your setup, say which and why in a
+            comment; that also stops the clock.
+          close-issue-reason: not_planned
+          close-issue-message: >
+            Closing: this report has been missing the information listed above for a
+            week, and it cannot be worked without it. Nothing is held against it -
+            edit the issue with the missing pieces and reopen it whenever you have
+            them, or say so in a comment if something in the list is impossible to
+            get on your setup.
+          days-before-pr-stale: -1
+          days-before-pr-close: -1
