@@ -11,6 +11,7 @@
 #include <linux/if_vlan.h>
 #include <linux/netdevice.h>
 #include <linux/platform_device.h>
+#include <linux/soc/qcom/qca_edma.h>
 #include <net/page_pool/helpers.h>
 
 #define EDMA_HW_RESET_ID "edma_rst"
@@ -237,6 +238,12 @@ struct edma_ring {
 	struct page **page_store;
 };
 
+struct edma_dp_owner {
+	const struct qca_edma_dp_owner *ops;
+	void *ctx;
+	struct rcu_head rcu;
+};
+
 struct edma_priv {
 	const struct edma_soc_data *soc;
 	struct napi_struct tx_napi;
@@ -253,6 +260,16 @@ struct edma_priv {
 	struct edma_ring txcmpl_ring;
 	struct edma_ring rxfill_ring;
 	struct edma_ring rxdesc_ring;
+
+	struct edma_dp_owner __rcu *dp_owner[QCA_EDMA_DP_MAX_PORT + 1];
+	bool dp_injectable[QCA_EDMA_DP_MAX_PORT + 1];
+	/*
+	 * Host frames refused because the port is not open for injection.
+	 * Counted per port: the conduit carries every port's traffic, so a
+	 * conduit-wide drop count cannot say which port lost them, and which
+	 * port lost them is the whole question when one goes quiet.
+	 */
+	atomic64_t dp_tx_ungranted[QCA_EDMA_DP_MAX_PORT + 1];
 
 	spinlock_t tx_lock;
 
