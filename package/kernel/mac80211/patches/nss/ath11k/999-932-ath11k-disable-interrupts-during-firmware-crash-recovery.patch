@@ -1,0 +1,45 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] ath11k: disable interrupts during firmware crash recovery
+
+ath11k_core_reconfigure_on_crash() tears the data path down while the
+host interrupts and copy-engine interrupts are still live, so a CE or
+DP interrupt can land in structures the same function is freeing. On
+IPQ8074 with NSS offload this is reachable on every firmware fatal.
+
+The reset path already disables them - ath11k_core_reset() does so
+before scheduling the reconfigure - so the crash path is the only one
+that arrives here with interrupts enabled. Gate on ab->is_reset and
+disable both interrupt classes there.
+
+This is the change submitted upstream as "wifi: ath11k: disable
+interrupts during firmware crash recovery"; it is carried here because
+the NSS tree reaches this path on hardware where it is not optional.
+
+It depends on the CRASH_FLUSH guard in 999-927: without it,
+ath11k_hif_ce_irq_disable() on the crash path would write the CE
+interrupt-enable registers of a Q6 that TrustZone is tearing down,
+which is the synchronous external abort 999-927 exists to prevent.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+
+diff --git a/drivers/net/wireless/ath/ath11k/core.c b/drivers/net/wireless/ath/ath11k/core.c
+index ba04535..48f14dd 100644
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -2427,6 +2427,16 @@ static int ath11k_core_reconfigure_on_crash(struct ath11k_base *ab)
+ 	ab->nss.enabled = false;
+ 
+ 	ath11k_thermal_unregister(ab);
++
++	/*
++	 * ath11k_core_reset() already disabled the interrupts on the reset
++	 * path; only the firmware crash path reaches here with them live.
++	 */
++	if (!ab->is_reset) {
++		ath11k_hif_irq_disable(ab);
++		ath11k_hif_ce_irq_disable(ab);
++	}
++
+ 	ath11k_dp_pdev_free(ab);
+ 	ath11k_cfr_deinit(ab);
+ 	ath11k_spectral_deinit(ab);

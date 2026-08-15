@@ -1,0 +1,42 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] wifi: ath11k: drop data TX during firmware crash recovery
+
+ath11k_core_reconfigure_on_crash() calls ath11k_dp_free() to release the DP
+(tx_ring/idr_pool and the TCL srng) while ATH11K_FLAG_CRASH_FLUSH is set.
+ieee80211_stop_queues() does not fully quiesce data TX, so a frame can still
+reach ath11k_dp_tx() in that window and dereferences the freed
+tx_ring->idr_pool, crashing with a NULL write:
+
+  Unable to handle kernel write to read-only memory at virtual address 0
+  pc : ath11k_dp_tx+0x1c8/0xb0c [ath11k]
+   ath11k_dp_tx
+   ath11k_mac_op_tx
+   __sys_sendto
+
+Guard the TX path against the crash-flush window, mirroring the guard
+ath11k_ce_send() already has for the WMI path.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+
+diff --git a/drivers/net/wireless/ath/ath11k/dp_tx.c b/drivers/net/wireless/ath/ath11k/dp_tx.c
+index cdc4853..03ce89b 100644
+--- a/drivers/net/wireless/ath/ath11k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_tx.c
+@@ -142,6 +142,17 @@ int ath11k_dp_tx(struct ath11k *ar, struct ath11k_vif *arvif,
+ 		     !ieee80211_is_data(hdr->frame_control)))
+ 		return -EOPNOTSUPP;
+ 
++	/*
++	 * During firmware crash recovery ath11k_core_reconfigure_on_crash() calls
++	 * ath11k_dp_free(), releasing the DP tx_ring/idr_pool and the TCL srng, while
++	 * ATH11K_FLAG_CRASH_FLUSH is still set. ieee80211_stop_queues() does not fully
++	 * quiesce data TX, so a frame can still reach ath11k_dp_tx() in that window and
++	 * NULL-deref the freed tx_ring->idr_pool (and, further in, the cleared TCL srng).
++	 * Drop it, as ath11k_ce_send() already does for the WMI path.
++	 */
++	if (unlikely(test_bit(ATH11K_FLAG_CRASH_FLUSH, &ab->dev_flags)))
++		return -ESHUTDOWN;
++
+ 	max_tx_ring = num_tx_rings;
+ 
+ #ifdef CPTCFG_ATH11K_MEM_PROFILE_512M
