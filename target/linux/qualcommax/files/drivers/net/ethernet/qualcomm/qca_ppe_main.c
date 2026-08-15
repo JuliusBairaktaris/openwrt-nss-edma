@@ -13,6 +13,7 @@
 #include <linux/reset.h>
 #include <linux/if_bridge.h>
 #include <linux/if_vlan.h>
+#include <linux/soc/qcom/qca_edma.h>
 #include <linux/version.h>
 
 #include "qca_ppe.h"
@@ -68,6 +69,14 @@ static void ppe_port_bridge_txmac_set(struct qca_ppe_priv *priv, int port,
 	regmap_update_bits(priv->regmap, PPE_PORT_BRIDGE_CTRL(port),
 			   PPE_PORT_BRIDGE_CTRL_TXMAC_EN,
 			   enable ? PPE_PORT_BRIDGE_CTRL_TXMAC_EN : 0);
+}
+
+static struct net_device *ppe_port_conduit(struct dsa_port *dp)
+{
+	if (!dp || !dsa_port_is_user(dp))
+		return NULL;
+
+	return dsa_port_to_conduit(dp);
 }
 
 static void ppe_gmac_link_up(struct qca_ppe_priv *priv, int port,
@@ -912,6 +921,9 @@ static int qca_ppe_port_enable(struct dsa_switch *ds, int port,
 static void qca_ppe_port_disable(struct dsa_switch *ds, int port)
 {
 	struct qca_ppe_priv *priv = ds_to_priv(ds);
+	struct dsa_port *dp = dsa_to_port(ds, port);
+
+	qca_edma_port_transition_begin(ppe_port_conduit(dp), port);
 
 	ppe_port_bridge_txmac_set(priv, port, false);
 	ppe_port_queues_enable(priv, port, false);
@@ -1439,6 +1451,8 @@ static void qca_ppe_mac_config(struct phylink_config *config,
 	struct qca_ppe_priv *priv = ds_to_priv(dp->ds);
 	int port = dp->index;
 
+	qca_edma_port_transition_begin(ppe_port_conduit(dp), port);
+
 	if ((state->interface == PHY_INTERFACE_MODE_2500BASEX &&
 	     phylink_autoneg_inband(mode)) ||
 	    state->interface == PHY_INTERFACE_MODE_USXGMII ||
@@ -1506,6 +1520,8 @@ static void qca_ppe_mac_link_down(struct phylink_config *config,
 	 */
 	if (dsa_is_cpu_port(dp->ds, port))
 		return;
+
+	qca_edma_port_transition_begin(ppe_port_conduit(dp), port);
 
 	/* Gate the fabric before the MAC is torn down; qca_ppe_mac_link_up()
 	 * turns it back on once the MAC is up. Left on across a flap, the
@@ -1581,7 +1597,7 @@ static void qca_ppe_mac_link_up(struct phylink_config *config,
 	     interface == PHY_INTERFACE_MODE_USXGMII ||
 	     interface == PHY_INTERFACE_MODE_10GBASER) &&
 	     port < 5)
-		return;
+		goto out;
 
 	/* Bank what the MAC the port is leaving has counted, then baseline
 	 * the one it arrives on: a rebase left to the periodic fold would
@@ -1616,7 +1632,7 @@ static void qca_ppe_mac_link_up(struct phylink_config *config,
 				  tx_pause, rx_pause);
 		break;
 	default:
-		return;
+		goto out;
 	}
 
 	switch (interface) {
@@ -1690,13 +1706,21 @@ static void qca_ppe_mac_link_up(struct phylink_config *config,
 		ppe_port_xgmac_set(priv, port, true, true);
 		break;
 	default:
-		return;
+		goto out;
 	}
 
-	/* MAC is up, so the fabric may feed the port again. The early returns
-	 * above bring no MAC up, so they leave the gate closed on purpose.
+	/* MAC is up, so the fabric may feed the port again. The early exits
+	 * above bring no MAC up, so they skip this and leave the gate closed
+	 * on purpose.
 	 */
 	ppe_port_bridge_txmac_set(priv, port, true);
+
+	/* The transition mac_config opened must close on every exit path,
+	 * gate or no gate: while it is open the conduit drops all host TX for
+	 * the port.
+	 */
+out:
+	qca_edma_port_transition_end(ppe_port_conduit(dp), port);
 }
 
 /* qca_ppe implements no LPI. The stubs exist only to make

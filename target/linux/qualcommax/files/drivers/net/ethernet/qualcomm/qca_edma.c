@@ -1115,9 +1115,9 @@ static int edma_ndo_stop(struct net_device *netdev)
 
 static int edma_ndo_change_mtu(struct net_device *netdev, int new_mtu);
 
-static netdev_tx_t edma_ndo_xmit(struct sk_buff *skb, struct net_device *netdev)
+static netdev_tx_t edma_xmit(struct edma_priv *priv, struct net_device *netdev,
+			     struct sk_buff *skb)
 {
-	struct edma_priv *priv = netdev_priv(netdev);
 	const struct edma_soc_data *soc = priv->soc;
 	u32 nhead, ntail;
 
@@ -1154,6 +1154,36 @@ drop:
 	return NETDEV_TX_OK;
 }
 
+static netdev_tx_t edma_ndo_xmit(struct sk_buff *skb, struct net_device *netdev)
+{
+	struct edma_priv *priv = netdev_priv(netdev);
+	struct dsa_oob_tag_info *tag_info;
+	struct edma_dp_owner *rd;
+
+	tag_info = skb_ext_find(skb, SKB_EXT_DSA_OOB);
+	if (tag_info && tag_info->port <= QCA_EDMA_DP_MAX_PORT) {
+		netdev_tx_t ret;
+
+		rcu_read_lock();
+		rd = rcu_dereference(priv->dp_owner[tag_info->port]);
+		if (rd) {
+			if (unlikely(!READ_ONCE(priv->dp_injectable[tag_info->port]))) {
+				rcu_read_unlock();
+				dev_kfree_skb_any(skb);
+				atomic64_inc(&priv->dp_tx_ungranted[tag_info->port]);
+				netdev->stats.tx_dropped++;
+				return NETDEV_TX_OK;
+			}
+			ret = rd->ops->xmit(skb, rd->ctx);
+			rcu_read_unlock();
+			return ret;
+		}
+		rcu_read_unlock();
+	}
+
+	return edma_xmit(priv, netdev, skb);
+}
+
 static const struct net_device_ops edma_netdev_ops = {
 	.ndo_open = edma_ndo_open,
 	.ndo_stop = edma_ndo_stop,
@@ -1163,6 +1193,185 @@ static const struct net_device_ops edma_netdev_ops = {
 	.ndo_validate_addr = eth_validate_addr,
 	.ndo_get_stats64 = dev_get_tstats64,
 };
+
+/*
+ * Serializes owner table mutation and injectable state across all
+ * conduits, and is held across every revoke/grant callback: an owner is
+ * never released while one of its callbacks runs, and claim-time grant,
+ * transition revoke/grant and release order totally.
+ */
+static DEFINE_MUTEX(edma_dp_lock);
+
+bool qca_edma_netdev_is_conduit(const struct net_device *netdev)
+{
+	return netdev && netdev->netdev_ops == &edma_netdev_ops;
+}
+EXPORT_SYMBOL_GPL(qca_edma_netdev_is_conduit);
+
+int qca_edma_port_dp_claim(struct net_device *conduit, unsigned int port,
+			   const struct qca_edma_dp_owner *owner, void *ctx)
+{
+	struct edma_dp_owner *rd;
+	struct edma_priv *priv;
+	int ret = 0;
+
+	if (!qca_edma_netdev_is_conduit(conduit) || !owner || !owner->xmit ||
+	    !owner->revoke || !owner->grant || port > QCA_EDMA_DP_MAX_PORT)
+		return -EINVAL;
+
+	priv = netdev_priv(conduit);
+
+	rd = kzalloc(sizeof(*rd), GFP_KERNEL);
+	if (!rd)
+		return -ENOMEM;
+
+	rd->ops = owner;
+	rd->ctx = ctx;
+
+	mutex_lock(&edma_dp_lock);
+	if (rcu_dereference_protected(priv->dp_owner[port],
+				      lockdep_is_held(&edma_dp_lock))) {
+		kfree(rd);
+		ret = -EBUSY;
+	} else {
+		bool was_open = priv->dp_injectable[port];
+
+		/*
+		 * Publishing the owner while the port is still marked
+		 * injectable hands it conduit TX before the grant has told
+		 * the firmware the port is up, and the firmware discards
+		 * frames for a port it believes is down. Close the port
+		 * across the claim instead: until the owner is published the
+		 * frames still take the host path, after it they are dropped
+		 * and counted against the port, so at no point are they given
+		 * to an owner that cannot send them. Reopen only on a granted
+		 * claim, leaving a refused one to the next transition.
+		 */
+		if (was_open)
+			WRITE_ONCE(priv->dp_injectable[port], false);
+		rcu_assign_pointer(priv->dp_owner[port], rd);
+		if (was_open && !owner->grant(ctx))
+			WRITE_ONCE(priv->dp_injectable[port], true);
+	}
+	mutex_unlock(&edma_dp_lock);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(qca_edma_port_dp_claim);
+
+int qca_edma_port_dp_release(struct net_device *conduit, unsigned int port)
+{
+	struct edma_dp_owner *rd;
+	struct edma_priv *priv;
+
+	if (!qca_edma_netdev_is_conduit(conduit) ||
+	    port > QCA_EDMA_DP_MAX_PORT)
+		return -EINVAL;
+
+	priv = netdev_priv(conduit);
+
+	mutex_lock(&edma_dp_lock);
+	rd = rcu_replace_pointer(priv->dp_owner[port], NULL,
+				 lockdep_is_held(&edma_dp_lock));
+	mutex_unlock(&edma_dp_lock);
+
+	if (!rd)
+		return -ENOENT;
+
+	/* No handler invocation is in flight once this returns. */
+	synchronize_net();
+	kfree(rd);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qca_edma_port_dp_release);
+
+void qca_edma_port_transition_begin(struct net_device *conduit,
+				    unsigned int port)
+{
+	struct edma_dp_owner *rd;
+	struct edma_priv *priv;
+
+	if (!qca_edma_netdev_is_conduit(conduit) ||
+	    port > QCA_EDMA_DP_MAX_PORT)
+		return;
+
+	priv = netdev_priv(conduit);
+
+	mutex_lock(&edma_dp_lock);
+	if (priv->dp_injectable[port]) {
+		WRITE_ONCE(priv->dp_injectable[port], false);
+		rd = rcu_dereference_protected(priv->dp_owner[port],
+					       lockdep_is_held(&edma_dp_lock));
+		if (rd)
+			rd->ops->revoke(rd->ctx);
+	}
+	mutex_unlock(&edma_dp_lock);
+}
+EXPORT_SYMBOL_GPL(qca_edma_port_transition_begin);
+
+void qca_edma_port_transition_end(struct net_device *conduit,
+				  unsigned int port)
+{
+	struct edma_dp_owner *rd;
+	struct edma_priv *priv;
+
+	if (!qca_edma_netdev_is_conduit(conduit) ||
+	    port > QCA_EDMA_DP_MAX_PORT)
+		return;
+
+	priv = netdev_priv(conduit);
+
+	mutex_lock(&edma_dp_lock);
+	if (!priv->dp_injectable[port]) {
+		rd = rcu_dereference_protected(priv->dp_owner[port],
+					       lockdep_is_held(&edma_dp_lock));
+		/*
+		 * Only open the port once the owner confirms it can carry the
+		 * traffic, and leave the flag clear if it cannot. The flag is
+		 * the retry condition as much as the TX permission: setting
+		 * it before the grant, and keeping it set when the grant
+		 * failed, made every later transition skip the grant it was
+		 * supposed to repeat, so one refused grant stranded the port
+		 * until reboot.
+		 * Left clear, host TX for the port is dropped and counted
+		 * rather than silently handed to an owner that cannot send it,
+		 * and the next transition tries again.
+		 */
+		if (!rd || !rd->ops->grant(rd->ctx))
+			WRITE_ONCE(priv->dp_injectable[port], true);
+	}
+	mutex_unlock(&edma_dp_lock);
+}
+EXPORT_SYMBOL_GPL(qca_edma_port_transition_end);
+
+u64 qca_edma_port_dp_tx_ungranted(struct net_device *conduit, unsigned int port)
+{
+	struct edma_priv *priv;
+
+	if (!qca_edma_netdev_is_conduit(conduit) ||
+	    port > QCA_EDMA_DP_MAX_PORT)
+		return 0;
+
+	priv = netdev_priv(conduit);
+
+	return atomic64_read(&priv->dp_tx_ungranted[port]);
+}
+EXPORT_SYMBOL_GPL(qca_edma_port_dp_tx_ungranted);
+
+bool qca_edma_port_dp_injectable(struct net_device *conduit, unsigned int port)
+{
+	struct edma_priv *priv;
+
+	if (!qca_edma_netdev_is_conduit(conduit) ||
+	    port > QCA_EDMA_DP_MAX_PORT)
+		return false;
+
+	priv = netdev_priv(conduit);
+
+	return READ_ONCE(priv->dp_injectable[port]);
+}
+EXPORT_SYMBOL_GPL(qca_edma_port_dp_injectable);
 
 static int edma_irq_init(struct edma_priv *priv)
 {
@@ -1345,16 +1554,18 @@ static const struct regmap_config edma_regmap_cfg = {
  * whose ports carry the board's addresses either from DT or patched in by
  * the bootloader. DSA user ports without one of their own inherit whatever
  * ends up here.
+ *
+ * A port address is optional here, so no lookup error is fatal: a cell whose
+ * layout driver never binds defers forever, and dsa_port_setup() reads these
+ * same addresses without acting on the error either.
  */
 static int edma_get_mac_address(struct net_device *netdev,
 				struct device_node *np)
 {
 	struct device_node *cpu_port;
-	int ret;
 
-	ret = of_get_ethdev_address(np, netdev);
-	if (!ret || ret == -EPROBE_DEFER)
-		return ret;
+	if (!of_get_ethdev_address(np, netdev))
+		return 0;
 
 	for_each_node_with_property(cpu_port, "ethernet") {
 		struct device_node *conduit __free(device_node) =
@@ -1364,10 +1575,9 @@ static int edma_get_mac_address(struct net_device *netdev,
 			continue;
 
 		for_each_available_child_of_node_scoped(cpu_port->parent, port) {
-			ret = of_get_ethdev_address(port, netdev);
-			if (!ret || ret == -EPROBE_DEFER) {
+			if (!of_get_ethdev_address(port, netdev)) {
 				of_node_put(cpu_port);
-				return ret;
+				return 0;
 			}
 		}
 	}
@@ -1417,10 +1627,7 @@ static int edma_probe(struct platform_device *pdev)
 	priv->pdev = pdev;
 	priv->soc = device_get_match_data(dev);
 
-	ret = edma_get_mac_address(netdev, dev->of_node);
-	if (ret == -EPROBE_DEFER)
-		return dev_err_probe(dev, ret, "failed to get MAC address\n");
-	if (ret)
+	if (edma_get_mac_address(netdev, dev->of_node))
 		eth_hw_addr_random(netdev);
 
 	priv->tx_ring_size = EDMA_TX_RING_SIZE;
@@ -1486,8 +1693,20 @@ err_page_pool:
 static void edma_remove(struct platform_device *pdev)
 {
 	struct edma_priv *priv = platform_get_drvdata(pdev);
+	struct edma_dp_owner *rd;
+	int i;
 
 	unregister_netdev(priv->netdev);
+
+	/* Datapath owners detach on NETDEV_UNREGISTER; mop up stragglers */
+	mutex_lock(&edma_dp_lock);
+	for (i = 0; i <= QCA_EDMA_DP_MAX_PORT; i++) {
+		rd = rcu_replace_pointer(priv->dp_owner[i], NULL,
+					 lockdep_is_held(&edma_dp_lock));
+		if (rd)
+			kfree_rcu(rd, rcu);
+	}
+	mutex_unlock(&edma_dp_lock);
 	netif_napi_del(&priv->tx_napi);
 	netif_napi_del(&priv->rx_napi);
 	edma_hw_stop(priv);
