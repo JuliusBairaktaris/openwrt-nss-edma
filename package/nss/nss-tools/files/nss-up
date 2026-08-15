@@ -1,0 +1,247 @@
+#!/bin/sh
+# Layer the NSS data-plane services on the armed firmware: bridge/multicast/
+# ECM/PPPoE managers, WAN and SQM. The nss init service armed the wired plane
+# and loaded ath11k with the data-path decision before netifd ran (the radios
+# bind once, no rebind here); this instance starts alongside netifd, verifies
+# that state, waits for the network topology, and brings up the rest. A
+# reboot with nss.general.enabled='0' returns the device to the host stack.
+set -e
+. /lib/nss/functions.sh
+# Every stage here loads its module by name. Stock OpenWrt answers modprobe with
+# ubox's kmodloader, which resolves a name by scanning /lib/modules and follows
+# each module's own depends= list. The optional 'kmod' package takes /sbin/modprobe
+# over (alternatives priority 200) with upstream kmod, which resolves names only
+# through a depmod-generated modules.dep that no OpenWrt image ships: every
+# modprobe below then fails as "not found" and, with no dependency walk, ECM
+# reports unresolved symbols instead.
+[ "$(readlink /sbin/modprobe)" = /sbin/kmodloader ] ||
+  [ -f "/lib/modules/$(uname -r)/modules.dep" ] ||
+  echo "WARN: modprobe cannot resolve module names here (the 'kmod' package replaced kmodloader and there is no modules.dep) - remove the 'kmod' package or run 'depmod -a'"
+FWM=/sys/kernel/debug/qca-ppe-nss/fw_mask
+[ "$(cat $FWM 2>/dev/null || echo 0x0)" != "0x0" ] || { echo "data plane not armed (the nss init service arms it before netifd) - nothing to do"; exit 1; }
+# nss-drv hands the armed ports their data plane from a one-shot workqueue
+# after the firmware boots; wait for that registration to reach every armed
+# port instead of guessing with a fixed sleep.
+NARM=$(grep -c 'armed=1' /sys/kernel/debug/qca-ppe-nss/status 2>/dev/null)
+ports_registered() {
+  [ "$(grep -c 'overridden=1' /sys/kernel/debug/qca-ppe-nss/status 2>/dev/null)" -ge "${NARM:-1}" ]
+}
+poll_until 20 ports_registered || true
+grep 'armed=1' /sys/kernel/debug/qca-ppe-nss/status
+
+# The firmware data plane is armed (the critical section above exits on
+# failure). Everything below - bridge-mgr, qca-mcs, ECM, PPPoE, the Wi-Fi flip,
+# WAN, SQM - is best-effort: a failure here must not abort the script and leave
+# the firmware armed without ECM. ECM hard-depends on qca-mcs
+# (ECM_MULTICAST_ENABLE), so 'modprobe ecm' can fail if qca-mcs is missing -
+# don't let that take down the rest of the plane.
+set +e
+
+# Firmware log ring. The ring the firmware publishes through meminfo holds 32
+# entries, and a firmware trap logs five lines per attempt, so a single burst
+# overwrites the ring and a coredump can only ever show the trap itself, never
+# what led to it. The driver also exposes /sys/kernel/debug/qca-nss-drv/logs/*
+# only for a ring it allocated, so by default the log is unreadable while
+# running too. Allocate a larger ring on both counts.
+FWLOG="$(uci -q get nss.general.fw_logbuf)"
+[ -n "$FWLOG" ] || FWLOG=256
+[ "$FWLOG" -ge 32 ] 2>/dev/null && sysctl -qw dev.nss.general.logbuf="$FWLOG"
+
+# This instance starts before netifd, but the managers below bind to
+# netifd's topology (bridge-mgr member-walks the live bridge on load).
+# Wait for the interface objects and the first bridge to exist; a
+# bridge-less configuration just pays the short timeout and proceeds
+# (bridge-mgr also handles later joins through its netdev notifiers).
+ubus -t 20 wait_for network.interface 2>/dev/null
+have_bridge() { ls -d /sys/class/net/*/bridge >/dev/null 2>&1; }
+poll_until 15 have_bridge
+
+# bridge-mgr: offload Linux-bridge L2 forwarding into the firmware. Load after
+# the data plane is up (ports armed) and before ECM, so the firmware bridge
+# interface exists when ECM classifies bridged flows. On load it walks the
+# existing bridge's members and joins the wired (qca_ppe) ports; Wi-Fi members
+# are skipped until they become NSS interfaces.
+modprobe qca-nss-bridge-mgr 2>/dev/null || true
+
+# vlan-mgr: register 802.1Q upper devices of the armed ports as firmware VLAN
+# interfaces. Without it the firmware untags parsed IP traffic onto the parent
+# port device, so a plain tagged-VLAN WAN (e.g. DHCP on wan.N) never sees its
+# inbound packets. Load after the ports are armed (it resolves the parent
+# device's interface number on the netdev-notifier replay) and before ECM, so
+# connection hierarchies over VLANs bind the firmware VLAN interfaces.
+# The module is not in the default image (a firmware VLAN node with no attached
+# VSI coredumps core0, so it is opt-in at build time too). Say so rather than
+# letting the opt-in fail silently.
+if [ "$(uci -q get nss.general.vlan_mgr)" = "1" ]; then
+  modprobe qca-nss-vlan 2>/dev/null ||
+    echo "WARN: nss.general.vlan_mgr=1 but qca-nss-vlan is not in this image - rebuild with the NSS VLAN manager selected"
+fi
+
+# qca-mcs: IGMP/MLD membership snooping. ECM's bridged-multicast classifier
+# links against its hooks (mc_bridge_ipv4_get_if etc.), so it must load before
+# ECM for symbol resolution. Same-subnet multicast is hardware-bridged by the
+# kernel bridge IGMP snoop -> switchdev MDB -> qca_ppe, independent of qca-mcs's
+# own replication path (which stays inert here - nothing enables it).
+modprobe qca-mcs 2>/dev/null || true
+
+sysctl -w net.netfilter.nf_conntrack_events=1
+modprobe ecm front_end_selection=1
+# ECM creates its debugfs tree from the module init; wait for the file rather
+# than guessing at a delay. A fixed sleep that is too short on a loaded boot
+# makes the write below fail silently and leaves the default classifier
+# accelerating from the first packet.
+ecm_ready() { [ -w /sys/kernel/debug/ecm/ecm_classifier_default/accel_delay_pkts ]; }
+poll_until 15 ecm_ready &&
+  echo 1 > /sys/kernel/debug/ecm/ecm_classifier_default/accel_delay_pkts ||
+  echo "WARN: ECM debugfs did not appear - accel_delay_pkts left at its default"
+
+# PPPoE connection-manager offload. Load unconditionally: the manager only
+# learns sessions created after it loads, and gating this on the current
+# network.wan.proto loses the race when the WAN becomes PPPoE only after boot
+# (fresh flash + config restore) - leaving every WAN flow stuck on the host
+# path. It is inert without a PPPoE session, and on images without the module
+# the redirect below swallows the error. The 'ifup wan' further down
+# (re)creates the session after the manager is resident.
+modprobe qca-nss-pppoe 2>/dev/null || true
+
+# Wi-Fi: the nss init service loaded ath11k before netifd with nss_offload
+# already decided and the pbuf n2h/clock tuning applied, so the radios bound
+# once, straight onto their data path (wifili when offloaded). Verify that
+# an offload-mode load actually produced radios; if none appeared, fall back
+# to host-mode Wi-Fi (the recovery/escape path). Nothing was up on the
+# failed path, so the rebind needs no prior wifi down.
+# Ask the ath11k platform driver for its phys rather than counting
+# /sys/class/ieee80211: on a board that also carries a PCIe radio, ath11k_pci
+# binds that one on its own and its phy alone satisfied the count, so the
+# fallback never ran when the SoC radios failed to bind.
+radios_up() { [ -n "$(ls -d /sys/bus/platform/drivers/ath11k/*/ieee80211/phy* 2>/dev/null)" ]; }
+if [ -e /sys/bus/platform/devices/c000000.wifi ] \
+   && [ "$(cat /sys/module/ath11k/parameters/nss_offload 2>/dev/null)" = "1" ]; then
+  if ! poll_until 15 radios_up; then
+    echo "WIFI OFFLOAD FAILED - falling back to host-mode wifi"
+    echo 0 > /sys/module/ath11k/parameters/nss_offload
+    echo c000000.wifi > /sys/bus/platform/drivers/ath11k/unbind 2>/dev/null
+    sleep 3
+    echo c000000.wifi > /sys/bus/platform/drivers/ath11k/bind
+    poll_until 12 radios_up
+    wifi up
+  fi
+fi
+
+# Linux RPS for the delivery netdevs is not applied here: net.core.rps_default_mask
+# (12-nss-networking.conf) already gives every netdev created after sysctl.d runs
+# the cores-1-3 mask at rx-queue creation, which covers the bridges, pppoe-wan and
+# the IGS ifb devices. See that file for why the Wi-Fi VAPs are not ours to set.
+
+# WAN + SQM bring-up is best-effort with retries (set +e is in effect).
+# Identify the WAN interface from the live default route (any section name
+# works); only when the WAN is down at this point fall back to the
+# conventional logical name 'wan'.
+. /lib/functions/network.sh
+network_find_wan wan_iface
+[ -n "$wan_iface" ] || wan_iface=wan
+ifup "$wan_iface"
+
+# Wait for the WAN to obtain an L3 address before flushing conntrack and
+# reporting: WAN negotiation (PPPoE especially) takes seconds, and the SQM
+# outcome below can only be judged once the ifup completed. Poll the real
+# L3 device for up to ~60s.
+# The L3 device (pppoe-wan for a PPPoE WAN, the DHCP/static device otherwise)
+# only exists once the interface is up, so re-derive it every iteration instead
+# of sampling it once before the WAN has negotiated.
+i=0
+while [ $i -lt 30 ]; do
+  wan_dev=$(ifstatus "$wan_iface" 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
+  if [ -n "$wan_dev" ] \
+     && { ip -4 addr show dev "$wan_dev" 2>/dev/null | grep -q "inet " \
+          || ip -6 addr show dev "$wan_dev" scope global 2>/dev/null | grep -q "inet6 "; }; then
+    break
+  fi
+  i=$((i + 1))
+  sleep 2
+done
+[ -n "$wan_dev" ] || wan_dev=$wan_iface
+if [ $i -lt 30 ]; then
+  echo "$wan_dev has an IP after ~$((i * 2))s"
+else
+  echo "WARN: $wan_dev still has no IP after 60s; starting SQM anyway"
+fi
+
+# Flush conntrack/ECM so flows established during bring-up re-accelerate
+# against the finished topology. The short settle is deliberate and not a
+# guess: the WAN wait above returns as soon as the L3 device has an address,
+# while pppd is still installing routes and the firewall is still reloading,
+# and flushing into that window just re-creates the stale flows.
+sleep 3
+echo 1 > /sys/kernel/debug/ecm/ecm_db/defunct_all 2>/dev/null
+echo f > /proc/net/nf_conntrack 2>/dev/null
+# Report what is actually up. Everything past the critical section is
+# best-effort, so an unconditional "NSS+wifi+ECM up" turned a failed ECM load or
+# a partially registered plane into a green light with empty accel counts.
+v4=$(cat /sys/kernel/debug/ecm/ecm_nss_ipv4/accelerated_count 2>/dev/null)
+v6=$(cat /sys/kernel/debug/ecm/ecm_nss_ipv6/accelerated_count 2>/dev/null)
+if [ -n "$v4" ] || [ -n "$v6" ]; then
+  echo "NSS+wifi+ECM up. accel counts: v4=${v4:-0} v6=${v6:-0}"
+else
+  echo "WARN: NSS plane armed but ECM is not accelerating (no ecm_nss_ipv4/ipv6 counters) - check 'logread | grep -i ecm'"
+fi
+
+# --- Optional offloads (NOT enabled in the default image) ------------------
+# Routed (L3) multicast, e.g. IPTV WAN->LAN. To enable it in a fork: add a
+# multicast-routing daemon to the build (CONFIG_PACKAGE_igmpproxy=y or smcroute),
+# ship your own /etc/config for it, disable its boot autostart so it starts only
+# here (after pppoe-wan has an address), and uncomment the line below. ECM
+# (ECM_MULTICAST_ENABLE, already on) then turns each kernel MFC entry the daemon
+# installs into a PPE hardware rule. See docs/CUSTOMIZE.md.
+# [ -x /usr/sbin/igmpproxy ] && /etc/init.d/igmpproxy start 2>/dev/null || true
+#
+# The other build-verified extras (nat46/MAP-T, vxlan, macvlan, gre) need no
+# bring-up step here - ECM offloads them automatically once their kmod and
+# interface exist.
+# ---------------------------------------------------------------------------
+
+# SQM starts from the iface hotplug on the 'ifup wan' above: sqm-scripts'
+# own 11-sqm covers sections shaping the L3 netdev, the 12-nss-sqm hotplug
+# (sqm-scripts-nss) covers sections shaping a lower device of the WAN stack
+# (the physical port, where the NSS shaper sits). Just report the outcome.
+# Test the resolved SECTION for being enabled, not just the sqm service: the
+# service is enabled in the default image while the shipped queue section is
+# not, and nss_sqm_section() falls back to the first section when none is
+# enabled - so checking the service alone burned 16s of polling and ended every
+# default boot with a WARN about a shaper nobody asked for.
+if /etc/init.d/sqm enabled; then
+  nss_sqm_section
+  sqm_attached() { tc qdisc show dev "$NSS_SQM_DEV" 2>/dev/null | grep -q nsstbl; }
+  if [ -z "$NSS_SQM_DEV" ]; then
+    echo "sqm service enabled but no queue section found"
+  elif ! [ "$(uci -q get "sqm.${NSS_SQM_SEC}.enabled")" -eq 1 ] 2>/dev/null; then
+    echo "SQM not configured (queue section '$NSS_SQM_SEC' is disabled)"
+  else
+  poll_until 16 sqm_attached
+  if sqm_attached; then
+    echo "SQM active on $NSS_SQM_DEV"
+  else
+    echo "WARN: SQM not attached on $NSS_SQM_DEV (logread | grep -i sqm)"
+  fi
+  # Report the per-port upload IGS trees (the section's igs_upload option).
+  for p in $(uci -q get "sqm.${NSS_SQM_SEC}.igs_upload"); do
+    if tc qdisc show dev "ifb-$p" 2>/dev/null | grep -q nsstbl; then
+      echo "upload IGS active: $p -> ifb-$p"
+    else
+      echo "WARN: upload IGS tree missing on ifb-$p (logread | grep upload_igs)"
+    fi
+  done
+  fi
+fi
+
+# Baseline the PPE's configuration registers now that the plane is armed and
+# settled. The per-port egress wedge is cleared only by a reboot, which points
+# at a register a reboot re-initialises and nothing else rewrites - and the only
+# way to name one of those without guessing which to suspect is to know what it
+# held when the box was healthy. Costs ~2s and one file; nss-wedge-watch diffs
+# against it at wedge time. Best effort: a missing baseline degrades the capture,
+# it must never fail a bring-up.
+nss-ppe-diff save >/dev/null 2>&1 ||
+  echo "WARN: could not baseline the PPE registers (nss-ppe-diff save)"
+
+exit 0
