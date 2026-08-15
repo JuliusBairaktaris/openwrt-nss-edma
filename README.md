@@ -1,108 +1,87 @@
-![OpenWrt logo](include/logo.png)
+# OpenWrt with NSS hardware offload for IPQ807x and IPQ60xx
 
-OpenWrt Project is a Linux operating system targeting embedded devices. Instead
-of trying to create a single, static firmware, OpenWrt provides a fully
-writable filesystem with package management. This frees you from the
-application selection and configuration provided by the vendor and allows you
-to customize the device through the use of packages to suit any application.
-For developers, OpenWrt is the framework to build an application without having
-to build a complete firmware around it; for users this means the ability for
-full customization, to use the device in ways never envisioned.
+This is OpenWrt main with Qualcomm NSS hardware offload for IPQ807x and
+IPQ60xx (IPQ6018) routers, such as the Xiaomi AX3600, Redmi AX6, Linksys
+MX4300 and MR7350, and GL.iNet GL-AX1800. The NSS firmware runs on top of
+the upstream `qca_edma` and `qca_ppe` ethernet and DSA drivers on kernel
+6.18 and on the 7.3 testing kernel. It does not use the out-of-tree
+`qca-nss-dp` and `qca-ssdk` drivers.
 
-Sunshine!
+Offloaded: IPv4 NAT and IPv6 routing through ECM, PPPoE, 802.1Q VLAN,
+bridging, multicast snooping, the NSS qdiscs for SQM, and ath11k Wi-Fi
+offload. 802.11s mesh offload needs the 11.4 NSS firmware (the mesh
+images). The full support matrix is in the wiki.
 
-## Download
+IPQ60xx support is new and lightly tested. The maintainer has no IPQ60xx
+hardware, so reports from IPQ60xx users are welcome.
 
-Built firmware images are available for many architectures and come with a
-package selection to be used as WiFi home router. To quickly find a factory
-image usable to migrate from a vendor stock firmware to OpenWrt, try the
-*Firmware Selector*.
+## Images
 
-* [OpenWrt Firmware Selector](https://firmware-selector.openwrt.org/)
+Prebuilt images for every IPQ807x board, and every IPQ60xx board with an
+NSS node in its device tree, are on the
+[Qualcommax_NSS_Builder releases](https://github.com/JuliusBairaktaris/Qualcommax_NSS_Builder/releases)
+page. IPQ60xx images are in the `ipq60xx-1g` and `ipq60xx-512m` groups.
+Each build comes in a default and a mesh flavour.
 
-If your device is supported, please follow the **Info** link to see install
-instructions or consult the support resources listed below.
+## Documentation
 
-##
+The [wiki](https://github.com/JuliusBairaktaris/openwrt-nss-edma/wiki)
+covers the architecture, runtime operation, SQM, hardware support and
+known limitations.
 
-An advanced user may require additional or specific package. (Toolchain, SDK, ...) For everything else than simple firmware download, try the wiki download page:
+## Branch layout
 
-* [OpenWrt Wiki Download](https://openwrt.org/downloads)
+`nss-edma-7.3` is the qualcommax kernel 7.3 branch
+([openwrt/openwrt#25701](https://github.com/openwrt/openwrt/pull/25701),
+which adds 7.3 as the testing kernel) plus a series on top:
 
-## Development
+1. `qca_edma` and `qca_ppe` changes that let the NSS firmware share the
+   EDMA and PPE with the host driver.
+2. NSS device tree nodes for IPQ807x and IPQ6018.
+3. Kernel support patches for ECM, the NSS qdiscs and qca-mcs.
+4. The `kmod-qca-ppe-nss` glue module and the NSS runtime tools.
+5. ath11k and mac80211 NSS Wi-Fi offload.
 
-To build your own firmware you need a GNU/Linux, BSD or macOS system (case
-sensitive filesystem required). Cygwin is unsupported because of the lack of a
-case sensitive file system.
+The NSS packages (driver, ECM, qdiscs, firmware) are in the
+[nss-packages](https://github.com/JuliusBairaktaris/nss-packages) feed,
+branch `edma-nss`. Its patches build for Linux 6.18 and 7.3.
 
-### Requirements
+## Building
 
-You need the following tools to compile OpenWrt, the package names vary between
-distributions. A complete list with distribution specific packages is found in
-the [Build System Setup](https://openwrt.org/docs/guide-developer/build-system/install-buildsystem)
-documentation.
-
+```sh
+git clone -b nss-edma-7.3 https://github.com/JuliusBairaktaris/openwrt-nss-edma.git
+cd openwrt-nss-edma
+cp feeds.conf.default feeds.conf
+echo "src-git nss https://github.com/JuliusBairaktaris/nss-packages.git;edma-nss" >> feeds.conf
+./scripts/feeds update -a && ./scripts/feeds install -a
+make menuconfig   # qualcommax/ipq807x or ipq60xx, select the NSS packages
+                  # for 7.3: Global build settings > Use the testing kernel version
+make -j$(nproc)
 ```
-binutils bzip2 diff find flex gawk gcc-6+ getopt grep install libc-dev libz-dev
-make4.1+ perl python3.8+ rsync subversion unzip which
-```
 
-### Quickstart
+Without the nss feed, `ATH11K_NSS_SUPPORT` has an unmet dependency and
+menuconfig fails.
 
-1. Run `./scripts/feeds update -a` to obtain all the latest package definitions
-   defined in feeds.conf / feeds.conf.default
+The image always boots on the host datapath first. The `nss` service then
+starts the offload. With `uci set nss.general.enabled=0` the router runs
+as stock OpenWrt and no NSS module is loaded.
 
-2. Run `./scripts/feeds install -a` to install symlinks for all obtained
-   packages into package/feeds/
+## Acknowledgements
 
-3. Run `make menuconfig` to select your preferred configuration for the
-   toolchain, target system & firmware packages.
+- [Christian Marangi (Ansuel)](https://github.com/Ansuel) for the upstream
+  EDMA and PPE drivers.
+- [Robert Marko (robimarko)](https://github.com/robimarko) for maintaining the
+  OpenWrt qualcommax target.
+- [qosmio](https://github.com/qosmio/openwrt-ipq) for the NSS packaging and
+  firmware tarballs the feed builds on.
+- Qualcomm and CodeLinaro for the open-source NSS host components.
 
-4. Run `make` to build your firmware. This will download all sources, build the
-   cross-compile toolchain and then cross-compile the GNU/Linux kernel & all chosen
-   applications for your target system.
+## Support
 
-### Related Repositories
-
-The main repository uses multiple sub-repositories to manage packages of
-different categories. All packages are installed via the OpenWrt package
-manager called `opkg`. If you're looking to develop the web interface or port
-packages to OpenWrt, please find the fitting repository below.
-
-* [LuCI Web Interface](https://github.com/openwrt/luci): Modern and modular
-  interface to control the device via a web browser.
-
-* [OpenWrt Packages](https://github.com/openwrt/packages): Community repository
-  of ported packages.
-
-* [OpenWrt Routing](https://github.com/openwrt/routing): Packages specifically
-  focused on (mesh) routing.
-
-* [OpenWrt Video](https://github.com/openwrt/video): Packages specifically
-  focused on display servers and clients (Xorg and Wayland).
-
-## Support Information
-
-For a list of supported devices see the [OpenWrt Hardware Database](https://openwrt.org/supported_devices)
-
-### Documentation
-
-* [Quick Start Guide](https://openwrt.org/docs/guide-quick-start/start)
-* [User Guide](https://openwrt.org/docs/guide-user/start)
-* [Developer Documentation](https://openwrt.org/docs/guide-developer/start)
-* [Technical Reference](https://openwrt.org/docs/techref/start)
-
-### Support Community
-
-* [Forum](https://forum.openwrt.org): For usage, projects, discussions and hardware advise.
-* [Support Chat](https://webchat.oftc.net/#openwrt): Channel `#openwrt` on **oftc.net**.
-
-### Developer Community
-
-* [Bug Reports](https://bugs.openwrt.org): Report bugs in OpenWrt
-* [Dev Mailing List](https://lists.openwrt.org/mailman/listinfo/openwrt-devel): Send patches
-* [Dev Chat](https://webchat.oftc.net/#openwrt-devel): Channel `#openwrt-devel` on **oftc.net**.
+[GitHub Sponsors](https://github.com/sponsors/JuliusBairaktaris) or
+[PayPal](https://paypal.me/JuliusBairaktaris).
 
 ## License
 
-OpenWrt is licensed under GPL-2.0
+GPL-2.0, see [LICENSE](LICENSE). The NSS components keep their upstream
+licenses.
