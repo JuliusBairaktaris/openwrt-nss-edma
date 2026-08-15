@@ -1,0 +1,499 @@
+#!/bin/sh
+# nss-wedge-watch - catch a per-port NSS egress stall and capture the state that
+# names it. Two field captures of this fault dead-ended because the only thing
+# read at wedge time was the per-port packet count, which says a port is dead but
+# not why. This samples the same counters continuously and, the moment a port
+# goes egress-dead with the link still up, dumps every readout that discriminates
+# between the remaining causes - before anyone reboots.
+#
+# Detection: carrier up AND the firmware's fw->wire counter frozen AND the host
+# still handing frames to the firmware, for $HOLD consecutive samples.
+#
+# The port set comes from the live glue table, never a hardcoded range.
+
+GLUE=/sys/kernel/debug/qca-ppe-nss
+DRV=/sys/kernel/debug/qca-nss-drv
+NET=/sys/class/net
+PPE_BASE=0x3a000000
+INTERVAL="${INTERVAL:-5}"
+HOLD="${HOLD:-4}"
+# Default into the directory sysupgrade is told to keep (lib/upgrade/keep.d),
+# so a capture survives the flash that carries the fix for it.
+OUTDIR="${OUTDIR:-/root/auto-recovery}"
+
+[ -r "$GLUE/status" ] || { echo "nss-wedge-watch: NSS plane not armed" >&2; exit 1; }
+
+bootid=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null | cut -c1-8)
+
+# field <line> <key>  -> value of key=value in an if_num line
+field() { echo "$1" | sed -n "s/.*$2=\([^ ]*\).*/\1/p"; }
+
+port_line() { grep "if_num $1:" "$GLUE/status" 2>/dev/null; }
+
+# firmware per-port egress / ingress (see nss-status: rx=fw->wire, tx=wire->fw)
+fw_egress()  { awk '/_rx_pkts/{print $3}' "$DRV/stats/edma/ports/$1/stats" 2>/dev/null; }
+fw_ingress() { awk '/_tx_pkts/{print $3}' "$DRV/stats/edma/ports/$1/stats" 2>/dev/null; }
+
+ports() { awk '/^if_num/ && !/netdev=-/ {sub(/:/,"",$2); print $2}' "$GLUE/status" 2>/dev/null; }
+
+reg() { devmem $(($1)) 32 2>/dev/null; }
+
+# Hardware truth for what left the wire: the MAC MIB TX frame counters, summed
+# over all three cast types because host-injected traffic on a stalled port is
+# mostly ARP/ND broadcast and would otherwise not show up at all. The MIB names
+# each of these once, so there is no ambiguity with the netdev counters ethtool
+# prints above them.
+mib_tx() {
+	ethtool -S "$1" 2>/dev/null |
+		awk '/^ *tx_(unicast|broadcast|multicast):/ {n += $2} END {print n+0}'
+}
+mib_rx() {
+	ethtool -S "$1" 2>/dev/null |
+		awk '/^ *rx_(unicast|broadcast|multicast):/ {n += $2} END {print n+0}'
+}
+
+# ---------------------------------------------------------------------------
+# Movement.
+#
+# Every other readout in this file is instantaneous, and on its own an
+# instantaneous readout cannot tell a wedged port from a busy one: a queue
+# sitting at its admission ceiling with buffer-manager flow control raised is
+# ALSO exactly what an ordinary congested port looks like (measured on the
+# bench by forcing a port to 100M under load). Whether a port is dead is a
+# question about movement, so sample the deciding counters twice and put the
+# deltas in the file. The verdict then belongs to the evidence rather than to
+# the header.
+SAMPLE="${SAMPLE:-3}"
+S1=/tmp/.nss-wedge-s1
+S2=/tmp/.nss-wedge-s2
+MV=/tmp/.nss-wedge-mv
+
+sample_ports() {
+	for p in $(ports); do
+		line=$(port_line "$p")
+		n=$(field "$line" netdev)
+		echo "$p $n $(fw_egress $p) $(fw_ingress $p) $(field "$line" tx_redirect_pkts) $(mib_tx "$n") $(mib_rx "$n")"
+	done
+}
+
+# Writes the movement table to $MV. Lines whose verdict is EGRESS-DEAD name the
+# ports that are offered traffic and put none of it on the wire.
+movement_scan() {
+	sample_ports > "$S1"
+	sleep "$SAMPLE"
+	sample_ports > "$S2"
+	{
+	echo "--- movement over ${SAMPLE}s (this is what separates wedged from congested) ---"
+	printf '  %-5s %-7s %-4s %10s %10s %10s %8s %8s  %s\n' \
+		port dev car "fw->wire" "wire->fw" "host->fw" mac_tx mac_rx verdict
+	while read -r p n a b c d e; do
+		l2=$(grep "^$p " "$S2")
+		a2=$(echo "$l2" | awk '{print $3}'); b2=$(echo "$l2" | awk '{print $4}')
+		c2=$(echo "$l2" | awk '{print $5}'); d2=$(echo "$l2" | awk '{print $6}')
+		e2=$(echo "$l2" | awk '{print $7}')
+		da=$(( ${a2:-0} - ${a:-0} )); db=$(( ${b2:-0} - ${b:-0} ))
+		dc=$(( ${c2:-0} - ${c:-0} )); dd=$(( ${d2:-0} - ${d:-0} ))
+		de=$(( ${e2:-0} - ${e:-0} ))
+		car=$(cat "$NET/$n/carrier" 2>/dev/null)
+		# Delivered is the best of the two independent "it left" counters:
+		# the firmware's own egress accounting and the MAC MIB. Compare it
+		# against what was offered rather than asking merely whether it
+		# moved - a port throttled to a trickle (measured: 1 frame put on
+		# the wire out of 37 offered, with the port shaper armed) is dead
+		# to its client, and a bare "did anything move" test calls that
+		# healthy.
+		del=$da; [ $dd -gt $del ] && del=$dd
+		if [ "$car" != 1 ]; then
+			v="link down"
+		elif [ $dc -le 0 ] && [ $db -le 0 ] && [ $de -le 0 ] && [ $del -le 0 ]; then
+			v="idle - nothing offered, inconclusive"
+		elif [ $dc -gt 0 ] && [ $del -le 0 ]; then
+			v="EGRESS-DEAD $dc offered, nothing reached the wire"
+		elif [ $dc -gt 0 ] && [ $(( del * 8 )) -lt $dc ]; then
+			v="EGRESS-GATED only $del of $dc offered reached the wire"
+		elif [ $del -gt 0 ]; then
+			v="transmitting"
+		else
+			v="receiving only - no egress offered, inconclusive"
+		fi
+		printf '  %-5s %-7s %-4s %10s %10s %10s %8s %8s  %s\n' \
+			"$p" "$n" "${car:-?}" "$da" "$db" "$dc" "$dd" "$de" "$v"
+	done < "$S1"
+	echo "  Deltas, not totals. mac_tx/mac_rx are the PPE MAC MIB frame counters"
+	echo "  (unicast+broadcast+multicast), i.e. hardware truth for what crossed"
+	echo "  the wire. The verdict weighs what reached the wire against what was"
+	echo "  offered: a port offered traffic that delivers none of it is wedged,"
+	echo "  and one that delivers a trickle is gated. A port that is transmitting"
+	echo "  is NOT wedged no matter how full its queue is - a queue pinned at the"
+	echo "  admission ceiling with buffer-manager flow control raised is also"
+	echo "  exactly what ordinary congestion looks like, so nothing below this"
+	echo "  table can be read as a wedge unless this table says so first."
+	} > "$MV"
+}
+
+# ports that measured egress-dead or throttled to a trickle in the last scan
+dead_ports() { awk '/EGRESS-DEAD|EGRESS-GATED/{print $1}' "$MV" 2>/dev/null; }
+
+capture() {
+	pn="$1"; nd="$2"; why="${3:-measured egress-dead}"
+	mkdir -p "$OUTDIR"
+	seq=0
+	while [ -e "$OUTDIR/wedge-$bootid-$seq.txt" ]; do seq=$((seq+1)); done
+	out="$OUTDIR/wedge-$bootid-$seq.txt"
+	{
+	echo "=== nss-wedge-watch: port $pn ($nd) - $why ==="
+	date; uptime; echo "boot_id=$(cat /proc/sys/kernel/random/boot_id)"
+	echo
+	[ -s "$MV" ] && { cat "$MV"; echo; }
+	# What CHANGED beats what IS. This fault survives a link cycle and a full
+	# data-plane re-attach and yields only to a reboot, so the holder is a
+	# register a reboot re-initialises and nothing else rewrites. Diffing
+	# against the baseline nss-up took while the box was healthy names such a
+	# register without anyone having had to suspect it in advance - which is
+	# the whole difficulty, because two owners share this register file.
+	echo "--- PPE configuration vs the baseline taken when this box came up ---"
+	nss-ppe-diff 2>&1
+	echo
+	echo "--- glue ---"; cat "$GLUE/status"
+	echo
+	# Every per-interface control message the host sends the firmware -
+	# open, close, link state - goes out synchronously and is abandoned
+	# after three seconds. A close that is abandoned was still delivered,
+	# so the firmware acts on it while the host records a failure, and the
+	# host's idea of that interface goes stale in the one direction that
+	# stops a port transmitting. These counters say whether that has
+	# happened on this box; both zero excludes the whole mechanism.
+	echo "--- firmware control-message health ---"
+	for k in phif_timeouts phif_stale_responses; do
+		echo "  $k = $(cat "/sys/module/qca_nss_drv/parameters/$k" 2>/dev/null)"
+	done
+	echo
+	# Each port's MAC clock branch, judged on its own rather than against a
+	# baseline: CLK_OFF asserted on a port whose carrier is up is wrong on its
+	# face, so this still answers on a box whose baseline was never taken.
+	# The driver enables these once in probe and nothing re-enables one, so a
+	# gated branch is repairable only by a reboot - measured on an AX3600,
+	# clearing one stops the port transmitting with its carrier up, its MAC TX
+	# counter at exactly zero and an admin link cycle unable to recover it.
+	echo "--- per-port MAC clock branches (bit0 enable, bit31 CLK_OFF) ---"
+	gated_clk=""
+	for p in $(ports); do
+		n=$(field "$(port_line $p)" netdev)
+		tx=$(reg $((0x01800000 + 0x68244 + (p - 1) * 8)))
+		rx=$(reg $((0x01800000 + 0x68240 + (p - 1) * 8)))
+		car=$(cat "$NET/$n/carrier" 2>/dev/null)
+		echo "  port $p ($n) carrier=${car:-?} tx=$tx rx=$rx"
+		[ "$car" = 1 ] || continue
+		for c in "tx $tx" "rx $rx"; do
+			w=${c#* }; d=${c%% *}
+			[ -n "$w" ] || continue
+			v=$(printf "%d" "$w")
+			# CLK_OFF is the whole answer: set means the branch is not
+			# running, whatever the enable bit says. The two cases point
+			# at different culprits and both are fatal to the port, so
+			# judge on bit 31 alone and let the enable bit name which.
+			# Testing "off AND disabled" would miss the more likely one:
+			# clk_set_rate() on a link event reprograms the parent RCG,
+			# and an RCG whose newly selected parent is not running fails
+			# its update and leaves the branch enabled but halted.
+			[ $(( (v >> 31) & 1 )) = 1 ] || continue
+			if [ $(( v & 1 )) = 0 ]; then
+				gated_clk="$gated_clk port $p $d (disabled);"
+			else
+				gated_clk="$gated_clk port $p $d (enabled but halted - parent/RCG);"
+			fi
+		done
+	done
+	if [ -n "$gated_clk" ]; then
+		echo "  VERDICT: a carrier-up port has its MAC clock gated ->$gated_clk"
+		echo "  Nothing in this stack re-enables one of these after probe, so this"
+		echo "  port cannot transmit again until the box is rebooted. Whoever"
+		echo "  cleared it is the fault."
+	else
+		echo "  VERDICT: every carrier-up port's MAC clock is running."
+	fi
+	echo
+	echo "--- nss-status ---"; nss-status 2>&1; nss-status -l2 2>&1
+	echo
+	# Whether the firmware ever saw the frames, and whether it dropped them on
+	# egress, is the single fact that splits a firmware-side stall from a fabric
+	# one. rx_queue[*]_drops are the egress drops and nothing was reading them.
+	echo "--- firmware EDMA: per-port stats + egress queue drops ---"
+	for p in $(ports); do
+		echo "## port $p"; cat "$DRV/stats/edma/ports/$p/stats" 2>/dev/null
+		cat "$DRV/stats/edma/ports/$p/ring_map" 2>/dev/null
+	done
+	echo "--- firmware EDMA: error stats ---"; cat "$DRV/stats/edma/err_stats" 2>/dev/null
+	echo "--- firmware EDMA: ring stats (tx / txcmpl) ---"
+	for r in "$DRV"/stats/edma/rings/tx/* "$DRV"/stats/edma/rings/txcmpl/*; do
+		[ -e "$r" ] && cat "$r" 2>/dev/null
+	done
+	echo
+	echo "--- firmware log ring ---"; cat "$DRV/logs/core0" 2>/dev/null
+	echo "--- firmware pbuf pools (n2h) ---"; cat "$DRV/stats/n2h" 2>/dev/null
+	echo
+	echo "--- PPE drop codes / punt reasons, per port ---"
+	for p in $(ports); do
+		echo "## port $p drop"; awk '$2=="=" && $3+0>0' "$DRV/stats/ppe/code/drop/$p" 2>/dev/null
+	done
+	cat "$DRV/stats/ppe/code/cpu/exception" 2>/dev/null
+	cat "$DRV/stats/ppe/code/cpu/non-exception" 2>/dev/null
+	echo
+	# The host writes these and then never touches them again, so if one is wrong
+	# at wedge time the firmware changed it underneath us - that is the whole
+	# dual-ownership question, and it has never been read on a wedged box.
+	echo "--- PPE per-port egress gates (host-owned, read back) ---"
+	echo "LPI_ENABLE        = $(reg $((PPE_BASE + 0x400)))   (0 = PPE-side 802.3az off, the healthy value)"
+	for p in $(ports); do
+		echo "port $p: PORT_BRIDGE_CTRL=$(reg $((PPE_BASE + 0x060300 + p * 4))) \
+CST_STATE=$(reg $((PPE_BASE + 0x060100 + p * 4))) \
+MRU_MTU_CTRL=$(reg $((PPE_BASE + 0x063000 + p * 0x10)))"
+	done
+	echo
+	# A stalled port that counts nothing is holding, not dropping, and the two
+	# things that hold a port are buffer-manager flow control and the queue
+	# admission ceiling. Neither counts a packet, so only these registers show
+	# it. PORT_FC_STATUS is read-only hardware state; a non-zero fc field on a
+	# port that cannot transmit is the answer.
+	# The BM tables are indexed by BM port, NOT by PPE port: BM 0-7 belong to
+	# EDMA, BM 8-13 are physical ports 1-6, BM 14 is EIP (upstream's own
+	# comment above ipq9574_ppe_bm_port_config). Reading them at the raw port
+	# number - which this did until it was checked against that map - reports
+	# EDMA's entries under a physical port's name, so every earlier field
+	# reading of "fc" here described the wrong port and meant nothing.
+	echo "--- BM per-port flow control (bm = port + 7) ---"
+	for p in $(ports); do
+		bm=$((p + 7))
+		v=$(reg $((PPE_BASE + 0x600140 + bm * 4)))
+		echo "port $p (bm $bm): PORT_FC_STATUS=$v fc=$(( (v >> 16) & 3 ))  \
+cfg_W0=$(reg $((PPE_BASE + 0x601000 + bm * 0x10))) \
+cfg_W1=$(reg $((PPE_BASE + 0x601000 + bm * 0x10 + 4)))  \
+FC_MODE=$(reg $((PPE_BASE + 0x600100 + bm * 4)))"
+	done
+	echo
+	# The per-queue enqueue and dequeue enables. Qualcomm's own PPE driver
+	# clears both of these for every queue when it configures the QM
+	# ("Enable enqueue" / "Enable dequeue", ppe_config.c); this stack never
+	# writes either register, so whatever holds them is never put back. A
+	# queue with DEQ_DISABLE set is never serviced: it fills, its port's MAC
+	# transmits nothing, and no counter anywhere records a loss - which is
+	# this fault exactly. Measured 0 on all 300 queues of a healthy box, so
+	# the reset default is fine and a 1 here names a writer, not a default.
+	# Three registers, disambiguated against qca-ssdk's own headers:
+	#   DEQ_DIS_TBL    qos 0x30000 + 0x400000 = 0x430000
+	#   OQ_ENQ_OPR_TBL qm  0x5c000 + 0x800000 = 0x85c000
+	#   OQ_DEQ_OPR_TBL qm  0x64000 + 0x800000 = 0x864000
+	# ssdk's adpt_hppe_queue_flush() disables the first two as a pair and
+	# leaves re-enabling to its caller, with two error returns that exit
+	# with the queue still disabled - so a stuck bit here is a flush that
+	# never finished.
+	echo "--- per-queue enqueue/dequeue enables (bit0 set = DISABLED) ---"
+	for p in $(ports); do
+		qb=$(( ($(reg $((PPE_BASE + 0x810000 + p * 0x10))) >> 4) & 0xff ))
+		dd=""; de=""; q=$qb
+		while [ $q -lt $((qb + 16)) ]; do
+			[ $(( $(reg $((PPE_BASE + 0x430000 + q * 0x10))) & 1 )) = 1 ] && dd="$dd $q"
+			[ $(( $(reg $((PPE_BASE + 0x85c000 + q * 0x10))) & 1 )) = 1 ] && de="$de $q"
+			q=$((q + 1))
+		done
+		do=""; q=$qb
+		while [ $q -lt $((qb + 16)) ]; do
+			[ $(( $(reg $((PPE_BASE + 0x864000 + q * 0x10))) & 1 )) = 1 ] && do="$do $q"
+			q=$((q + 1))
+		done
+		echo "port $p queues $qb..$((qb + 15)): DEQ_DIS=[${dd:- none}] ENQ_DIS=[${de:- none}] OQ_DEQ_OPR=[${do:- none}]"
+	done
+	echo
+	# Queue occupancy is instantaneous and reads 0 on a healthy box; a value
+	# pinned at the admission ceiling is a queue that is never drained. The
+	# port's queue base is read back out of the QM unicast map rather than
+	# assumed, so this works on any IPQ807x port layout.
+	#
+	# Then the layer that decides the dequeue, which is where this fault lives.
+	# Three shapers can stop a queue draining - the queue's own L0 shaper, the L1
+	# node it feeds, and the port shaper - and so can a zero DRR weight on that L1
+	# node. Reproduced on an AX3600 by arming PSCH_SHP_CFG_TBL for one port with
+	# cir=1: the queue pinned at 252, the buffer manager raised flow control, the
+	# firmware's egress counter and the MAC MIB TX both froze, and an "ip link
+	# down/up" did not recover it - the field capture of this wedge exactly. A
+	# negative shaper credit outlives clearing SHAPER_ENABLE (measured: the port
+	# stays dead until the credit and sign are reset too), so all three are read.
+	#
+	# We program no PPE shaper anywhere and every one of these reads zero on a
+	# healthy armed box, so a non-zero value here is somebody else's write. The one
+	# known writer is the vendor's own nss_qdisc PPE mode (nss_ppe.c
+	# nss_ppe_port_shaper_set(), reached by a root nsstbl/nsshtb on a physical port
+	# when accel_mode is left at its iproute2 default of PPE): it arms the shaper
+	# with cir = rate/1000*8 - zero for "no rate given", which is degenerate, not
+	# unlimited - and its reset path zeroes only the config, never the tokens it
+	# pre-loaded, which is why the credit stays in debt. That object is compiled out
+	# of this build (NSS_QDISC_PPE_ENABLE=n), so the cir value discriminates: 0 or a
+	# multiple of 8 is consistent with it, anything else is not.
+	#
+	# The L1 tables are indexed by the L0 SP node id, NOT by the port: this dump
+	# used to read L1_FLOW_MAP(port) and got unrelated entries, because index 1..6
+	# are unprogrammed and the ports live at 36,37,40,41,... The id comes out of the
+	# queue's own L0_FLOW_MAP sp_id field, so no per-board table is needed.
+	# Offsets are relative to TRAFFIC_MANAGER_BASE_ADDR 0x400000, from qca-ssdk
+	# NHSS.QSDK.14.0.r8 hppe_shaper_reg.h: L0 shaper cfg 0x1c000 credit 0x1a000,
+	# L1 shaper cfg 0x5e000 credit 0x5c000, port shaper sign 0x70000 credit 0x72000
+	# cfg 0x74000, 0x10 per entry.
+	echo "--- QM per-queue occupancy + egress scheduler/shapers, per port ---"
+	echo "   global shaper slots: L0=$(reg $((PPE_BASE + 0x400010))) \
+L1=$(reg $((PPE_BASE + 0x400014))) PORT=$(reg $((PPE_BASE + 0x400018)))"
+	gated=""
+	for p in $(ports); do
+		qb=$(( ($(reg $((PPE_BASE + 0x810000 + p * 0x10))) >> 4) & 0xff ))
+		echo "## port $p (queues $qb..$((qb + 15)))"
+		pw0=$(reg $((PPE_BASE + 0x474000 + p * 0x10)))
+		pw1=$(reg $((PPE_BASE + 0x474000 + p * 0x10 + 4)))
+		pen=$(( (${pw1:-0} >> 4) & 1 ))
+		pneg=$(( $(reg $((PPE_BASE + 0x470000 + p * 0x10))) & 1 ))
+		echo "   PORT shaper en=$pen neg=$pneg cir=$(( ${pw0:-0} & 0x3ffff )) \
+cfg=$pw0/$pw1 credit=$(reg $((PPE_BASE + 0x472000 + p * 0x10)))"
+		[ "$pen" = 1 ] || [ "$pneg" = 1 ] &&
+			gated="$gated port $p (port shaper en=$pen neg=$pneg);"
+		q=$qb
+		while [ $q -lt $((qb + 16)) ]; do
+			# The L0/L1 shaper enable is C_SHAPER_ENABLE at bit 68 of
+			# the entry, i.e. word 2 bit 4 - word 1 there is EIR, and
+			# reading it would report a rate bit as an enable. Their
+			# negative-credit flag is bit 30 of the credit word itself
+			# (the port shaper alone has a separate sign table).
+			#
+			# These are multi-word table entries behind a read shadow:
+			# reading word 0 latches the entry, and only then do the
+			# later words belong to it. Jumping straight to word 2
+			# returns whichever entry was latched last, which reads as
+			# every port having an armed shaper.
+			reg $((PPE_BASE + 0x41c000 + q * 0x10)) >/dev/null
+			reg $((PPE_BASE + 0x41c000 + q * 0x10 + 4)) >/dev/null
+			l0e=$(( ($(reg $((PPE_BASE + 0x41c000 + q * 0x10 + 8))) >> 4) & 1 ))
+			l0c=$(reg $((PPE_BASE + 0x41a000 + q * 0x10)))
+			# empty=1 with occ>0 means the admission counter leaked
+			# rather than the queue holding anything - a different
+			# fault from a queue that is never dequeued, and the two
+			# are indistinguishable from occupancy alone.
+			echo "   q$q occ=$(( $(reg $((PPE_BASE + 0x84e000 + q * 0x10))) & 4095 )) \
+empty=$(( $(reg $((PPE_BASE + 0x86c000 + q * 0x10))) & 1 )) \
+drop_state=$(reg $((PPE_BASE + 0x856000 + q * 0x10))) \
+AC_W0=$(reg $((PPE_BASE + 0x848000 + q * 0x10))) \
+L0_FLOW=$(reg $((PPE_BASE + 0x402000 + q * 0x10))) \
+L0_PORT=$(reg $((PPE_BASE + 0x408000 + q * 0x10))) \
+L0_shp_en=$l0e credit=$l0c neg=$(( (${l0c:-0} >> 30) & 1 ))"
+			[ "$l0e" = 1 ] && gated="$gated port $p (q$q L0 shaper);"
+			q=$((q + 1))
+		done
+		# The two L1 nodes this port's queues feed, addressed by the SP id the
+		# port's first queue reports rather than by the port number.
+		sp=$(( $(reg $((PPE_BASE + 0x402000 + qb * 0x10))) & 0x3f ))
+		for s in $sp $((sp + 1)); do
+			lf=$(reg $((PPE_BASE + 0x440000 + s * 0x10)))
+			reg $((PPE_BASE + 0x45e000 + s * 0x10)) >/dev/null
+			reg $((PPE_BASE + 0x45e000 + s * 0x10 + 4)) >/dev/null
+			len=$(( ($(reg $((PPE_BASE + 0x45e000 + s * 0x10 + 8))) >> 4) & 1 ))
+			lc=$(reg $((PPE_BASE + 0x45c000 + s * 0x10)))
+			cdrr=$(( (${lf:-0} >> 10) & 0x3ff ))
+			echo "   L1 sp$s port=$(( $(reg $((PPE_BASE + 0x446000 + s * 0x10))) & 0xf )) \
+flow=$lf sp_id=$(( ${lf:-0} & 0xf )) c_drr=$cdrr e_drr=$(( (${lf:-0} >> 20) & 0x3ff )) \
+shp_en=$len credit=$lc neg=$(( (${lc:-0} >> 30) & 1 ))"
+			[ "$len" = 1 ] && gated="$gated port $p (L1 sp$s shaper);"
+			[ "$cdrr" = 0 ] && gated="$gated port $p (L1 sp$s c_drr=0);"
+		done
+	done
+	if [ -n "$gated" ]; then
+		echo "   VERDICT: the egress scheduler is gated ->$gated"
+		echo "   The port scheduler will not dequeue those ports, and a link cycle"
+		echo "   does not clear it. Nothing in this build writes a PPE shaper; the"
+		echo "   vendor nss_qdisc PPE path that does is compiled out here, and it"
+		echo "   can only ever write cir=0 or a multiple of 8 (rate/1000*8)."
+	else
+		echo "   VERDICT: no shaper armed, no zero DRR weight - the egress"
+		echo "   scheduler is not what is holding this port."
+	fi
+	echo
+	echo "--- per-port MAC MIB (hardware truth for what left the wire) ---"
+	for p in $(ports); do
+		n=$(field "$(port_line $p)" netdev)
+		[ -n "$n" ] && { echo "## $n"; ethtool -S "$n" 2>/dev/null; }
+	done
+	echo
+	echo "--- qdiscs ---"; tc -s qdisc show 2>/dev/null
+	echo "--- links ---"; ip -br link
+	echo "--- dmesg ---"; dmesg
+	echo "--- logread ---"; logread | tail -400
+	} > "$out" 2>&1
+	logger -t nss-wedge-watch "port $pn ($nd) egress dead - state captured in $out"
+	echo "$out"
+}
+
+# One-shot: capture right now, for someone sitting in front of a wedged box.
+# This is the mode to hand a reporter - it takes the same dump the watcher takes,
+# without needing the watcher to have been running beforehand.
+if [ "${1:-}" = "-1" ] || [ "${1:-}" = "--now" ]; then
+	movement_scan
+	pn="${2:-}"
+	why="measured egress-dead"
+	if [ -n "$pn" ]; then
+		dead_ports | grep -qx "$pn" ||
+			why="port named on the command line, NOT measured egress-dead"
+	else
+		# Pick a port that actually measured dead. If none did, still take
+		# the dump - a reference capture of a healthy box is useful - but
+		# say so, because a capture that claims a wedge it never observed
+		# is worse than no capture at all.
+		pn=$(dead_ports | head -1)
+		if [ -z "$pn" ]; then
+			for p in $(ports); do
+				n=$(field "$(port_line $p)" netdev)
+				[ "$(cat "$NET/$n/carrier" 2>/dev/null)" = 1 ] &&
+					{ pn="$p"; break; }
+			done
+			why="REFERENCE CAPTURE - no port measured egress-dead"
+		fi
+	fi
+	[ -n "$pn" ] || { echo "nss-wedge-watch: no link-up port" >&2; exit 1; }
+	out=$(capture "$pn" "$(field "$(port_line $pn)" netdev)" "$why")
+	echo "$out"
+	awk 'NR<=3' "$MV" >&2
+	exit 0
+fi
+
+logger -t nss-wedge-watch "armed (interval ${INTERVAL}s, hold ${HOLD})"
+
+# per-port previous sample and frozen-run length, kept in shell vars addressed by
+# port number (busybox ash has no arrays).
+while :; do
+	for pn in $(ports); do
+		line=$(port_line "$pn")
+		nd=$(field "$line" netdev)
+		[ -n "$nd" ] && [ "$nd" != "-" ] || continue
+		[ "$(cat "$NET/$nd/carrier" 2>/dev/null)" = 1 ] || continue
+
+		eg=$(fw_egress "$pn"); htx=$(field "$line" tx_redirect_pkts)
+		[ -n "$eg" ] && [ -n "$htx" ] || continue
+
+		peg=""; phtx=""; run=0
+		eval "peg=\${eg_$pn:-}"
+		eval "phtx=\${htx_$pn:-}"
+		eval "run=\${run_$pn:-0}"
+		if [ -n "$peg" ] && [ -n "$phtx" ]; then
+			# egress frozen while the host is still feeding the firmware
+			if [ "$eg" = "$peg" ] && [ "$htx" -gt "$phtx" ]; then
+				run=$((run + 1))
+			else
+				run=0
+			fi
+		fi
+		eval "eg_$pn=\$eg" ; eval "htx_$pn=\$htx" ; eval "run_$pn=\$run"
+
+		if [ "$run" -ge "$HOLD" ]; then
+			movement_scan
+			capture "$pn" "$nd" \
+				"egress frozen for $((HOLD * INTERVAL))s while the host kept feeding it" \
+				>/dev/null
+			eval "run_$pn=0"
+		fi
+	done
+	sleep "$INTERVAL"
+done
