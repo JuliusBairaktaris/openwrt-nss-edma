@@ -1251,6 +1251,60 @@ bool qca_edma_netdev_is_conduit(const struct net_device *netdev)
 }
 EXPORT_SYMBOL_GPL(qca_edma_netdev_is_conduit);
 
+/*
+ * Restore the EDMA registers the NSS firmware reprograms when it takes
+ * over CPU-port delivery: the QID2RID table (CPU-port queues back to the
+ * host rx ring), the firmware-range ring enables, and the shared
+ * ring-map registers. This returns the block to the host-only baseline
+ * programmed by edma_hw_init(), so host RX resumes as soon as the
+ * firmware data plane detaches and a later firmware boot starts from
+ * the same state as a cold boot. The caller must guarantee the
+ * firmware is stopped (qca-ppe-nss calls this with the NSS cores held
+ * in reset), because the firmware-owned ring range is written.
+ */
+int qca_edma_fw_baseline_restore(struct net_device *conduit)
+{
+	const struct edma_soc_data *soc;
+	struct edma_priv *priv;
+	int i;
+
+	if (!qca_edma_netdev_is_conduit(conduit))
+		return -EINVAL;
+
+	priv = netdev_priv(conduit);
+	soc = priv->soc;
+
+	edma_rings_disable(priv);
+
+	/* Queue 0 to the host rx ring, every other entry parked at 0 */
+	regmap_write(priv->regmap, EDMA_QID2RID_TABLE_MEM(0),
+		     soc->rxdesc_ring & 0xF);
+	for (i = 1; i < EDMA_QID2RID_DEPTH; i++)
+		regmap_write(priv->regmap, EDMA_QID2RID_TABLE_MEM(i), 0);
+
+	regmap_write(priv->regmap, EDMA_REG_RXDESC2FILL_MAP_0, 0);
+	regmap_write(priv->regmap, EDMA_REG_RXDESC2FILL_MAP_1,
+		     (soc->rxfill_ring & 0x7)
+			<< ((soc->rxdesc_ring % 10) * 3));
+
+	if (soc->txcmpl_ring != soc->txdesc_ring) {
+		int map_idx = soc->txdesc_ring / 10;
+		int bit_pos = (soc->txdesc_ring % 10) * 3;
+
+		for (i = 0; i < 3; i++)
+			regmap_write(priv->regmap,
+				     EDMA_REG_TXDESC2CMPL_MAP(i), 0);
+		regmap_set_bits(priv->regmap,
+				EDMA_REG_TXDESC2CMPL_MAP(map_idx),
+				(soc->txcmpl_ring & 0x7) << bit_pos);
+	}
+
+	edma_rings_enable(priv);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qca_edma_fw_baseline_restore);
+
 int qca_edma_port_dp_claim(struct net_device *conduit, unsigned int port,
 			   const struct qca_edma_dp_owner *owner, void *ctx)
 {
