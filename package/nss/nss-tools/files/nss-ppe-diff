@@ -1,0 +1,228 @@
+#!/bin/sh
+# nss-ppe-diff - snapshot the PPE's configuration registers, and diff a live
+# read against that snapshot.
+#
+# Why this exists. The per-port egress wedge survives a link cycle and a full
+# NSS data-plane detach and re-attach, and is cleared only by a reboot. That
+# narrows the holder to state which a reboot re-initialises and nothing else
+# rewrites - which in this SoC means a PPE register written once at probe. Every
+# readout we had answers "what is this register now", and none of them answers
+# the question that actually names a fault of that shape: "which register is no
+# longer what we wrote". Two host<->firmware owners share this register file, so
+# that question has to be answerable without knowing in advance which register
+# to suspect.
+#
+# So: save a baseline once the plane is armed and healthy, and diff at wedge
+# time. Any line that changed names the writer.
+#
+# usage:
+#   nss-ppe-diff save [file]   take a baseline (default /root/auto-recovery/ppe-baseline.txt)
+#   nss-ppe-diff [file]        diff the live registers against a baseline
+#   nss-ppe-diff dump          print the live registers, diff nothing
+#
+# Configuration registers only. Counters, queue occupancy, flow-control status
+# and the FDB are deliberately excluded: they change constantly by design and
+# would bury the one line that matters. nss-wedge-watch reads those.
+
+GLUE=/sys/kernel/debug/qca-ppe-nss
+BASE=0x3a000000
+# The clock controller: the per-port MAC clock branches live here, not in the
+# PPE, and they are as capable of stopping a port as any PPE gate.
+GCC=0x01800000
+BASELINE_DEFAULT=/root/auto-recovery/ppe-baseline.txt
+
+# Block bases are fixed by the SoC, not by the board: PPE at 0x3a000000 with
+# MAC_CSR 0x1000, XGMAC_CSR 0x3000, PRX 0xb000, IVLAN 0xf000, PTX 0x20000,
+# L2 0x60000, TM 0x400000, BM 0x600000, QM 0x800000. Everything board-shaped -
+# which ports exist, which are armed, each port's queue base and scheduler node
+# - is read from live state below. Never add a port range here.
+r() { devmem $(($1)) 32 2>/dev/null; }
+p_() { echo "$1 $(r $2)"; }
+
+ports() {
+	awk '/^if_num/ && !/netdev=-/ {sub(/:/,"",$2); print $2}' "$GLUE/status" 2>/dev/null
+}
+
+dump() {
+	# --- global ---
+	p_ LPI_ENABLE            $((BASE + 0x400))
+	p_ L2_GLOBAL_CONF        $((BASE + 0x60038))
+	p_ AGE_TIMER             $((BASE + 0x60034))
+	p_ EG_BRIDGE_CONFIG      $((BASE + 0x26000))
+	p_ PRX_TDM_CTRL          $((BASE + 0xb000))
+	p_ TM_TDM_DEPTH          $((BASE + 0x400000))
+	p_ SHP_SLOT_L0           $((BASE + 0x400010))
+	p_ SHP_SLOT_L1           $((BASE + 0x400014))
+	p_ SHP_SLOT_PORT         $((BASE + 0x400018))
+
+	# --- per port: everything that gates whether the port can transmit ---
+	# The MAC index is port-1 for the GMACs; the XGMAC window is per port and
+	# is read for every port because which port is XGMAC-backed is a board
+	# property we must not encode.
+	for p in $(ports); do
+		g=$((p - 1))
+		p_ "PORT${p}_BRIDGE_CTRL"  $((BASE + 0x60300 + p * 4))
+		p_ "PORT${p}_CST_STATE"    $((BASE + 0x60100 + p * 4))
+		p_ "PORT${p}_MRU_MTU_W0"   $((BASE + 0x63000 + p * 0x10))
+		p_ "PORT${p}_MRU_MTU_W1"   $((BASE + 0x63000 + p * 0x10 + 4))
+		p_ "PORT${p}_MC_MTU_CTRL"  $((BASE + 0x60a00 + p * 4))
+		p_ "PORT${p}_EG_VLAN"      $((BASE + 0x20420 + p * 4))
+		p_ "PORT${p}_DEF_VID"      $((BASE + 0xf010 + p * 4))
+		p_ "PORT${p}_VLAN_CFG"     $((BASE + 0xf050 + p * 4))
+		p_ "GMAC${g}_ENABLE"       $((BASE + 0x1000 + g * 0x200))
+		p_ "GMAC${g}_SPEED"        $((BASE + 0x1000 + g * 0x200 + 0x4))
+		p_ "GMAC${g}_CTRL2"        $((BASE + 0x1000 + g * 0x200 + 0x18))
+		p_ "GMAC${g}_DBG_CTRL"     $((BASE + 0x1000 + g * 0x200 + 0x1c))
+		p_ "GMAC${g}_JUMBO"        $((BASE + 0x1000 + g * 0x200 + 0x30))
+		p_ "GMAC${g}_MIB_CTRL"     $((BASE + 0x1000 + g * 0x200 + 0x34))
+		p_ "XGMAC${p}_TX_CONF"     $((BASE + 0x3000 + p * 0x4000))
+		p_ "XGMAC${p}_RX_CONF"     $((BASE + 0x3000 + p * 0x4000 + 0x4))
+		p_ "XGMAC${p}_PKT_FILTER"  $((BASE + 0x3000 + p * 0x4000 + 0x8))
+		p_ "XGMAC${p}_TX_FLOW"     $((BASE + 0x3000 + p * 0x4000 + 0x70))
+		p_ "XGMAC${p}_RX_FLOW"     $((BASE + 0x3000 + p * 0x4000 + 0x90))
+		p_ "BM${p}_FC_W0"          $((BASE + 0x601000 + p * 0x10))
+		p_ "BM${p}_FC_W1"          $((BASE + 0x601000 + p * 0x10 + 4))
+		p_ "BM${p}_FC_MODE"        $((BASE + 0x600100 + p * 4))
+		p_ "BM${p}_GROUP"          $((BASE + 0x600180 + p * 4))
+		# port egress shaper: cfg is two words, credit and sign their own
+		# tables. Read word 0 first - these entries are behind a read
+		# shadow and word 1 belongs to whatever was latched last.
+		p_ "PSHP${p}_CFG_W0"       $((BASE + 0x474000 + p * 0x10))
+		p_ "PSHP${p}_CFG_W1"       $((BASE + 0x474000 + p * 0x10 + 4))
+		p_ "PSHP${p}_CREDIT"       $((BASE + 0x472000 + p * 0x10))
+		p_ "PSHP${p}_SIGN"         $((BASE + 0x470000 + p * 0x10))
+
+		# The port's own MAC clock branches, in the clock controller rather
+		# than the PPE. These matter more than their obscurity suggests:
+		# the driver enables every one of them exactly once, in probe, with
+		# clk_bulk_prepare_enable(), and nothing in the tree ever re-enables
+		# a branch afterwards. The common clock framework's enable_count
+		# stays at 1 for the life of the boot, so even an explicit
+		# clk_prepare_enable() from elsewhere would be a refcount bump with
+		# no register write - which makes a gated branch reboot-only state
+		# by construction, the exact shape of this fault. Measured on an
+		# AX3600: clearing the TX branch stops the port transmitting with
+		# its carrier up, its MAC TX counter at exactly zero, every
+		# host-owned gate healthy, and an admin link down/up unable to
+		# repair it; restoring the bit recovers it within one sample.
+		# Bit 0 is the enable, bit 31 reads back CLK_OFF.
+		p_ "GCC_PORT${p}_TX_CLK"   $((GCC + 0x68244 + (p - 1) * 8))
+		p_ "GCC_PORT${p}_RX_CLK"   $((GCC + 0x68240 + (p - 1) * 8))
+
+		# --- the port's own queues and scheduler nodes ---
+		# Queue base and L1 node id come out of the live QM/L0 maps, so
+		# this works on any IPQ807x port layout.
+		qb=$(( ($(r $((BASE + 0x810000 + p * 0x10))) >> 4) & 0xff ))
+		echo "PORT${p}_QBASE $qb"
+		q=$qb
+		while [ $q -lt $((qb + 16)) ]; do
+			p_ "Q${q}_L0_FLOW"   $((BASE + 0x402000 + q * 0x10))
+			p_ "Q${q}_L0_PORT"   $((BASE + 0x408000 + q * 0x10))
+			p_ "Q${q}_AC_W0"     $((BASE + 0x848000 + q * 0x10))
+			p_ "Q${q}_AC_W3"     $((BASE + 0x848000 + q * 0x10 + 0xc))
+			p_ "Q${q}_SHP_W0"    $((BASE + 0x41c000 + q * 0x10))
+			r $((BASE + 0x41c000 + q * 0x10 + 4)) >/dev/null
+			p_ "Q${q}_SHP_W2"    $((BASE + 0x41c000 + q * 0x10 + 8))
+			p_ "Q${q}_SHP_CRED"  $((BASE + 0x41a000 + q * 0x10))
+			q=$((q + 1))
+		done
+		sp=$(( $(r $((BASE + 0x402000 + qb * 0x10))) & 0x3f ))
+		for s in $sp $((sp + 1)); do
+			p_ "L1_${s}_FLOW"    $((BASE + 0x440000 + s * 0x10))
+			p_ "L1_${s}_PORT"    $((BASE + 0x446000 + s * 0x10))
+			p_ "L1_${s}_SHP_W0"  $((BASE + 0x45e000 + s * 0x10))
+			r $((BASE + 0x45e000 + s * 0x10 + 4)) >/dev/null
+			p_ "L1_${s}_SHP_W2"  $((BASE + 0x45e000 + s * 0x10 + 8))
+			p_ "L1_${s}_SHP_CRED" $((BASE + 0x45c000 + s * 0x10))
+		done
+	done
+
+	# --- VSI table: the firmware assigns these, so a lost membership or a
+	# cleared forwarding mask shows up here and nowhere else ---
+	v=0
+	while [ $v -lt 32 ]; do
+		p_ "VSI${v}_W0" $((BASE + 0x61800 + v * 0x10))
+		p_ "VSI${v}_W1" $((BASE + 0x61800 + v * 0x10 + 4))
+		p_ "EG_VSI_TAG${v}" $((BASE + 0x20000 + v * 4))
+		v=$((v + 1))
+	done
+
+	# --- the port scheduler's time-division tables: shared, written once ---
+	i=0
+	while [ $i -lt 128 ]; do
+		p_ "PSCH_TDM${i}" $((BASE + 0x47a000 + i * 0x10))
+		i=$((i + 1))
+	done
+	i=0
+	while [ $i -lt 48 ]; do
+		p_ "PRX_TDM${i}" $((BASE + 0xc000 + i * 0x10))
+		i=$((i + 1))
+	done
+}
+
+[ -r "$GLUE/status" ] || { echo "nss-ppe-diff: NSS plane not armed" >&2; exit 1; }
+
+case "${1:-}" in
+save)
+	f="${2:-$BASELINE_DEFAULT}"
+	mkdir -p "$(dirname "$f")"
+	# Stamp the boot. The capture directory survives sysupgrade on purpose,
+	# so without this a baseline could outlive the firmware that produced it
+	# and every changed default would read as a foreign write - a phantom
+	# diff is worse than no diff.
+	{ echo "# boot_id $(cat /proc/sys/kernel/random/boot_id)"; dump; } > "$f" || exit 1
+	echo "nss-ppe-diff: baseline saved to $f ($(($(wc -l < "$f") - 1)) registers)"
+	;;
+dump)
+	dump
+	;;
+*)
+	f="${1:-$BASELINE_DEFAULT}"
+	[ -r "$f" ] || {
+		echo "nss-ppe-diff: no baseline at $f - take one with 'nss-ppe-diff save'" >&2
+		exit 1
+	}
+	want=$(sed -n 's/^# boot_id //p' "$f")
+	have=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+	[ -n "$want" ] && [ "$want" = "$have" ] || {
+		echo "nss-ppe-diff: $f was taken on a different boot ($want), not this one" >&2
+		echo "  Refusing to diff: register defaults can differ across firmware, so" >&2
+		echo "  every one of them would read as a foreign write. Re-run 'nss-ppe-diff" >&2
+		echo "  save' when the box is healthy, and diff after the next occurrence." >&2
+		exit 1
+	}
+	now=$(mktemp) || exit 1
+	res=$(mktemp) || exit 1
+	dump > "$now"
+	# Join on the register name rather than diffing line by line: the port
+	# set can differ between the two reads (a port may have been unplugged),
+	# and a positional diff would then report every following line.
+	#
+	# Collect into a file and print it once. Counting the lines of something
+	# already on its way to stdout invites writing the same report down two
+	# descriptors, and when both are the same file - which is exactly how
+	# nss-wedge-watch calls this - the second one starts from its own offset
+	# and overwrites the beginning of the capture.
+	awk '/^#/ {next}
+	     NR==FNR {was[$1] = $2; next}
+	     {
+		if (!($1 in was)) { printf "  %-22s (new)      -> %s\n", $1, $2; next }
+		if (was[$1] != $2) printf "  %-22s %s -> %s\n", $1, was[$1], $2
+		seen[$1] = 1
+	     }
+	     END {
+		for (k in was) if (!(k in seen)) printf "  %-22s %s -> (gone)\n", k, was[k]
+	     }' "$f" "$now" > "$res"
+	n=$(wc -l < "$res")
+	cat "$res"
+	rm -f "$now" "$res"
+	if [ "$n" = 0 ]; then
+		echo "nss-ppe-diff: every PPE configuration register still holds its baseline value."
+		echo "  Whatever is wrong with this box, nothing rewrote the PPE's configuration."
+	else
+		echo "nss-ppe-diff: $n PPE configuration registers changed since the baseline."
+		echo "  Nothing in this stack rewrites these after setup, so each line above is"
+		echo "  a write by the other owner of this register file."
+	fi
+	;;
+esac
