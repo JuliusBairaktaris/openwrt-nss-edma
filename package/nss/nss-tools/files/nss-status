@@ -1,0 +1,515 @@
+#!/bin/sh
+# nss-status: one-shot health report for the NSS offload data plane.
+# Human-readable by default; -j emits JSON (used by the LuCI status page);
+# -d/--debug appends a diagnostics snapshot (firmware EDMA/N2H counters,
+# ECM totals, recent NSS kernel messages). Read-only: safe to run at any time.
+
+# Every path the report reads hangs off one prefix, empty on the router. Point
+# it at an unpacked support capture to read that box's state on a workstation,
+# which is also how the parsers are exercised without hardware.
+R="${NSS_STATUS_ROOT:-}"
+
+. "$R/lib/nss/functions.sh"
+
+GLUE=$R/sys/kernel/debug/qca-ppe-nss
+DRV=$R/sys/kernel/debug/qca-nss-drv/stats
+ECM=$R/sys/kernel/debug/ecm
+NET=$R/sys/class/net
+MOD=$R/sys/module
+
+JSON=0
+DEBUG=0
+L2=0
+case "$1" in
+	-j) JSON=1 ;;
+	-d|--debug) DEBUG=1 ;;
+	-l2) L2=1 ;;
+esac
+
+mod() { [ -d "$MOD/$1" ] && echo 1 || echo 0; }
+
+# --- collect ---------------------------------------------------------------
+
+fw_version=$(nss_fw_version)
+[ -n "$fw_version" ] || fw_version="unknown"
+
+# 802.11s mesh state, same decision nss-up takes. mesh_cfg/mesh_capable only
+# say a mesh iface is configured and the firmware line supports offload; they
+# say nothing about whether a mesh vdev actually got created (vdev alloc can
+# fail at runtime - e.g. -524 - while the iface stays up on the host path).
+# "links" is written by ath11k_nss_mesh_vdev_alloc() only on success, so a
+# non-empty file is the actual runtime signal. It lives under the per-ab
+# debugfs root (ath11k/<bus>-<devname>/), so glob rather than assume a name.
+nss_mesh_state
+mesh_cfg=$NSS_MESH_CFG
+mesh_capable=$NSS_MESH_CAPABLE
+mesh_vdev=0
+for f in "$R"/sys/kernel/debug/ath11k/*/dbg_infra/links; do
+	grep -q "^link id" "$f" 2>/dev/null && mesh_vdev=1
+done
+
+fw_mask=$(cat "$GLUE/fw_mask" 2>/dev/null)
+[ -n "$fw_mask" ] || fw_mask="0x0"
+
+n2h_sum() { awk '$1 == "n2h_rx_pkts" {s += $3} END {print s + 0}' "$DRV/n2h" 2>/dev/null; }
+
+heartbeat=0
+if [ -r "$DRV/n2h" ]; then
+	a=$(n2h_sum); sleep 1; b=$(n2h_sum)
+	heartbeat=$((b - a))
+fi
+
+# "Core N:" then a Min/Avg/Max percent line; keep the Avg column per core.
+core_loads=$(awk '/^Core [0-9]+:/ {c=$2; sub(":","",c)}
+	/%/ {gsub("%",""); print c":"$2}' "$DRV/cpu_load_ubi" 2>/dev/null)
+
+# if_num N: netdev=lanX armed=1 overridden=1 started=1 injectable=1 fw_vsi=N
+#           tx_redirect_pkts=N tx_busy=N rx_fw_pkts=N
+#
+# The glue counters are the host<->firmware exception path: tx_redirect_pkts is
+# what the host handed to the firmware to egress the port, rx_fw_pkts is what
+# the firmware punted back up. The port's own totals come from the netdev, whose
+# counters are the MAC's MIB and therefore see every frame on the wire. What the
+# firmware forwarded on its own - the offloaded share - is the difference.
+#
+# Match the fields by name. By position, a field added to the line silently
+# shifts every counter after it into the wrong column, and the result still
+# looks like a plausible packet count.
+ports=$(awk '/^if_num/ {
+	sub(":", "", $2)
+	nd = ""; st = 0; tx = 0; rx = 0
+	for (i = 3; i <= NF; i++) {
+		split($i, kv, "=")
+		if (kv[1] == "netdev")                nd = kv[2]
+		else if (kv[1] == "started")          st = kv[2]
+		else if (kv[1] == "tx_redirect_pkts") tx = kv[2]
+		else if (kv[1] == "rx_fw_pkts")       rx = kv[2]
+	}
+	if (nd != "-") print $2 " " nd " " st " " tx " " rx
+}' "$GLUE/status" 2>/dev/null)
+
+# ifnum netdev started host_tx fw_rx tx_total rx_total tx_offl rx_offl tx_pct rx_pct
+ports=$(echo "$ports" | while read -r ifnum nd st htx frx; do
+	[ -n "$ifnum" ] || continue
+	ttx=$(cat "$NET/$nd/statistics/tx_packets" 2>/dev/null || echo 0)
+	trx=$(cat "$NET/$nd/statistics/rx_packets" 2>/dev/null || echo 0)
+	echo "$ifnum $nd $st $htx $frx $ttx $trx" | LC_ALL=C awk '{
+		otx = $6 - $4; orx = $7 - $5
+		if (otx < 0) otx = 0
+		if (orx < 0) orx = 0
+		ptx = ($6 > 0) ? 100 * otx / $6 : 0
+		prx = ($7 > 0) ? 100 * orx / $7 : 0
+		printf "%s %s %s %s %s %s %s %d %d %.1f %.1f\n",
+		       $1, $2, $3, $4, $5, $6, $7, otx, orx, ptx, prx
+	}'
+done)
+
+ecm_loaded=$(mod ecm)
+ecm_v4=$(cat "$ECM/ecm_nss_ipv4/accelerated_count" 2>/dev/null || echo 0)
+ecm_v6=$(cat "$ECM/ecm_nss_ipv6/accelerated_count" 2>/dev/null || echo 0)
+
+bridge_mgr=$(mod qca_nss_bridge_mgr)
+mcs=$(mod qca_mcs)
+pppoe_mgr=$(mod qca_nss_pppoe)
+
+wifi_offload=$(cat "$MOD/ath11k/parameters/nss_offload" 2>/dev/null || echo -1)
+
+nss_sqm_section
+sqm_sec=$NSS_SQM_SEC
+sqm_dev=$NSS_SQM_DEV
+sqm_active=0
+[ -n "$sqm_dev" ] && tc qdisc show dev "$sqm_dev" 2>/dev/null | grep -q nsstbl && sqm_active=1
+
+# Fast lane: nsspfifo band packet counters (egress tree + ingress IFB tree).
+fastlane_pkts() {
+	tc -s qdisc show dev "$1" 2>/dev/null | grep -A1 nsspfifo | \
+		sed -n 's/.*Sent [0-9]* bytes \([0-9]*\) pkt.*/\1/p' | head -1
+}
+fl_egress=$(fastlane_pkts "$sqm_dev")
+fl_ingress=$(fastlane_pkts "ifb@${sqm_dev}")
+fl_active=0
+[ -n "$fl_egress$fl_ingress" ] && fl_active=1
+qos_rules=$(nft list chain inet nssqos forward 2>/dev/null | grep -c 'dscp set')
+igs_ports=""
+for p in $(uci -q get "sqm.${sqm_sec}.igs_upload"); do
+	if tc qdisc show dev "ifb-$p" 2>/dev/null | grep -q nsstbl; then
+		igs_ports="$igs_ports $p:1"
+	else
+		igs_ports="$igs_ports $p:0"
+	fi
+done
+
+# An NSS tree forwards nothing until one leaf is marked as its default
+# destination. A root left without one is the shape a failed or interrupted
+# shaper build leaves behind, and it is invisible everywhere else: the link
+# stays up, the carrier stays set, tc still lists a shaper. Name it, because
+# from the outside it looks exactly like a dead port or a dead line.
+sqm_dropping=""
+for d in $sqm_dev "ifb@${sqm_dev}" $(uci -q get "sqm.${sqm_sec}.igs_upload" | sed 's/[^ ]*/ifb-&/g'); do
+	[ -n "$d" ] || continue
+	tc qdisc show dev "$d" 2>/dev/null | head -n1 | grep -q '^qdisc nsstbl' || continue
+	tc qdisc show dev "$d" 2>/dev/null | grep -q set_default || sqm_dropping="$sqm_dropping $d"
+done
+
+state=host
+if [ "$fw_mask" != "0x0" ]; then
+	if [ "$heartbeat" -gt 0 ]; then
+		state=active
+	else
+		state=stalled
+	fi
+fi
+
+# Kernel log sweep: a WARN/oops anywhere in this boot is worth surfacing even
+# when everything else looks healthy (WARN_ON_ONCE fires once and scrolls away).
+kwarns=$(dmesg 2>/dev/null | grep -c 'cut here')
+koops=$(dmesg 2>/dev/null | grep -cE 'Oops:|BUG:|Kernel panic')
+
+# --- emit ------------------------------------------------------------------
+
+if [ "$JSON" = 1 ]; then
+	pjson=""
+	for line in $(echo "$ports" | tr ' ' ',' ); do
+		# line: ifnum,netdev,started,tx,rx
+		# Splitting is the point: one field per positional parameter.
+		# shellcheck disable=SC2046
+		set -- $(echo "$line" | tr ',' ' ')
+		[ -n "$1" ] || continue
+		pjson="$pjson{\"ifnum\":$1,\"netdev\":\"$2\",\"started\":$3,\"tx_host_pkts\":$4,\"rx_host_pkts\":$5,\"tx_total\":$6,\"rx_total\":$7,\"tx_offloaded\":$8,\"rx_offloaded\":$9,\"tx_offload_pct\":${10},\"rx_offload_pct\":${11}},"
+	done
+	pjson="[${pjson%,}]"
+
+	cjson=""
+	for c in $core_loads; do
+		cjson="$cjson{\"core\":${c%%:*},\"avg\":${c##*:}},"
+	done
+	cjson="[${cjson%,}]"
+
+	ijson=""
+	for i in $igs_ports; do
+		ijson="$ijson{\"port\":\"${i%%:*}\",\"active\":${i##*:}},"
+	done
+	ijson="[${ijson%,}]"
+
+	# The shaper fault the text report calls out: an NSS root with no default
+	# leaf drops every packet while the link stays up. It was computed and
+	# then thrown away here, so the LuCI page could never show the one state
+	# that most looks like dead hardware.
+	sfjson=""
+	for d in $sqm_dropping; do
+		sfjson="$sfjson\"$d\","
+	done
+	sfjson="[${sfjson%,}]"
+
+	cat <<-EOF
+	{"state":"$state","fw_version":"$fw_version","fw_mask":"$fw_mask",
+	"heartbeat_pps":$heartbeat,"cores":$cjson,"ports":$pjson,
+	"ecm":{"loaded":$ecm_loaded,"ipv4_accel":$ecm_v4,"ipv6_accel":$ecm_v6},
+	"modules":{"bridge_mgr":$bridge_mgr,"mcs":$mcs,"pppoe":$pppoe_mgr},
+	"wifi_offload":$wifi_offload,
+	"mesh":{"configured":$mesh_cfg,"offloaded":$mesh_vdev,"fw_capable":$mesh_capable},
+	"kernel_log":{"warns":$kwarns,"oopses":$koops},
+	"sqm":{"active":$sqm_active,"device":"$sqm_dev","igs":$ijson,
+	"shaper_fault":$sfjson,
+	"fastlane":{"active":$fl_active,"egress_pkts":${fl_egress:-0},"ingress_pkts":${fl_ingress:-0}},
+	"qos_marking_rules":$qos_rules}}
+	EOF
+	exit 0
+fi
+
+# --- L2 per-port datapath view (-l2) ---------------------------------------
+# host<->fw<->wire counters per offloaded port. The pointer that localises an
+# egress stall: a link-up port whose host->fw (glue tx_redirect) climbs while
+# the client stays unreachable is not putting frames on the wire.
+if [ "$L2" = 1 ]; then
+	edp=$DRV/edma/ports
+	# VSI table base (HPPE, SoC-wide on IPQ807x): PPE 0x3a000000 + L2 block
+	# 0x060000 + VSI_TBL 0x1800, 0x10 per VSI. Word0 holds the member and
+	# unknown-unicast/multicast/broadcast flood bitmaps: an emptied word0 on a
+	# started port means the firmware dropped the port out of its own flood
+	# masks, which silently black-holes host BUM egress (PADI/ARP/ND).
+	vsi_bmp() { [ -n "$1" ] && [ "$1" -ge 0 ] 2>/dev/null &&
+		devmem $((0x3a061800 + $1 * 0x10)) 32 2>/dev/null; }
+	echo "NSS L2 per-port datapath:"
+	printf "  %-6s %-4s %-4s %-4s %-4s %-4s %-11s %12s %9s %9s %12s %12s %12s\n" \
+	       port ifn car inj fwl vsi vsi_bmp "host->fw" "hostbusy" "hostdrop" \
+	       "fw->host" "wire->fw" "fw->wire"
+	# Port set comes from the live glue table, never a hardcoded range: the
+	# WAN is port 2 on one board and port 6 on the next.
+	for pn in $(awk '/^if_num/ && !/netdev=-/ {sub(/:/,"",$2); print $2}' \
+		    "$GLUE/status" 2>/dev/null); do
+		line=$(grep "if_num $pn:" "$GLUE/status" 2>/dev/null)
+		nd=$(echo "$line" | sed -n 's/.*netdev=\([^ ]*\).*/\1/p')
+		[ -z "$nd" ] || [ "$nd" = "-" ] && continue
+		vsi=$(echo "$line" | sed -n 's/.*fw_vsi=\([^ ]*\).*/\1/p')
+		inj=$(echo "$line" | sed -n 's/.*injectable=\([^ ]*\).*/\1/p')
+		fwl=$(echo "$line" | sed -n 's/.*fw_link=\([^ ]*\).*/\1/p')
+		txr=$(echo "$line" | sed -n 's/.*tx_redirect_pkts=\([^ ]*\).*/\1/p')
+		tbz=$(echo "$line" | sed -n 's/.*tx_busy=\([^ ]*\).*/\1/p')
+		tdr=$(echo "$line" | sed -n 's/.*tx_dropped=\([^ ]*\).*/\1/p')
+		rxf=$(echo "$line" | sed -n 's/.*rx_fw_pkts=\([^ ]*\).*/\1/p')
+		car=$(cat "$NET/$nd/carrier" 2>/dev/null)
+		# A failed devmem read must not swallow the column: every field in
+		# this row is width-aligned and read by eye, so an empty one shifts
+		# everything after it and silently renames the remaining numbers.
+		bmp=$(vsi_bmp "$vsi")
+		etx=$(cat "$edp/$pn"/* 2>/dev/null | awk '/tx_pkts/{print $3}')
+		erx=$(cat "$edp/$pn"/* 2>/dev/null | awk '/rx_pkts/{print $3}')
+		printf "  %-6s %-4s %-4s %-4s %-4s %-4s %-11s %12s %9s %9s %12s %12s %12s\n" \
+		       "$nd" "$pn" "${car:-?}" "${inj:-?}" "${fwl:-?}" "${vsi:-?}" \
+		       "${bmp:-?}" "${txr:-?}" "${tbz:-?}" "${tdr:-?}" \
+		       "${rxf:-?}" "${etx:-?}" "${erx:-?}"
+	done
+	echo "  host->fw=glue tx_redirect  fw->host=glue rx_fw  wire->fw=edma ingress  fw->wire=edma egress"
+	echo "  link-up + host->fw climbing + client unreachable => egress stall (see /root/auto-recovery)"
+	echo "  A wedged WAN on a carrier-up port reads as one of:"
+	echo "    inj=0            host TX is dropped before the firmware - the port never got its"
+	echo "                     injection grant back after a transition"
+	echo "    hostbusy rising  the firmware stopped draining the host->fw ring"
+	echo "    fwl=0            we last told the firmware this port's link is DOWN, so it"
+	echo "                     will not transmit on it; a missed grant on our side"
+	echo "    hostdrop rising  nss-drv refused the frames before the firmware ever saw"
+	echo "                     them; host->fw counts those as sent, so read it here"
+	echo "    host->fw rising  frames reach the firmware and die past it (fabric/egress side);"
+	echo "                     an emptied vsi_bmp there means the flood masks were lost"
+
+	# When frames do die past the firmware, the PPE fabric already knows why:
+	# it counts every discard against a named reason, per port. Nothing was
+	# reading those, so the one question a wedge capture has to answer - is the
+	# fabric dropping this port's traffic, and for what - could not be answered
+	# after the fact. Report any port whose drop counters are moving; a healthy
+	# port has none at all, so silence here is meaningful too.
+	#
+	# The 'special' rows are not discards (ppe_drop_code_none counts forwarded
+	# frames), hence the filter on the type column rather than on the name.
+	drops=""
+	for pn in $(awk '/^if_num/ && !/netdev=-/ {sub(/:/,"",$2); print $2}' \
+		    "$GLUE/status" 2>/dev/null); do
+		f="$DRV/ppe/code/drop/$pn"
+		[ -r "$f" ] || continue
+		top=$(awk '$2 == "=" && $4 == "drop" && $3 + 0 > 0 {print $3, $1}' "$f" 2>/dev/null |
+		      sort -rn | head -1)
+		[ -n "$top" ] && drops="${drops}
+    port $pn: $(echo "$top" | awk '{print $2}' | sed 's/^ppe_drop_code_//') = $(echo "$top" | awk '{print $1}')"
+	done
+	if [ -n "$drops" ]; then
+		echo "  PPE FABRIC DROPS (the hardware naming what it discarded, per port):$drops"
+		echo "    full list per port: nss-status -d, or"
+		echo "    awk '\$2==\"=\" && \$4==\"drop\" && \$3+0>0' $DRV/ppe/code/drop/<port>"
+	else
+		echo "  PPE fabric drop counters: all zero on every armed port"
+	fi
+
+	# A stalled port that drops nothing anywhere is not dropping, it is not being
+	# dequeued - and the thing that stops the port scheduler dequeuing a port is
+	# its egress shaper. Reproduced on an AX3600 by arming PSCH_SHP_CFG_TBL for one
+	# port with cir=1: that port's queue pinned at its admission ceiling, the
+	# buffer manager raised per-port flow control, the firmware's egress counter
+	# and the MAC MIB TX both froze, and neither an "ip link down/up" nor a
+	# data-plane restore brought it back - which is the field capture of this wedge
+	# down to the queue depth. A negative shaper credit outlives clearing the
+	# enable bit, so both are read here.
+	#
+	# We program no PPE shaper anywhere (grep-verified across the DSA drivers, the
+	# glue and every nss-tools script), and a healthy armed box reads zero in all
+	# of these, so anything armed here was armed by the firmware.
+	# PSCH_SHP_CFG_TBL 0x3a474000 (word1 bit4 = SHAPER_ENABLE, word0 bits 17:0 =
+	# CIR), PSCH_SHP_CREDIT_TBL 0x3a472000, PSCH_SHP_SIGN_TBL 0x3a470000 (bit0 =
+	# credit negative), 0x10 per port - qca-ssdk NHSS.QSDK.14.0.r8, hppe_shaper_reg.h
+	# relative to TRAFFIC_MANAGER_BASE_ADDR 0x400000.
+	shp=""
+	for pn in $(awk '/^if_num/ && !/netdev=-/ {sub(/:/,"",$2); print $2}' \
+		    "$GLUE/status" 2>/dev/null); do
+		nd=$(sed -n "s/^if_num $pn: netdev=\([^ ]*\).*/\1/p" "$GLUE/status")
+		w0=$(devmem $((0x3a474000 + pn * 0x10)) 32 2>/dev/null)
+		w1=$(devmem $((0x3a474000 + pn * 0x10 + 4)) 32 2>/dev/null)
+		sg=$(devmem $((0x3a470000 + pn * 0x10)) 32 2>/dev/null)
+		[ -n "$w1" ] && [ -n "$sg" ] || continue
+		en=$(( ($w1 >> 4) & 1 ))
+		neg=$(( $sg & 1 ))
+		[ "$en" = 1 ] || [ "$neg" = 1 ] || continue
+		shp="${shp}
+    ${nd:-port $pn}: SHAPER_ENABLE=$en credit_neg=$neg cir=$(( $w0 & 0x3ffff )) \
+credit=$(devmem $((0x3a472000 + pn * 0x10)) 32 2>/dev/null)"
+	done
+	if [ -n "$shp" ]; then
+		echo "  PPE EGRESS SHAPER ARMED - the port scheduler will not drain these ports:$shp"
+		echo "    cir=0 with SHAPER_ENABLE=1 is a shaper with no rate: the port cannot"
+		echo "    transmit at all, and no link cycle recovers it - only a reboot."
+		echo "    Nothing in this build writes these registers; please report this block."
+	else
+		echo "  PPE egress shapers: disabled on every armed port (the healthy value)"
+	fi
+	exit 0
+fi
+
+echo "NSS offload status: $state"
+echo "  firmware:    $fw_version (fw_mask $fw_mask, heartbeat ${heartbeat} pkts/s)"
+if [ -n "$core_loads" ]; then
+	echo -n "  NSS cores:  "
+	for c in $core_loads; do echo -n " core${c%%:*} ${c##*:}% avg"; done
+	echo ""
+fi
+if [ -n "$ports" ]; then
+	echo "  ports:       offloaded = forwarded by the firmware, never reached the host"
+	printf "    %-6s %3s %3s  %18s %10s  %18s %10s\n" \
+	       "port" "if" "up" "tx offloaded" "via host" "rx offloaded" "to host"
+	echo "$ports" | while read -r ifnum nd st htx frx ttx trx otx orx ptx prx; do
+		[ -n "$ifnum" ] || continue
+		printf "    %-6s %3s %3s  %18s %10s  %18s %10s\n" \
+		       "$nd" "$ifnum" "$st" "$otx ($ptx%)" "$htx" "$orx ($prx%)" "$frx"
+	done
+	echo "    (via host / to host = the host<->firmware exception path, i.e. what was"
+	echo "     NOT offloaded: broadcast/multicast discovery, connection setup and"
+	echo "     short-lived flows, and traffic addressed to the router itself. A quiet"
+	echo "     port carries little else, so its share reads low. Port totals: ifconfig)"
+fi
+echo "  ECM:         loaded=$ecm_loaded, accelerated: $ecm_v4 IPv4 / $ecm_v6 IPv6"
+echo "  modules:     bridge-mgr=$bridge_mgr qca-mcs=$mcs pppoe-mgr=$pppoe_mgr"
+case "$wifi_offload" in
+	1)  if [ "$mesh_cfg" = 1 ] && [ "$mesh_vdev" = 1 ]; then
+	        echo "  Wi-Fi:       NSS offload active (wifili, 802.11s mesh offloaded)"
+	    elif [ "$mesh_cfg" = 1 ]; then
+	        echo "  Wi-Fi:       NSS offload active (wifili; 802.11s mesh configured, not offloaded)"
+	    else
+	        echo "  Wi-Fi:       NSS offload active (wifili)"
+	    fi ;;
+	0)  if [ "$mesh_cfg" = 1 ] && [ "$mesh_capable" = 1 ]; then
+	        echo "  Wi-Fi:       host mode (mesh configured; firmware supports mesh offload - armed by nss-up)"
+	    elif [ "$mesh_cfg" = 1 ]; then
+	        echo "  Wi-Fi:       host mode (mesh configured; mesh offload needs the 11.4 NSS firmware and a mesh-enabled build)"
+	    else
+	        echo "  Wi-Fi:       host mode"
+	    fi ;;
+	*)  echo "  Wi-Fi:       ath11k not loaded" ;;
+esac
+if [ "$sqm_active" = 1 ]; then
+	igs_human=$(echo "$igs_ports" | sed 's/\([a-z0-9]*\):1/\1/g; s/\([a-z0-9]*\):0/\1(MISSING)/g')
+	echo "  SQM:         nsstbl shaper on $sqm_dev, upload IGS:${igs_human:- none}"
+	[ -n "$sqm_dropping" ] && echo "  SHAPER FAULT: no default leaf below the NSS root on:$sqm_dropping - those devices are dropping every packet they are given (link stays up)"
+	if [ "$fl_active" = 1 ]; then
+		echo "  fast lane:   egress ${fl_egress:-0} pkts / ingress ${fl_ingress:-0} pkts, ${qos_rules} marking rules active"
+	fi
+else
+	echo "  SQM:         no NSS shaper${sqm_dev:+ on $sqm_dev}"
+fi
+if [ "$kwarns" -gt 0 ] || [ "$koops" -gt 0 ]; then
+	echo "  kernel log:  $kwarns WARN / $koops oops this boot - see 'nss-status -d' or dmesg"
+else
+	echo "  kernel log:  clean (no WARN/oops this boot)"
+fi
+case "$state" in
+	active)  echo "  verdict:     OFFLOAD ACTIVE" ;;
+	stalled) echo "  verdict:     FIRMWARE ARMED BUT HEARTBEAT SILENT - check logread; reboot returns to the host stack" ;;
+	host)    echo "  verdict:     host stack (NSS plane not armed - run nss-up or 'service nss start')" ;;
+esac
+
+[ "$DEBUG" = 1 ] || exit 0
+
+# --- debug snapshot (-d) -----------------------------------------------------
+# Every source is optional: with the NSS plane down most of these do not exist.
+
+sec() {
+	echo ""
+	echo "=== $1 ==="
+}
+
+sec "firmware EDMA error/pressure counters ($DRV/edma/err_stats)"
+if [ -r "$DRV/edma/err_stats" ]; then
+	cat "$DRV/edma/err_stats"
+else
+	echo "(not available - qca-nss-drv not loaded / firmware not armed)"
+fi
+
+sec "N2H (firmware-to-host) statistics ($DRV/n2h)"
+if [ -r "$DRV/n2h" ]; then
+	# The raw file repeats identical stat names once per core, told apart only
+	# by a banner line - prefix every stat line with its core so greps and
+	# over-time comparisons can never mix the two cores.
+	awk '/N2H [01]/ { core = $3 } { sub(/^\tn2h_/, "\tcore" core ".n2h_"); print }' "$DRV/n2h"
+	echo ""
+	echo "note: payload_alloc_fails = per-packet retries while the fw payload pool"
+	echo "  runs dry; bursts by design under saturating load. rx_queue[N]_drops ="
+	echo "  host-bound queue back-pressure at its limit (sysctl"
+	echo "  dev.nss.n2hcfg.n2h_queue_limit_coreN); neither touches offloaded flows."
+else
+	echo "(not available - qca-nss-drv not loaded / firmware not armed)"
+fi
+
+sec "PPE fabric drop codes, per port (nonzero only, $DRV/ppe/code/drop)"
+# Port numbers come from the live glue table, never a fixed range - the WAN is
+# port 2 on one board and port 6 on the next.
+if [ -d "$DRV/ppe/code/drop" ]; then
+	for pn in $(awk '/^if_num/ && !/netdev=-/ {sub(/:/,"",$2); print $2}' \
+		    "$GLUE/status" 2>/dev/null); do
+		f="$DRV/ppe/code/drop/$pn"
+		[ -r "$f" ] || continue
+		nd=$(sed -n "s/.*if_num $pn: netdev=\([^ ]*\).*/\1/p" "$GLUE/status" 2>/dev/null)
+		hits=$(awk '$2 == "=" && $4 == "drop" && $3 + 0 > 0 {printf "    %-46s %s\n", $1, $3}' "$f" 2>/dev/null)
+		if [ -n "$hits" ]; then
+			echo "  port $pn (${nd:-?}):"
+			echo "$hits"
+		else
+			echo "  port $pn (${nd:-?}): no drops"
+		fi
+	done
+else
+	echo "(not available - qca-nss-drv not loaded / firmware not armed)"
+fi
+
+sec "PPE host-punt reasons (nonzero only, $DRV/ppe/code/cpu)"
+# Why the fabric handed a frame to the host instead of forwarding it. A wedge
+# that punts everything and a wedge that drops everything look identical from
+# the outside and are not the same fault.
+for w in exception non-exception; do
+	f="$DRV/ppe/code/cpu/$w"
+	[ -r "$f" ] || continue
+	# $2 == "=" pins the counter shape: the file's banner line also has a third
+	# field, and an unanchored numeric test compares it as a string and matches.
+	hits=$(awk '$2 == "=" && $3 + 0 > 0 {printf "    %-46s %s\n", $1, $3}' "$f" 2>/dev/null)
+	echo "  $w:"
+	echo "${hits:-    (none)}"
+done
+
+sec "firmware log ring (${DRV%/stats}/logs)"
+# Readable on demand, no coredump needed, and empty on a healthy box - so
+# anything in here at all is worth reading.
+found=0
+for c in "${DRV%/stats}"/logs/core*; do
+	[ -r "$c" ] || continue
+	found=1
+	if [ -s "$c" ]; then
+		echo "  $(basename "$c"):"
+		cat "$c" 2>/dev/null | tail -60
+	else
+		echo "  $(basename "$c"): empty"
+	fi
+done
+[ "$found" = 1 ] || echo "(not available - qca-nss-drv not loaded / firmware not armed)"
+
+sec "ECM connection totals ($ECM)"
+if [ -d "$ECM" ]; then
+	for f in ecm_db/connection_count \
+		 ecm_nss_ipv4/accelerated_count ecm_nss_ipv4/pending_accel_count \
+		 ecm_nss_ipv4/pending_decel_count \
+		 ecm_nss_ipv6/accelerated_count ecm_nss_ipv6/pending_accel_count \
+		 ecm_nss_ipv6/pending_decel_count; do
+		[ -r "$ECM/$f" ] && echo "$f: $(cat "$ECM/$f" 2>/dev/null)"
+	done
+else
+	echo "(not available - ecm not loaded)"
+fi
+
+sec "kernel warnings/oopses this boot (dmesg)"
+if [ "$kwarns" -gt 0 ] || [ "$koops" -gt 0 ]; then
+	dmesg 2>/dev/null | grep -B2 -A44 -E 'cut here|Oops:|BUG:|Kernel panic' | tail -150
+else
+	echo "(none)"
+fi
+
+sec "recent NSS kernel messages (dmesg)"
+dmesg 2>/dev/null | grep -i nss | tail -40
+
+sec "hints"
+echo "sysctl -w dev.nss.project.wt_stats=1 enables per-worker-thread firmware"
+echo "statistics under $DRV/project/"

@@ -1,0 +1,20 @@
+uci -q batch << EOI
+# Keep OpenWrt's packet-steering service out of the NSS data path: its model is a
+# host NAPI per hardware queue, which does not describe a datapath where the
+# firmware delivers through N2H. In this mode the service writes rps_cpus=0 on the
+# netdevs it owns (the Wi-Fi VAPs and the EDMA conduit); the cores-1-3 mask for
+# the delivery netdevs comes from net.core.rps_default_mask in
+# 12-nss-networking.conf.
+#
+# Measured on a Wi-Fi client to wired host flow through the router, two runs
+# each: 749 and 800 Mbit/s with the service disabled against 619 and 626 with
+# it at its default, and the default also produced n2h_rx_queue drops (158 and
+# 83) where disabling it produced none. See 12-nss-networking.conf.
+#
+# Kernel flow offloading must also stay off - ECM owns acceleration - but that
+# lives in firewall.@defaults[0].flow_offloading{,_hw} and OpenWrt already ships
+# it off, so there is nothing to write here.
+set network.globals.packet_steering='0'
+EOI
+
+exit 0
