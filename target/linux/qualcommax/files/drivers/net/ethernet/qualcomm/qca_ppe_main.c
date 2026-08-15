@@ -12,8 +12,10 @@
 #include <linux/phylink.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
+#include <linux/rtnetlink.h>
 #include <linux/if_bridge.h>
 #include <linux/if_vlan.h>
+#include <linux/soc/qcom/qca_ppe.h>
 
 #include "qca_ppe.h"
 
@@ -1324,8 +1326,10 @@ static int qca_ppe_setup(struct dsa_switch *ds)
 	port_mask = BIT(num_ports) - 1;
 	frame_size = PPE_DEFAULT_MTU + 2 * VLAN_HLEN;
 
-	for (i = 0; i < num_ports; i++)
+	for (i = 0; i < num_ports; i++) {
 		priv->port_vsi[i] = 0;
+		priv->port_fw_vsi[i] = PPE_VSI_INVALID;
+	}
 
 	regmap_write(priv->regmap, PPE_FDB_OP, 0);
 
@@ -3352,6 +3356,83 @@ static const struct dsa_switch_ops qca_ppe_ops = {
 	.devlink_trap_policer_counter_get = qca_ppe_devlink_trap_policer_counter_get,
 	.devlink_trap_drop_counter_get = qca_ppe_devlink_trap_drop_counter_get,
 };
+
+static struct qca_ppe_priv *fw_vsi_port_resolve(struct net_device *netdev,
+						int *port)
+{
+	struct dsa_port *dp;
+
+	ASSERT_RTNL();
+
+	if (!netdev || !dsa_user_dev_check(netdev))
+		return NULL;
+
+	dp = dsa_port_from_netdev(netdev);
+	if (IS_ERR(dp) || dp->ds->ops != &qca_ppe_ops)
+		return NULL;
+
+	*port = dp->index;
+	return ds_to_priv(dp->ds);
+}
+
+/*
+ * qca_ppe_port_fw_vsi_get - a VSI of the port's own for the NSS firmware
+ * @netdev: DSA user netdev on a qca-ppe switch
+ *
+ * The firmware refuses a VSI that a second port already uses, so each port
+ * gets one of its own on first use, kept for the switch lifetime. Its members
+ * are the port and the CPU port, so the Linux bridge stays the forwarding
+ * authority. The firmware clears the member and flood masks of a VSI it is
+ * assigned, so every call writes them again: call it once more after the
+ * assign. Callers hold rtnl. Returns the VSI or -errno.
+ */
+int qca_ppe_port_fw_vsi_get(struct net_device *netdev)
+{
+	struct qca_ppe_priv *priv;
+	int port, vsi;
+
+	priv = fw_vsi_port_resolve(netdev, &port);
+	if (!priv)
+		return -ENODEV;
+
+	guard(mutex)(&priv->vlan_lock);
+
+	vsi = priv->port_fw_vsi[port];
+	if (vsi == PPE_VSI_INVALID) {
+		vsi = ppe_vsi_alloc(priv);
+		if (vsi < 0)
+			return vsi;
+		priv->port_fw_vsi[port] = vsi;
+	}
+
+	ppe_vsi_member_set(priv, vsi, BIT(port) | BIT(QCA_PPE_CPU_PORT));
+
+	return vsi;
+}
+EXPORT_SYMBOL_GPL(qca_ppe_port_fw_vsi_get);
+
+/*
+ * qca_ppe_port_vsi_restore - bind a port to its VSI again
+ * @netdev: DSA user netdev whose VSI the firmware has released
+ *
+ * Releasing a VSI from the firmware leaves the port bound to no VSI, so it
+ * forwards nothing. Put back the binding the bridge state implies. Callers
+ * hold rtnl.
+ */
+int qca_ppe_port_vsi_restore(struct net_device *netdev)
+{
+	struct qca_ppe_priv *priv;
+	int port;
+
+	priv = fw_vsi_port_resolve(netdev, &port);
+	if (!priv)
+		return -ENODEV;
+
+	ppe_port_vsi_set(priv, port, priv->port_vsi[port]);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qca_ppe_port_vsi_restore);
 
 static void ppe_mac_hw_init(struct qca_ppe_priv *priv)
 {
