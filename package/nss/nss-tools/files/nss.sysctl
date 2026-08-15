@@ -1,0 +1,34 @@
+# With firmware RPS and the Linux RPS fan-out, bursts to host-terminated
+# flows land on the per-CPU receive backlogs; the 1000-packet default
+# overflows at line-rate bursts (softnet_stat column-2 drops). 4096 absorbs
+# them with no measured drops at ~1.5 Gbit/s offered.
+net.core.netdev_max_backlog=4096
+
+# Default RPS mask applied to every rx queue at creation, so it needs no
+# re-application when a netdev is recreated. Mask 'e' = cores 1-3: every ipq807x
+# is a quad A53, and core 0 is left to the N2H queue-0 NAPI that firmware RPS
+# hashes host-terminated flows onto.
+# This service runs at START=11, before netifd, so it covers every delivery netdev
+# created afterwards: the bridges, pppoe-wan and the IGS ifb devices. The wired
+# ports exist before it runs and keep the kernel default, which is correct - under
+# offload their traffic never reaches a host softirq.
+#
+# The Wi-Fi VAPs are deliberately NOT ours to set. OpenWrt's own packet_steering
+# service owns rps_cpus for every netdev that has a device symlink and no lower_*
+# - on ipq807x the Wi-Fi VAPs and the EDMA conduit netdev - and it re-runs on
+# every interface.* event. We set network.globals.packet_steering='0'
+# (98-nss-offload, and qca-nss-ecm's init forces it again on every start and on
+# its network/packet_steering reload triggers), and in that mode it writes 0 to
+# those queues - so any VAP rps_cpus we set is erased again within a second.
+#
+# That override is measured, not assumed. Leaving the service at its default
+# puts the VAPs on core 3, the EDMA conduit on core 2 and the conduit NAPI
+# thread on core 0. On a Wi-Fi client to wired host flow through the router,
+# two runs each: with the service disabled 749 and 800 Mbit/s and no n2h queue
+# drops; with it at its default 619 and 626 Mbit/s and 158 then 83 fresh
+# n2h_rx_queue drops. Its placement fights firmware RPS, which already hashes
+# host-terminated flows onto the N2H queues this mask is shaped around.
+#
+# Do not add a writer to fight the service either - configure the service, as
+# 98-nss-offload does.
+net.core.rps_default_mask=e
