@@ -17,6 +17,35 @@
 		reg = <0x01868010 0x1000>;
 		reg-names = "nss-misc-reset";
 		memory-region = <&nss_region>;
+
+		/*
+		 * Clocks the NSS block requires while the firmware runs and
+		 * that no host driver on the qca_edma/qca_ppe stack turns on.
+		 * The
+		 * uniphy domains are listed because firmware PPE init walks
+		 * every port, while the PCS driver only clocks the domains
+		 * with an active port.
+		 */
+		clocks = <&gcc GCC_NSSNOC_CRYPTO_CLK>,
+			 <&gcc GCC_CRYPTO_PPE_CLK>,
+			 <&gcc GCC_UNIPHY1_AHB_CLK>,
+			 <&gcc GCC_UNIPHY1_SYS_CLK>,
+			 <&gcc GCC_UNIPHY2_AHB_CLK>,
+			 <&gcc GCC_UNIPHY2_SYS_CLK>,
+			 <&gcc GCC_UNIPHY1_PORT5_RX_CLK>,
+			 <&gcc GCC_UNIPHY1_PORT5_TX_CLK>,
+			 <&gcc GCC_UNIPHY2_PORT6_RX_CLK>,
+			 <&gcc GCC_UNIPHY2_PORT6_TX_CLK>;
+		clock-names = "gcc_nssnoc_crypto_clk",
+			      "gcc_crypto_ppe_clk",
+			      "gcc_uniphy1_ahb_clk",
+			      "gcc_uniphy1_sys_clk",
+			      "gcc_uniphy2_ahb_clk",
+			      "gcc_uniphy2_sys_clk",
+			      "gcc_uniphy1_port5_rx_clk",
+			      "gcc_uniphy1_port5_tx_clk",
+			      "gcc_uniphy2_port6_rx_clk",
+			      "gcc_uniphy2_port6_tx_clk";
 	};
 
 	nss0: nss@40000000 {
@@ -177,6 +206,11 @@
 		qcom,pvxlan-enabled;
 		qcom,clmap-enabled;
 		qcom,rmnet_rx-enabled;
+
+		/*
+		 * Core 1 carries no packet path; a board enables it only to
+		 * reach one of the subsystems above.
+		 */
 		status = "disabled";
 	};
 };
