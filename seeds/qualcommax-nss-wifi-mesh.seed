@@ -1,0 +1,11 @@
+CONFIG_TARGET_qualcommax=y
+CONFIG_TARGET_qualcommax_ipq807x=y
+CONFIG_PACKAGE_kmod-nss-wifi-drv=y
+CONFIG_ATH11K_NSS_WIFI=y
+CONFIG_PACKAGE_nss-firmware=y
+CONFIG_PACKAGE_nss-firmware-ipq807x=y
+CONFIG_PACKAGE_nss-firmware-ipq60xx=y
+CONFIG_NSS_FIRMWARE_VERSION_11_4=y
+# CONFIG_NSS_FIRMWARE_VERSION_12_5 is not set
+CONFIG_PACKAGE_wpad-mesh-openssl=y
+# CONFIG_PACKAGE_wpad-basic-mbedtls is not set
