@@ -28,7 +28,7 @@ jobs:
       extra_repos: ${{ steps.detect.outputs.extra_repos }}
     steps:
       - name: Checkout kernel version files
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           sparse-checkout: target/linux/generic
 
