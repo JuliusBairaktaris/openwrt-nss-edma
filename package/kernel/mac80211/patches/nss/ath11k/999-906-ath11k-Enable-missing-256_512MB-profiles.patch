@@ -1,0 +1,40 @@
+ath11k-Enable-missing-256_512MB-profiles
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+
+diff --git a/drivers/net/wireless/ath/ath11k/core.c b/drivers/net/wireless/ath/ath11k/core.c
+index 7e3963b..ce3f5ca 100644
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -311,6 +311,7 @@ static struct ath11k_hw_params ath11k_hw_params[] = {
+ 		.tx_ring_size = DP_TCL_DATA_RING_SIZE,
+ 		.smp2p_wow_exit = false,
+ 		.support_fw_mac_sequence = true,
++		.num_vdevs_peers = ath11k_vdevs_peers,
+ 		.support_dual_stations = true,
+ 		.pdev_suspend = false,
+ 		.cfr_support = false,
+@@ -490,6 +491,7 @@ static struct ath11k_hw_params ath11k_hw_params[] = {
+ 		.tx_ring_size = DP_TCL_DATA_RING_SIZE,
+ 		.smp2p_wow_exit = false,
+ 		.support_fw_mac_sequence = true,
++		.num_vdevs_peers = ath11k_vdevs_peers,
+ 		.support_dual_stations = true,
+ 		.pdev_suspend = false,
+ 		.cfr_support = false,
+@@ -665,6 +667,7 @@ static struct ath11k_hw_params ath11k_hw_params[] = {
+ 		.tx_ring_size = DP_TCL_DATA_RING_SIZE_WCN6750,
+ 		.smp2p_wow_exit = true,
+ 		.support_fw_mac_sequence = true,
++		.num_vdevs_peers = ath11k_vdevs_peers,
+ 		.support_dual_stations = false,
+ 		.pdev_suspend = true,
+ 		.cfr_support = false,
+@@ -1000,6 +1003,7 @@ static struct ath11k_hw_params ath11k_hw_params[] = {
+ 		.support_off_channel_tx = false,
+ 		.tcl_ring_retry = true,
+ 		.tx_ring_size = DP_TCL_DATA_RING_SIZE,
++		.num_vdevs_peers = ath11k_vdevs_peers,
+ 	},
+ };
+ 
