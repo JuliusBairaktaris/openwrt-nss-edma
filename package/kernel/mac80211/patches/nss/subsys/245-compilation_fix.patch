@@ -1,0 +1,103 @@
+From 9cdb8bae50aca80b593d0f53be5b8efedfc91324 Mon Sep 17 00:00:00 2001
+From: Tamizh Chelvam <tamizhr@codeaurora.org>
+Date: Sun, 7 Mar 2021 22:49:26 +0530
+Subject: [PATCH] backport: Compile fix
+
+Adding these changes to fix compilation issue due to
+package upgrade
+
+Signed-off-by: Tamizh Chelvam <tamizhr@codeaurora.org>
+Signed-off-by: Gautham Kumar Senthilkumaran <quic_gauthamk@quicinc.com>
+---
+ include/linux/backport-refcount.h        |  4 +--
+ include/net/fq.h                         | 10 +++++-
+ net/mac80211/cfg.c                       |  4 +--
+ net/mac80211/ieee80211_i.h               |  4 ++-
+ net/mac80211/iface.c                     |  2 --
+ net/mac80211/rx.c                        | 23 +++++++++-----
+ net/mac80211/tx.c                        | 54 ++++++++++++++++++++++----------
+ 7 files changed, 40 insertions(+), 23 deletions(-)
+
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index 7c46c1b..86c1ede 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -225,6 +225,7 @@ enum ieee80211_rx_flags {
+ };
+ 
+ struct ieee80211_rx_data {
++	struct napi_struct *napi;
+ 	struct list_head *list;
+ 	struct sk_buff *skb;
+ 	struct ieee80211_local *local;
+diff --git a/net/mac80211/tx.c b/net/mac80211/tx.c
+index ebdd9b7..7c256f4 100644
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -4795,21 +4795,23 @@ static void ieee80211_8023_xmit(struct ieee80211_sub_if_data *sdata,
+ 
+ 	ieee80211_aggr_check(sdata, sta, skb);
+ 
+-	tid = skb->priority & IEEE80211_QOS_CTL_TAG1D_MASK;
++	if (!ieee80211_hw_check(&local->hw, SUPPORTS_NSS_OFFLOAD)) {
++		tid = skb->priority & IEEE80211_QOS_CTL_TAG1D_MASK;
+ 
+-	if (sta)
+-		tid_tx = rcu_dereference(sta->ampdu_mlme.tid_tx[tid]);
+-	if (tid_tx) {
+-		if (!test_bit(HT_AGG_STATE_OPERATIONAL, &tid_tx->state)) {
+-			/* fall back to non-offload slow path */
+-			__ieee80211_subif_start_xmit(skb, dev, 0,
+-						     IEEE80211_TX_CTRL_MLO_LINK_UNSPEC,
+-						     NULL);
+-			return;
+-		}
++		if (sta)
++			tid_tx = rcu_dereference(sta->ampdu_mlme.tid_tx[tid]);
++		if (tid_tx) {
++			if (!test_bit(HT_AGG_STATE_OPERATIONAL, &tid_tx->state)) {
++				/* fall back to non-offload slow path */
++				__ieee80211_subif_start_xmit(skb, dev, 0,
++							     IEEE80211_TX_CTRL_MLO_LINK_UNSPEC,
++							     NULL);
++				return;
++			}
+ 
+-		if (tid_tx->timeout)
+-			tid_tx->last_tx = jiffies;
++			if (tid_tx->timeout)
++				tid_tx->last_tx = jiffies;
++		}
+ 	}
+ 
+ 	skb = ieee80211_tx_skb_fixup(skb, ieee80211_sdata_netdev_features(sdata));
+@@ -4890,7 +4892,7 @@ static void __ieee80211_subif_start_xmit_8023(struct sk_buff *skb,
+ 	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
+ 	struct ethhdr *ehdr = (struct ethhdr *)skb->data;
+ 	struct ieee80211_link_data *link;
+-	struct ieee80211_key *key;
++	struct ieee80211_key *key = NULL;
+ 	struct sta_info *sta;
+ 
+ 	rcu_read_lock();
+@@ -4900,6 +4902,12 @@ static void __ieee80211_subif_start_xmit_8023(struct sk_buff *skb,
+ 		goto out;
+ 	}
+ 
++	if (ieee80211_hw_check(&sdata->local->hw, SUPPORTS_NSS_OFFLOAD)) {
++		if (unlikely(IS_ERR_OR_NULL(sta) || !sta->uploaded))
++			sta = NULL;
++		goto tx_offload;
++	}
++
+ 	/*
+ 	 * If STA is invalid, use the multicast offload path when applicable.
+ 	 * In AP mode, drop the frame if there are no associated stations;
+@@ -4930,6 +4938,7 @@ static void __ieee80211_subif_start_xmit_8023(struct sk_buff *skb,
+ 		goto skip_offload;
+ 
+ 	sk_pacing_shift_update(skb->sk, sdata->local->hw.tx_sk_pacing_shift);
++tx_offload:
+ 	ieee80211_8023_xmit(sdata, dev, sta, key, skb);
+ 	goto out;
+ 
