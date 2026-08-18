@@ -1,0 +1,52 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] mac80211: drop the HW checksum offload on an offloaded mesh vdev
+
+ath11k grants NETIF_F_HW_CSUM hw-wide in __ath11k_mac_register(), so
+ieee80211_if_add() puts it on the mesh netdev too. On the wifili path
+the advertisement is honoured: nss_core_send_buffer() raises
+H2N_BIT_FLAG_GEN_IP_TRANSPORT_CHECKSUM for a CHECKSUM_PARTIAL skb and
+the firmware completes the checksum. The mesh encap node is handed the
+same request - nss_wifi_mesh_tx_buf() reaches that same function - and
+does not act on it, so a frame the router generates itself leaves with
+the pseudo-header sum still in the field.
+
+The advertisement is also what suppresses every software fallback:
+skb_csum_hwoffload_help() in the core sees a checksum bit in
+netif_skb_features() and declines, and the IS_HW_CSUM_NOT_ENABLED()
+guards in ieee80211_tx_skb_fixup() and ieee80211_mesh_xmit_fast() are
+false. Captured on both ends of an 802.11s link, every DHCP OFFER and
+DNS reply the router sourced towards a peer carried udp.check = the
+bare pseudo-header sum; busybox udhcpc discards those without a log
+line in d4_recv_raw_packet(), so a peer that re-joins never completes
+DHCP again. Forwarded traffic is unaffected - only locally generated
+frames are CHECKSUM_PARTIAL.
+
+Clear the feature for a mesh vdev whose data path is the NSS firmware.
+SUPPORTS_MESH_NSS_OFFLOAD is set only under
+ab->nss.mesh_nss_offload_enabled, so a mesh vdev that still transmits
+through wifili or the host path keeps the offload. Clearing before
+hw_features is computed keeps it out of ethtool's changeable set as
+well, so the broken advertisement cannot be restored by hand.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+
+diff --git a/net/mac80211/iface.c b/net/mac80211/iface.c
+index 6611ecf..3eadea6 100644
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@ -2397,6 +2397,14 @@ int ieee80211_if_add(struct ieee80211_local *local, const char *name,
+ 		    ieee80211_hw_check(&local->hw, SUPPORTS_TX_ENCAP_OFFLOAD))
+ 			ndev->features |= NETIF_F_HW_CSUM;
+ 
++		/*
++		 * Nothing behind the NSS mesh encap node completes a
++		 * CHECKSUM_PARTIAL: the placeholder sum reaches the air.
++		 */
++		if (type == NL80211_IFTYPE_MESH_POINT &&
++		    ieee80211_hw_check(&local->hw, SUPPORTS_MESH_NSS_OFFLOAD))
++			ndev->features &= ~NETIF_F_HW_CSUM;
++
+ 		ndev->hw_features |= ndev->features &
+ 					MAC80211_SUPPORTED_FEATURES_TX;
+ 		sdata->vif.netdev_features = local->hw.netdev_features;

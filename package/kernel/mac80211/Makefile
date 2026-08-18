@@ -135,7 +135,8 @@ define KernelPackage/mac80211
   TITLE:=Linux 802.11 Wireless Networking Stack
   # +kmod-crypto-cmac is a runtime only dependency of net/mac80211/aes_cmac.c
   DEPENDS+= +kmod-cfg80211 +kmod-crypto-cmac +kmod-crypto-ccm +kmod-crypto-gcm +hostapd-common \
-	+ATH11K_NSS_SUPPORT:kmod-qca-nss-drv
+	+ATH11K_NSS_SUPPORT:kmod-qca-nss-drv \
+	+ATH11K_NSS_MESH_SUPPORT:kmod-qca-nss-drv-wifi-meshmgr
   KCONFIG:=\
 	CONFIG_AVERAGE=y
   FILES:= $(PKG_BUILD_DIR)/net/mac80211/mac80211.ko
@@ -310,7 +311,19 @@ MAKE_OPTS:= \
 # NOSTDINC_FLAGS (Makefile.kernel), so the staged qca-nss-drv include path
 # must travel via CFLAGS.
 ifdef CONFIG_ATH11K_NSS_SUPPORT
-  MAKE_OPTS += CFLAGS="-I$(STAGING_DIR)/usr/include/qca-nss-drv"
+  # qca-nss-clients staging carries nss_wifi_meshmgr.h for the ath11k
+  # mesh offload path; the directory only exists once qca-nss-clients is
+  # staged, which the kmod-qca-nss-drv-wifi-meshmgr dependency guarantees.
+  # The 11.4 firmware line uses older wifili exception metadata: the
+  # ath11k NSS patches key the differing decode paths on
+  # CONFIG_NSS_FIRMWARE_VERSION_11_4, which kbuild does not export to
+  # external modules, so pass it explicitly.
+  # The qca-nss-drv export headers gate NSS firmware-version dependent
+  # struct fields on the UNPREFIXED NSS_FIRMWARE_VERSION_* macros (the drv
+  # itself builds with them). ath11k must see the same definitions or the
+  # shared wifili message layouts (e.g. the per-peer stats array stride)
+  # silently diverge from what the driver and firmware fill.
+  MAKE_OPTS += CFLAGS="-I$(STAGING_DIR)/usr/include/qca-nss-drv$(if $(CONFIG_ATH11K_NSS_MESH_SUPPORT), -I$(STAGING_DIR)/usr/include/qca-nss-clients)$(if $(CONFIG_NSS_FIRMWARE_VERSION_11_4), -DCONFIG_NSS_FIRMWARE_VERSION_11_4 -DNSS_FIRMWARE_VERSION_11_4)$(if $(CONFIG_NSS_FIRMWARE_VERSION_12_5), -DNSS_FIRMWARE_VERSION_12_5)"
 endif
 
 define ConfigVars
@@ -380,6 +393,9 @@ ifdef CONFIG_ATH11K_NSS_SUPPORT
 	$(foreach driver,$(NSS_PATCH),
 		$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/nss/$(driver),nss/$(driver)/)
 	)
+ifdef CONFIG_ATH11K_NSS_MESH_SUPPORT
+	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/nss/mesh,nss/mesh/)
+endif
 endif
 	$(if $(QUILT),touch $(PKG_BUILD_DIR)/.quilt_used)
 endef
@@ -402,6 +418,9 @@ ifdef CONFIG_ATH11K_NSS_SUPPORT
 	$(foreach driver,$(NSS_PATCH),
 		$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/nss/$(driver),nss/$(driver)/)
 	)
+ifdef CONFIG_ATH11K_NSS_MESH_SUPPORT
+	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/nss/mesh,nss/mesh/)
+endif
 endif
 endef
 
