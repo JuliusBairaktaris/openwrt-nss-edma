@@ -36,6 +36,7 @@ PKG_CONFIG_DEPENDS:= \
 	CONFIG_PACKAGE_MAC80211_DEBUGFS \
 	CONFIG_PACKAGE_MAC80211_MESH \
 	CONFIG_PACKAGE_MAC80211_TRACING \
+	CONFIG_PACKAGE_MAC80211_NSS_SUPPORT \
 	CONFIG_PACKAGE_IWLWIFI_DEBUG \
 	CONFIG_PACKAGE_IWLWIFI_DEBUGFS \
 	CONFIG_PACKAGE_RTLWIFI_DEBUG \
@@ -43,6 +44,9 @@ PKG_CONFIG_DEPENDS:= \
 include $(INCLUDE_DIR)/package.mk
 
 WMENU:=Wireless Drivers
+
+# NSS Wi-Fi offload patch sets (applied only with CONFIG_ATH11K_NSS_SUPPORT)
+NSS_PATCH:=subsys ath11k
 
 define KernelPackage/mac80211/Default
   SUBMENU:=$(WMENU)
@@ -130,7 +134,8 @@ define KernelPackage/mac80211
   $(call KernelPackage/mac80211/Default)
   TITLE:=Linux 802.11 Wireless Networking Stack
   # +kmod-crypto-cmac is a runtime only dependency of net/mac80211/aes_cmac.c
-  DEPENDS+= +kmod-cfg80211 +kmod-crypto-cmac +kmod-crypto-ccm +kmod-crypto-gcm +hostapd-common
+  DEPENDS+= +kmod-cfg80211 +kmod-crypto-cmac +kmod-crypto-ccm +kmod-crypto-gcm +hostapd-common \
+	+ATH11K_NSS_SUPPORT:kmod-qca-nss-drv
   KCONFIG:=\
 	CONFIG_AVERAGE=y
   FILES:= $(PKG_BUILD_DIR)/net/mac80211/mac80211.ko
@@ -140,6 +145,14 @@ endef
 
 define KernelPackage/mac80211/config
   if PACKAGE_kmod-mac80211
+
+	config PACKAGE_MAC80211_NSS_SUPPORT
+		bool "Enable NSS offload support in mac80211"
+		depends on PACKAGE_kmod-qca-nss-drv
+		default y
+		help
+		  Compile mac80211 with support for handing vifs over to the
+		  Qualcomm NSS cores (required for ath11k NSS Wi-Fi offload).
 
 	config PACKAGE_MAC80211_DEBUGFS
 		bool "Export mac80211 internals in DebugFS"
@@ -282,6 +295,8 @@ ifeq ($(BUILD_VARIANT),smallbuffers)
 	C_DEFINES+= -DCONFIG_ATH10K_SMALLBUFFERS
 endif
 
+config-$(CONFIG_PACKAGE_MAC80211_NSS_SUPPORT) += MAC80211_NSS_SUPPORT
+
 MAKE_OPTS:= \
 	$(subst -C $(LINUX_DIR),-C "$(PKG_BUILD_DIR)",$(KERNEL_MAKEOPTS)) \
 	EXTRA_CFLAGS="-I$(PKG_BUILD_DIR)/include $(IREMAP_CFLAGS) $(C_DEFINES)" \
@@ -290,6 +305,13 @@ MAKE_OPTS:= \
 	KLIB=$(TARGET_MODULES_DIR) \
 	KERNEL_SUBLEVEL=$(lastword $(subst ., ,$(KERNEL_PATCHVER))) \
 	KBUILD_LDFLAGS_MODULE_PREREQ=
+
+# kbuild >= 6.15 ignores EXTRA_CFLAGS, and backports folds $(CFLAGS) into
+# NOSTDINC_FLAGS (Makefile.kernel), so the staged qca-nss-drv include path
+# must travel via CFLAGS.
+ifdef CONFIG_ATH11K_NSS_SUPPORT
+  MAKE_OPTS += CFLAGS="-I$(STAGING_DIR)/usr/include/qca-nss-drv"
+endif
 
 define ConfigVars
 $(subst $(space),,$(foreach opt,$(config-$(1)),CPTCFG_$(opt)=$(1)
@@ -354,6 +376,11 @@ define Build/Patch
 	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/mwl,mwl/)
 	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/brcm,brcm/)
 	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/rtl,rtl/)
+ifdef CONFIG_ATH11K_NSS_SUPPORT
+	$(foreach driver,$(NSS_PATCH),
+		$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/nss/$(driver),nss/$(driver)/)
+	)
+endif
 	$(if $(QUILT),touch $(PKG_BUILD_DIR)/.quilt_used)
 endef
 
@@ -371,6 +398,11 @@ define Quilt/Refresh/Package
 	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/mwl,mwl/)
 	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/brcm,brcm/)
 	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/rtl,rtl/)
+ifdef CONFIG_ATH11K_NSS_SUPPORT
+	$(foreach driver,$(NSS_PATCH),
+		$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/nss/$(driver),nss/$(driver)/)
+	)
+endif
 endef
 
 define Build/Compile
@@ -392,6 +424,15 @@ define Build/InstallDev
 	rm -f $(1)/usr/include/mac80211-backport/linux/module.h
 endef
 
+
+ifdef CONFIG_ATH11K_NSS_SUPPORT
+define KernelPackage/ath11k/install
+	$(INSTALL_DIR) $(1)/etc/init.d $(1)/etc/config $(1)/usr/bin
+	$(INSTALL_BIN) ./files/qca-nss-pbuf.init $(1)/etc/init.d/qca-nss-pbuf
+	$(INSTALL_DATA) ./files/pbuf.uci $(1)/etc/config/pbuf
+	$(INSTALL_BIN) ./files/nss_diag.sh $(1)/usr/bin/nss_diag
+endef
+endif
 
 $(eval $(foreach drv,$(PKG_DRIVERS),$(call KernelPackage,$(drv))))
 $(eval $(call KernelPackage,cfg80211))

@@ -1,0 +1,110 @@
+ath11k: give the NSS helpers internal linkage
+
+Eleven functions added by the NSS patches in this series - the wifili
+event and exception callbacks, the pdev init/start/deinit helpers, the
+PPDU stats copy helpers and the AP arvif lookup - are called only from
+the file that defines them, but were left with external linkage and no
+prototype. ath11k_init()/ath11k_exit() are in the same state.
+
+Mark them static. No behaviour change; it keeps symbols the NSS
+offload path invents out of the module's global namespace and silences
+the matching missing-prototype warnings.
+
+The patch was previously called "add kernel 6_12", which described
+nothing it does: none of its hunks is kernel-version dependent.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+
+diff --git a/drivers/net/wireless/ath/ath11k/dp_rx.c b/drivers/net/wireless/ath/ath11k/dp_rx.c
+index 62b8af6..939ade2 100644
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
+@@ -1741,7 +1741,7 @@ struct htt_ppdu_stats_info *ath11k_dp_htt_get_ppdu_desc(struct ath11k *ar,
+ 	return ppdu_info;
+ }
+ 
+-void ath11k_copy_to_delay_stats(struct ath11k_peer *peer,
++static void ath11k_copy_to_delay_stats(struct ath11k_peer *peer,
+ 				  struct htt_ppdu_user_stats* usr_stats)
+ {
+ 	peer->ppdu_stats_delayba.reserved0 = usr_stats->rate.reserved0;
+@@ -1756,7 +1756,7 @@ void ath11k_copy_to_delay_stats(struct ath11k_peer *peer,
+ 	peer->delayba_flag = true;
+ }
+ 
+-void ath11k_copy_to_bar(struct ath11k_peer *peer,
++static void ath11k_copy_to_bar(struct ath11k_peer *peer,
+ 			struct htt_ppdu_user_stats* usr_stats)
+ {
+ 	usr_stats->rate.reserved0 = peer->ppdu_stats_delayba.reserved0;
+diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
+index b5abce3..cd4f988 100644
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -720,7 +720,7 @@ u8 ath11k_mac_get_target_pdev_id(struct ath11k *ar)
+ 		return ar->ab->target_pdev_ids[0].pdev_id;
+ }
+ 
+-struct ath11k_vif *ath11k_mac_get_ap_arvif_by_addr(struct ath11k_base *ab,
++static struct ath11k_vif *ath11k_mac_get_ap_arvif_by_addr(struct ath11k_base *ab,
+ 						   const u8 *addr)
+ {
+ 	int i;
+diff --git a/drivers/net/wireless/ath/ath11k/nss.c b/drivers/net/wireless/ath/ath11k/nss.c
+index 27dfd70..907a000 100644
+--- a/drivers/net/wireless/ath/ath11k/nss.c
++++ b/drivers/net/wireless/ath/ath11k/nss.c
+@@ -318,7 +318,7 @@ static void ath11k_nss_peer_mem_free(struct ath11k_base *ab, u32 peer_id)
+ 
+ /*-----------------------------Events/Callbacks------------------------------*/
+ 
+-void ath11k_nss_wifili_event_receive(struct ath11k_base *ab, struct nss_wifili_msg *msg)
++static void ath11k_nss_wifili_event_receive(struct ath11k_base *ab, struct nss_wifili_msg *msg)
+ {
+ 	u32 msg_type = msg->cm.type;
+ 	enum nss_cmn_response response = msg->cm.response;
+@@ -422,7 +422,7 @@ void ath11k_nss_wifili_event_receive(struct ath11k_base *ab, struct nss_wifili_m
+ 	}
+ }
+ 
+-void ath11k_nss_process_mic_error(struct ath11k_base *ab, struct sk_buff *skb)
++static void ath11k_nss_process_mic_error(struct ath11k_base *ab, struct sk_buff *skb)
+ {
+ 	struct ath11k_vif *arvif;
+ 	struct ath11k *ar;
+@@ -516,7 +516,7 @@ ath11k_nss_wifili_ext_callback_fn(struct ath11k_base *ab, struct sk_buff *skb,
+ 	}
+ }
+ 
+-void ath11k_nss_vdev_cfg_cb(void *app_data, struct nss_cmn_msg *msg)
++static void ath11k_nss_vdev_cfg_cb(void *app_data, struct nss_cmn_msg *msg)
+ {
+ 	struct ath11k_vif *arvif = (struct ath11k_vif *)app_data;
+ 
+@@ -3124,7 +3124,7 @@ void ath11k_nss_peer_stats_enable(struct ath11k *ar)
+ 			     ATH11K_NSS_STATS_ENABLE);
+ }
+ 
+-int ath11k_nss_pdev_init(struct ath11k_base *ab, int radio_id)
++static int ath11k_nss_pdev_init(struct ath11k_base *ab, int radio_id)
+ {
+ 	struct ath11k *ar = ab->pdevs[radio_id].ar;
+ 	struct nss_wifili_pdev_init_msg *pdevmsg;
+@@ -3244,7 +3244,7 @@ dealloc:
+ /* TODO : Check if start, reset and stop messages can be done using single function as
+  * body is similar, having it now for clarity */
+ 
+-int ath11k_nss_start(struct ath11k_base *ab)
++static int ath11k_nss_start(struct ath11k_base *ab)
+ {
+ 	struct nss_wifili_msg *wlmsg = NULL;
+ 	nss_wifili_msg_callback_t msg_cb;
+@@ -3409,7 +3409,7 @@ free:
+ 	return ret;
+ }
+ 
+-int ath11k_nss_pdev_deinit(struct ath11k_base *ab, int radio_id)
++static int ath11k_nss_pdev_deinit(struct ath11k_base *ab, int radio_id)
+ {
+ 	struct ath11k *ar = ab->pdevs[radio_id].ar;
+ 	struct nss_wifili_pdev_deinit_msg *deinit;
