@@ -638,6 +638,9 @@ static int ppe_flow_alloc_ingress(struct qca_ppe_priv *priv, int iport,
 	regmap_write(priv->regmap, PPE_L3_VSI_TBL(vsi),
 		     PPE_L3_VSI_IF_VALID | FIELD_PREP(PPE_L3_VSI_IF_INDEX, vsi));
 
+	/* Frames injected on the conduit are routed against this interface. */
+	ppe_port_l3_if_set(priv, QCA_PPE_CPU_PORT, vsi);
+
 	return 0;
 }
 
@@ -770,6 +773,7 @@ static void ppe_flow_free_ingress(struct qca_ppe_priv *priv,
 	}
 
 	if (entry->l3_if >= 0 && !--priv->l3_if_ref[entry->l3_if]) {
+		ppe_port_l3_if_set(priv, QCA_PPE_CPU_PORT, PPE_L3_IF_INVALID);
 		regmap_write(priv->regmap, PPE_L3_VSI_TBL(entry->l3_if), 0);
 		ppe_tbl_clear(priv, PPE_IN_L3_IF_TBL(entry->l3_if),
 			      PPE_L3_IF_WORDS);
