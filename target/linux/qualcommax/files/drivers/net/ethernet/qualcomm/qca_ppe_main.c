@@ -352,6 +352,33 @@ static void ppe_port_vsi_set(struct qca_ppe_priv *priv, int port, u32 vsi)
 			     val[i]);
 }
 
+/* A frame the host hands to the conduit arrives on the CPU port carrying no
+ * switch port of its own, so the routing stage has no interface to work from and
+ * a ROUTE flow entry never applies to it. Binding an L3 interface to the CPU port
+ * supplies that context. The binding is the L3 interface alone: giving the CPU
+ * port a VSI supplies it too, but a port-default VSI reclassifies every
+ * host-originated frame and leaves PPPoE discovery without a concentrator.
+ */
+void ppe_port_l3_if_set(struct qca_ppe_priv *priv, int port, u32 l3_if)
+{
+	u32 val[3];
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(val); i++)
+		regmap_read(priv->regmap, PPE_L3_VP_PORT_TBL(port) + i * 4,
+			    &val[i]);
+
+	val[0] &= ~(PPE_L3_VP_L3_IF_VALID | PPE_L3_VP_L3_IF_INDEX);
+	if (l3_if != PPE_L3_IF_INVALID) {
+		val[0] |= PPE_L3_VP_L3_IF_VALID;
+		val[0] |= FIELD_PREP(PPE_L3_VP_L3_IF_INDEX, l3_if);
+	}
+
+	for (i = 0; i < ARRAY_SIZE(val); i++)
+		regmap_write(priv->regmap, PPE_L3_VP_PORT_TBL(port) + i * 4,
+			     val[i]);
+}
+
 #define PPE_FDB_OP_RETRIES	100
 
 /* The result register reports a command id and how many results are queued

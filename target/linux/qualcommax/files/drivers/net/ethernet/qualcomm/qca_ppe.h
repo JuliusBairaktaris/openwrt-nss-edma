@@ -591,6 +591,8 @@
 #define PPE_L3_BASE			0x200000
 
 #define PPE_L3_VP_PORT_TBL(port)	(PPE_L3_BASE + 0x1000 + (port) * 0x10)
+#define   PPE_L3_VP_L3_IF_VALID		BIT(0)
+#define   PPE_L3_VP_L3_IF_INDEX		GENMASK(8, 1)
 #define   PPE_L3_VP_VSI_VALID		BIT(9)
 #define   PPE_L3_VP_VSI		GENMASK(14, 10)
 
@@ -1107,6 +1109,7 @@
 
 #define PPE_VSI_MAX			32
 #define PPE_VSI_INVALID			U32_MAX
+#define PPE_L3_IF_INVALID		U32_MAX
 #define PPE_DEFAULT_MTU			1514
 #define PPE_MAX_FRAME_SIZE		12288
 #define PPE_AGE_UNIT_MS			8000
@@ -1429,6 +1432,7 @@ int ppe_token_bucket(unsigned long clk, u32 slot, u64 rate_bps, u32 burst,
 int ppe_vsi_alloc(struct qca_ppe_priv *priv);
 void ppe_vsi_free(struct qca_ppe_priv *priv, u32 vsi);
 void ppe_vsi_member_set(struct qca_ppe_priv *priv, u32 vsi, u32 portmask);
+void ppe_port_l3_if_set(struct qca_ppe_priv *priv, int port, u32 l3_if);
 
 int ppe_xlt_idx_alloc(struct qca_ppe_priv *priv);
 void ppe_xlt_idx_free(struct qca_ppe_priv *priv, int *idx);
