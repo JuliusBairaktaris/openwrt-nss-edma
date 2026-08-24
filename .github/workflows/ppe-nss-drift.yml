@@ -1,0 +1,52 @@
+name: ppe-nss drift guard
+
+# ppe-nss carries the NSS Wi-Fi offload work on top of the PPE hardware offload
+# series that PR #24806 publishes as ppe-flow-offload. The series is curated and
+# rewritten in place, so the two branches drift the moment ppe-flow-offload is
+# rebased without ppe-nss following it.
+#
+# The invariant is ancestry: every ppe-flow-offload commit must be reachable from
+# ppe-nss. Ancestry makes the shared portion byte-identical by construction, which
+# a file comparison cannot promise.
+
+on:
+  push:
+    branches: [ppe-nss]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ancestry:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: ppe-flow-offload is an ancestor of ppe-nss
+        run: |
+          git fetch --no-tags origin ppe-flow-offload
+
+          pr=$(git rev-parse FETCH_HEAD)
+          echo "ppe-flow-offload $pr"
+          echo "ppe-nss          $(git rev-parse HEAD)"
+
+          if git merge-base --is-ancestor "$pr" HEAD; then
+            echo "ppe-nss carries the series unchanged, $(git rev-list --count "$pr"..HEAD) commit(s) on top"
+            exit 0
+          fi
+
+          base=$(git merge-base "$pr" HEAD)
+          cat >&2 <<EOF
+          ppe-nss has drifted from ppe-flow-offload.
+
+          Common ancestor: $base
+          Series commits missing from ppe-nss:
+          $(git log --oneline "$base".."$pr")
+
+          Rebase ppe-nss onto ppe-flow-offload, keeping the NSS commits on top:
+            git rebase --onto ppe-flow-offload $base ppe-nss
+          EOF
+          exit 1
