@@ -1602,6 +1602,11 @@ static void qca_ppe_get_stats64(struct dsa_switch *ds, int port,
 	s->collisions = MIB(TXCOLLISIONS);
 
 	spin_unlock_bh(&priv->mib_lock);
+
+	/* The MIB cannot see a frame dropped on its way to the MAC, and under
+	 * the NSS data plane those are the only record of a refused transmit.
+	 */
+	s->tx_dropped = dsa_to_port(ds, port)->user->stats.tx_dropped;
 }
 
 #undef MIB
