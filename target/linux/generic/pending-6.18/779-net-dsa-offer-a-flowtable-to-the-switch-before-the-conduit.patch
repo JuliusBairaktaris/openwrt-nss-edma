@@ -1,0 +1,49 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Date: Tue, 25 Aug 2026 13:40:00 +0200
+Subject: [PATCH] net: dsa: offer a flowtable to the switch before the conduit
+
+A netfilter flowtable bound to a DSA user port reaches hardware through
+dsa_user_setup_ft_block(), which forwards the block to the conduit netdev.
+That route serves a flow engine that sits on the conduit, as mtk_eth's
+does. TC_SETUP_FT is the only tc setup type handled this way: every other
+type falls through to ds->ops->port_setup_tc, so a switch that owns its
+flow engine is never offered the flowtable at all.
+
+Reaching back from the conduit's ndo_setup_tc through conduit->dsa_ptr is
+not a substitute: dsa_tree_teardown() tears down the conduit before the
+ports, so a block unbound while the tree goes down can no longer be
+resolved to the port it was bound on.
+
+Offer TC_SETUP_FT to the switch first and keep the conduit forward as the
+fallback. Every driver implementing .port_setup_tc returns -EOPNOTSUPP
+for a setup type it does not handle, so a conduit-side flow engine is
+reached exactly as before.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/net/dsa/user.c
++++ b/net/dsa/user.c
+@@ -1734,11 +1734,22 @@ static int dsa_user_setup_tc(struct net_
+ {
+ 	struct dsa_port *dp = dsa_user_to_port(dev);
+ 	struct dsa_switch *ds = dp->ds;
++	int err;
+ 
+ 	switch (type) {
+ 	case TC_SETUP_BLOCK:
+ 		return dsa_user_setup_tc_block(dev, type_data);
+ 	case TC_SETUP_FT:
++		/* A switch that owns the flow tables answers for itself; only
++		 * a conduit-side flow engine needs the block forwarded, and
++		 * that forward is gone by the time the port is torn down.
++		 */
++		if (ds->ops->port_setup_tc) {
++			err = ds->ops->port_setup_tc(ds, dp->index, type,
++						     type_data);
++			if (err != -EOPNOTSUPP)
++				return err;
++		}
+ 		return dsa_user_setup_ft_block(ds, dp->index, type_data);
+ 	default:
+ 		break;
