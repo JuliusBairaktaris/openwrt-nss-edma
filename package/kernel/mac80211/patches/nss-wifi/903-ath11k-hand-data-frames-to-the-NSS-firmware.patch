@@ -1,0 +1,141 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] ath11k: hand data frames to the NSS firmware
+
+The firmware owns the transmit ring, so this driver cannot put a frame on
+it, and the handover left transmit refused. A frame goes to the firmware
+instead, addressed to the virtual device the firmware knows the interface
+by, and a frame the firmware hands up names the same device.
+
+The virtual device is registered once the interface's encapsulation mode
+is set and released before the interface goes, so the firmware never names
+one whose peers are already gone. Only an already-encapsulated frame is
+handed over: the hardware builds the 802.11 header from an ethernet frame,
+so a frame still carrying its own header is not one the firmware would read
+the same way. Management leaves over the control path above this, unchanged.
+
+The interface number the registration returns is what a transmitted frame
+is addressed to, so it is kept with the interface rather than looked up per
+frame.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -374,6 +374,9 @@ struct ath11k_vif {
+ 	u8 hal_addr_search_flags;
+ 	u8 search_type;
+ 
++	/* What the NSS firmware calls this interface, or -1. */
++	int nss_ifnum;
++
+ 	struct ath11k *ar;
+ 	struct ieee80211_vif *vif;
+ 
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <net/mac80211.h>
++#include <linux/soc/qcom/nss_wifi.h>
+ #include <net/cfg80211.h>
+ #include <linux/etherdevice.h>
+ #include <linux/bitfield.h>
+@@ -6216,14 +6217,17 @@ static void ath11k_mac_op_tx(struct ieee
+ 		return;
+ 	}
+ 
+-	/* The transmit ring belongs to the firmware, which reaps its own
+-	 * completions by a cookie it minted and resolves that cookie to one
+-	 * of its own descriptors. A frame the host puts there completes as a
+-	 * descriptor the firmware never handed out. Management has already
+-	 * left over the control path above.
++	/* The transmit ring belongs to the firmware, so a frame goes to the
++	 * virtual device the firmware knows this interface by instead. Only
++	 * an already-encapsulated one: the hardware builds the 802.11 header
++	 * from the ethernet frame, and anything still carrying its own is a
++	 * frame nothing downstream of here would read the same way.
++	 * Management has already left over the control path above.
+ 	 */
+ 	if (ath11k_nss_offload) {
+-		ieee80211_free_txskb(ar->hw, skb);
++		if (!(info_flags & IEEE80211_TX_CTL_HW_80211_ENCAP) ||
++		    nss_wifi_vdev_tx(arvif->nss_ifnum, skb))
++			ieee80211_free_txskb(ar->hw, skb);
+ 		return;
+ 	}
+ 
+@@ -6551,6 +6555,37 @@ static int ath11k_mac_setup_vdev_create_
+ 	return 0;
+ }
+ 
++/* Give the NSS firmware a virtual device for this interface.
++ *
++ * The firmware addresses a transmitted frame to a virtual device and names
++ * the same device on a frame it hands up, so the network device is what the
++ * registration binds the number to. Frames across it are ethernet, which is
++ * what the hardware encapsulation and decapsulation this driver has already
++ * been told to use produce.
++ */
++static void ath11k_nss_vdev_register(struct ath11k_vif *arvif,
++				     struct ieee80211_vif *vif)
++{
++	struct ath11k *ar = arvif->ar;
++	struct wireless_dev *wdev;
++	int ret;
++
++	wdev = ieee80211_vif_to_wdev(vif);
++	if (!wdev || !wdev->netdev)
++		return;
++
++	ret = nss_wifi_vdev_register(wdev->netdev, ar->pdev_idx, arvif->vdev_id,
++				     vif->addr,
++				     vif->type == NL80211_IFTYPE_AP);
++	if (ret < 0) {
++		ath11k_warn(ar->ab, "failed to give vdev %d to the NSS firmware: %d\n",
++			    arvif->vdev_id, ret);
++		return;
++	}
++
++	arvif->nss_ifnum = ret;
++}
++
+ static void ath11k_mac_op_update_vif_offload(struct ieee80211_hw *hw,
+ 					     struct ieee80211_vif *vif)
+ {
+@@ -6797,6 +6832,7 @@ static int ath11k_mac_op_add_interface(s
+ 
+ 	arvif->ar = ar;
+ 	arvif->vif = vif;
++	arvif->nss_ifnum = -1;
+ 
+ 	INIT_LIST_HEAD(&arvif->list);
+ 	INIT_WORK(&arvif->bcn_tx_work, ath11k_mac_bcn_tx_work);
+@@ -6882,6 +6918,9 @@ static int ath11k_mac_op_add_interface(s
+ 
+ 	ath11k_mac_op_update_vif_offload(hw, vif);
+ 
++	if (ath11k_nss_offload)
++		ath11k_nss_vdev_register(arvif, vif);
++
+ 	nss = get_num_chains(ar->cfg_tx_chainmask) ? : 1;
+ 	ret = ath11k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id,
+ 					    WMI_VDEV_PARAM_NSS, nss);
+@@ -7064,6 +7103,17 @@ static void ath11k_mac_op_remove_interfa
+ 				    arvif->vdev_id, ret);
+ 	}
+ 
++	/* Before the vdev goes, so the firmware stops naming an interface
++	 * whose peers are already gone.
++	 */
++	if (arvif->nss_ifnum >= 0) {
++		struct wireless_dev *wdev = ieee80211_vif_to_wdev(vif);
++
++		if (wdev && wdev->netdev)
++			nss_wifi_vdev_unregister(wdev->netdev);
++		arvif->nss_ifnum = -1;
++	}
++
+ 	ret = ath11k_mac_vdev_delete(ar, arvif);
+ 	if (ret) {
+ 		ath11k_warn(ab, "failed to delete vdev %d: %d\n",
