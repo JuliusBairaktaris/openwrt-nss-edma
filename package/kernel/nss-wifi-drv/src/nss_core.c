@@ -408,6 +408,12 @@ static int nss_rx_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(nss_rx);
 
+static int nss_wifili_show(struct seq_file *s, void *unused)
+{
+	return nss_wifili_start(s);
+}
+DEFINE_SHOW_ATTRIBUTE(nss_wifili);
+
 /* Leave the switch CPU port with the firmware instead of taking it back.
  *
  * The two data planes share the block and which of them owns the port is a
@@ -571,6 +577,7 @@ static int nss_probe(struct platform_device *pdev)
 				     "load address is outside the region\n");
 
 	platform_set_drvdata(pdev, core);
+	nss_wifili_bind(core);
 
 	core->debugfs = debugfs_create_dir(dev_name(dev), NULL);
 	debugfs_create_file("boot", 0600, core->debugfs, core, &nss_boot_fops);
@@ -578,6 +585,8 @@ static int nss_probe(struct platform_device *pdev)
 	debugfs_create_file("msg_probe", 0400, core->debugfs, core,
 			    &nss_probe_fops);
 	debugfs_create_file("rx", 0400, core->debugfs, core, &nss_rx_fops);
+	debugfs_create_file("wifili_start", 0400, core->debugfs, core,
+			    &nss_wifili_fops);
 	debugfs_create_file("cpu_port_to_fw", 0600, core->debugfs, core,
 			    &nss_fwport_fops);
 
@@ -588,6 +597,7 @@ static void nss_remove(struct platform_device *pdev)
 {
 	struct nss_core *core = platform_get_drvdata(pdev);
 
+	nss_wifili_bind(NULL);
 	debugfs_remove_recursive(core->debugfs);
 }
 
