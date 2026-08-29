@@ -76,6 +76,10 @@ struct nss_wifi_soc {
 int nss_wifi_soc_register(const struct nss_wifi_soc *soc);
 void nss_wifi_soc_unregister(void);
 int nss_wifi_pdev_register(const struct nss_wifi_pdev *pdev);
+int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
+			   const u8 *mac, bool ap);
+void nss_wifi_vdev_unregister(struct net_device *dev);
+int nss_wifi_vdev_tx(int if_num, struct sk_buff *skb);
 #else
 static inline int nss_wifi_soc_register(const struct nss_wifi_soc *soc)
 {
@@ -87,6 +91,21 @@ static inline void nss_wifi_soc_unregister(void)
 }
 
 static inline int nss_wifi_pdev_register(const struct nss_wifi_pdev *pdev)
+{
+	return -ENODEV;
+}
+
+static inline int nss_wifi_vdev_register(struct net_device *dev, u8 radio,
+					 u32 vdev_id, const u8 *mac, bool ap)
+{
+	return -ENODEV;
+}
+
+static inline void nss_wifi_vdev_unregister(struct net_device *dev)
+{
+}
+
+static inline int nss_wifi_vdev_tx(int if_num, struct sk_buff *skb)
 {
 	return -ENODEV;
 }
