@@ -19,6 +19,7 @@
  * message rather than the data plane.
  */
 
+#include <linux/container_of.h>
 #include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
 #include <linux/if_ether.h>
@@ -39,7 +40,18 @@
  */
 #define NSS_WIFILI_RING_ENTRIES		32
 #define NSS_WIFILI_ENTRY_WORDS		8
-#define NSS_WIFILI_TX_DESC		64
+/* Transmit descriptors per pool. The firmware holds one for every frame in
+ * flight and refuses the frame when it cannot get one, silently as far as the
+ * host is concerned - only the firmware's own desc_alloc_fail counter shows
+ * it, and at 64 it read three times the number of frames that got through.
+ * A descriptor is under 128 bytes, so this many still fit the page below.
+ */
+#define NSS_WIFILI_TX_DESC		512
+
+/* One page for the descriptors and one for the extension descriptors: the two
+ * kinds are carved at different strides out of whichever page each starts on,
+ * so a shared page leaves one of the pools without one.
+ */
 #define NSS_WIFILI_TX_DESC_MEM		SZ_64K
 
 /* The receive buffer the hardware would be programmed with, and the tag block
@@ -89,6 +101,7 @@ struct nss_wifili_ctx {
 	struct nss_wifili_mem shadow;
 	struct nss_wifili_mem doorbell;
 	struct nss_wifili_mem txdesc;
+	struct nss_wifili_mem txdescext;
 };
 
 /* The one core that runs wifili, and what the WLAN driver said about its
@@ -133,6 +146,9 @@ void nss_wifi_soc_unregister(void)
 	guard(mutex)(&nss_wifili_lock);
 	nss_wifili_have_soc = false;
 	nss_wifili_pdevs = 0;
+
+	/* The WLAN driver is about to free the rings this reaches into. */
+	WRITE_ONCE(nss_wifili_soc.link_desc_return, NULL);
 }
 EXPORT_SYMBOL_GPL(nss_wifi_soc_unregister);
 
@@ -148,6 +164,42 @@ int nss_wifi_pdev_register(const struct nss_wifi_pdev *pdev)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(nss_wifi_pdev_register);
+
+/* The one message the firmware sends unasked that must be acted on.
+ *
+ * It reaps rings holding MSDU-link descriptors it cannot put back, because
+ * the ring that returns one to the idle list stays with the WLAN driver, and
+ * hands each one back here instead. An unreturned descriptor is gone from the
+ * idle list for good, and an empty idle list stops receive on every radio
+ * rather than only on the path that emptied it - so late is the same as never
+ * and this may not be deferred.
+ */
+void nss_wifili_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
+		       u32 len)
+{
+	void (*home)(void *priv, const u32 *buf_addr_info);
+	const struct nss_wifili_msg *m;
+
+	if (ncm->type != NSS_WIFILI_LINK_DESC_INFO_MSG ||
+	    len < offsetof(struct nss_wifili_msg, msg) +
+		  sizeof(struct nss_wifili_soc_linkdesc_buf_info_msg))
+		return;
+
+	/* Counted before the way home is looked up, because whether the
+	 * firmware sends these at all, and how often, is what this rung is
+	 * measuring: there is no receive to lose yet, and no route back until
+	 * the shape of what arrives has been read off the device.
+	 */
+	core->link_desc_seen++;
+
+	home = READ_ONCE(nss_wifili_soc.link_desc_return);
+	if (!home)
+		return;
+
+	m = container_of_const(ncm, struct nss_wifili_msg, cm);
+	home(nss_wifili_soc.priv, (const u32 *)&m->msg.linkdescinfomsg);
+	core->link_desc_returned++;
+}
 
 static void nss_wifili_ring_fill(struct nss_wifili_hal_srng_info *r,
 				 const struct nss_wifi_ring *src)
@@ -497,6 +549,10 @@ int nss_wifili_start(struct seq_file *s)
 	if (ret)
 		goto out;
 
+	ret = nss_wifili_mem_get(core, &w->txdescext, NSS_WIFILI_TX_DESC_MEM);
+	if (ret)
+		goto out;
+
 	m->cm.interface = NSS_INTERFACE_WIFILI;
 	m->cm.type = NSS_WIFILI_INIT_MSG;
 	m->msg.init.hssm.dev_base_addr = nss_wifili_soc.dev_base;
@@ -523,17 +579,56 @@ int nss_wifili_start(struct seq_file *s)
 	nss_wifili_ring_fill(&m->msg.init.reo_exception_ring,
 			     &nss_wifili_soc.reo_exception);
 
+	/* One descriptor pool per radio. The message carries a separate count
+	 * for each, and the firmware reaps a pool per radio whatever the count
+	 * says, so a pool left at zero is one it reaps against and never
+	 * sized.
+	 */
+	m->msg.init.wtdim.num_pool = nss_wifili_pdevs;
 	m->msg.init.wtdim.num_tx_desc = NSS_WIFILI_TX_DESC;
 	m->msg.init.wtdim.num_tx_desc_ext = NSS_WIFILI_TX_DESC;
-	m->msg.init.wtdim.num_pool = 1;
-	m->msg.init.wtdim.num_memaddr = 1;
+	if (nss_wifili_pdevs > 1) {
+		m->msg.init.wtdim.num_tx_desc_2 = NSS_WIFILI_TX_DESC;
+		m->msg.init.wtdim.num_tx_desc_ext_2 = NSS_WIFILI_TX_DESC;
+	}
+	if (nss_wifili_pdevs > 2) {
+		m->msg.init.wtdim.num_tx_desc_3 = NSS_WIFILI_TX_DESC;
+		m->msg.init.wtdim.num_tx_desc_ext_3 = NSS_WIFILI_TX_DESC;
+	}
+
+	m->msg.init.wtdim.num_memaddr = 2;
 	m->msg.init.wtdim.memory_addr[0] = w->txdesc.dma;
 	m->msg.init.wtdim.memory_size[0] = w->txdesc.size;
-	m->msg.init.wtdim.num_tx_device_limit = NSS_WIFILI_TX_DESC;
+	m->msg.init.wtdim.memory_addr[1] = w->txdescext.dma;
+	m->msg.init.wtdim.memory_size[1] = w->txdescext.size;
+	m->msg.init.wtdim.ext_desc_page_num = 1;
+	m->msg.init.wtdim.num_tx_device_limit = NSS_WIFILI_TX_DESC *
+						nss_wifili_pdevs;
 
 	m->msg.init.target_type = nss_wifili_soc.target_type;
 	m->msg.init.wrip.tlv_size = nss_wifili_soc.tlv_size;
 	m->msg.init.wrip.rx_buf_len = nss_wifili_soc.rx_buf_len;
+
+	/* A fault in the firmware's transmit path names a descriptor by a page
+	 * and an offset within it, both of which are the host's. Print what was
+	 * handed over so a trapped address can be told apart from a stray one.
+	 */
+	dev_info(core->dev,
+		 "wifili: txdesc %pad+%zx ext %pad+%zx, %u pools, %u tcl, %u reo\n",
+		 &w->txdesc.dma, w->txdesc.size, &w->txdescext.dma,
+		 w->txdescext.size, nss_wifili_pdevs, nss_wifili_soc.num_tcl,
+		 nss_wifili_soc.num_reo);
+	for (i = 0; i < nss_wifili_soc.num_tcl; i++)
+		dev_info(core->dev,
+			 "wifili: tcl%d id %u base %#x x%u  txcomp id %u base %#x x%u hw %#x/%#x\n",
+			 i, nss_wifili_soc.tcl[i].id,
+			 nss_wifili_soc.tcl[i].base,
+			 nss_wifili_soc.tcl[i].num_entries,
+			 nss_wifili_soc.txcomp[i].id,
+			 nss_wifili_soc.txcomp[i].base,
+			 nss_wifili_soc.txcomp[i].num_entries,
+			 nss_wifili_soc.txcomp[i].hwreg[0],
+			 nss_wifili_soc.txcomp[i].hwreg[1]);
 
 	ret = nss_msg_send(core, m, offsetof(struct nss_wifili_msg, msg) +
 				    sizeof(m->msg.init));
