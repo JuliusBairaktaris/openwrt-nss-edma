@@ -24,10 +24,13 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_net.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/regulator/consumer.h>
+#include <linux/rtnetlink.h>
 #include <linux/seq_file.h>
+#include <linux/soc/qcom/qca_edma.h>
 
 #include "nss_drv.h"
 
@@ -175,6 +178,62 @@ out:
 	return ret;
 }
 
+/* A running core takes CPU-port delivery away from the host, and the EDMA
+ * conduit is what takes it back. There is one on this SoC, and the switch is
+ * behind it, so it is found rather than described.
+ */
+static const struct of_device_id nss_edma_of_match[] = {
+	{ .compatible = "qualcomm,ipq6018-edma" },
+	{ .compatible = "qualcomm,ipq8074-edma" },
+	{ }
+};
+
+static struct net_device *nss_conduit_get(void)
+{
+	struct device_node *np __free(device_node) =
+		of_find_matching_node(NULL, nss_edma_of_match);
+	struct net_device *dev;
+
+	dev = np ? of_find_net_device_by_node(np) : NULL;
+	if (dev) {
+		dev_hold(dev);
+		put_device(&dev->dev);
+	}
+
+	return dev;
+}
+
+static void nss_conduit_put(void *data)
+{
+	dev_put(data);
+}
+
+/* The firmware leaves its EDMA rings and the queue table wherever it got to,
+ * and a firmware started on them reads descriptors no engine wrote. The
+ * conduit's DMA reset returns the block to its power-on state; it may only
+ * run with the core in reset, and the conduit's driver wants rtnl for it.
+ */
+static void nss_edma_settle(struct nss_core *core)
+{
+	struct net_device *conduit = core->conduit;
+	u32 flags = ETH_RESET_DMA;
+	int ret;
+
+	rtnl_lock();
+	mutex_lock(&core->lock);
+	if (core->edma_stale && !core->loaded) {
+		ret = conduit->ethtool_ops->reset ?
+		      conduit->ethtool_ops->reset(conduit, &flags) :
+		      -EOPNOTSUPP;
+		if (ret)
+			dev_err(core->dev, "EDMA not reset: %d\n", ret);
+		else
+			core->edma_stale = false;
+	}
+	mutex_unlock(&core->lock);
+	rtnl_unlock();
+}
+
 static void nss_core_release(struct nss_core *core)
 {
 	u32 val;
@@ -232,6 +291,13 @@ static void nss_core_halt(void *data)
 	core->running = false;
 
 	nss_rings_stop(core);
+
+	/* The core is in reset by now, so the block may be reset under it.
+	 * This hands the CPU port back.
+	 */
+	core->loaded = false;
+	nss_edma_settle(core);
+
 	nss_mem_free_all(core);
 }
 
@@ -243,6 +309,12 @@ static int nss_core_boot(struct nss_core *core)
 
 	if (core->loaded)
 		return -EBUSY;
+
+	/* Callers run nss_edma_settle() first. */
+	if (core->edma_stale) {
+		dev_err(core->dev, "EDMA not reset since a core last ran\n");
+		return -EAGAIN;
+	}
 
 	ret = nss_clocks_enable(core);
 	if (ret)
@@ -276,6 +348,7 @@ static int nss_core_boot(struct nss_core *core)
 		goto stop;
 
 	core->loaded = true;
+	core->edma_stale = true;
 	nss_core_release(core);
 
 	if (!wait_for_completion_timeout(&core->booted,
@@ -301,6 +374,7 @@ static int nss_boot_set(void *data, u64 val)
 	if (val != 1)
 		return -EINVAL;
 
+	nss_edma_settle(data);
 	return nss_core_boot(data);
 }
 
@@ -452,6 +526,16 @@ static int nss_probe(struct platform_device *pdev)
 	    core->load_addr >= core->region_base + core->region_size)
 		return dev_err_probe(dev, -ERANGE,
 				     "load address is outside the region\n");
+
+	/* Whatever ran before this driver, the block is reset before a boot. */
+	core->conduit = nss_conduit_get();
+	if (!core->conduit)
+		return dev_err_probe(dev, -EPROBE_DEFER, "no EDMA conduit\n");
+	core->edma_stale = true;
+
+	ret = devm_add_action_or_reset(dev, nss_conduit_put, core->conduit);
+	if (ret)
+		return ret;
 
 	platform_set_drvdata(pdev, core);
 

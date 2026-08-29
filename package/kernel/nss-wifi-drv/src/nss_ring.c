@@ -17,6 +17,7 @@
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
 #include <linux/seq_file.h>
+#include <linux/soc/qcom/qca_edma.h>
 #include <linux/spinlock.h>
 
 #include "nss_drv.h"
@@ -233,7 +234,7 @@ static int nss_poll_n2h(struct napi_struct *napi, int budget)
 	}
 
 	if (done)
-		WRITE_ONCE(map->n2h_hlos_index[qid], ring->hlos_index);
+	WRITE_ONCE(map->n2h_hlos_index[qid], ring->hlos_index);
 
 	/* Whatever came back leaves the firmware that much shorter. */
 	nss_refill(core, done);
@@ -260,6 +261,12 @@ static int nss_poll_coredump(struct napi_struct *napi, int budget)
 	dev_err(core->dev, "core %u has crashed; leaving it stopped\n",
 		core->id);
 	nss_log_dump(core, "coredump");
+
+	/* The dead core no longer services the CPU-port queues it took. The
+	 * host takes them back here rather than at detach: keeping the box
+	 * routing through a firmware fault is why this driver does not panic.
+	 */
+	qca_edma_cpu_queues_to_host(core->conduit);
 
 	napi_complete(napi);
 
