@@ -134,17 +134,100 @@ static void nss_cpu_port_reclaim(struct nss_core *core)
 	dev_info(core->dev, "CPU-port queues returned to the host\n");
 }
 
+/* Keep every line the firmware writes, not just the last ringful.
+ *
+ * The block the firmware asks for at boot fits thirty-two entries and a fault
+ * fills far more than that, so by the time the host is told a fault happened
+ * the beginning of it - the part that says what went wrong - has been
+ * overwritten by the lines that follow it.
+ *
+ * So the host copies entries out as they appear, appending anything new to a
+ * buffer big enough for a whole fault. A line is lost if it arrives faster
+ * than the sampling or after the buffer is full, and the readout says how
+ * many rather than hiding it.
+ */
+#define NSS_LOG_SHADOW_ENTRIES	1024
+#define NSS_LOG_SHADOW_POLL_US	200
+
+/* Runs from a timer and from whoever is reading, so it is serialised: two
+ * appenders racing on the same index would write past the buffer.
+ */
+static void nss_log_shadow_take(struct nss_core *core)
+{
+	u32 n = core->log_entries;
+	u32 written, first, i;
+
+	if (!core->log || !core->shadow || !n)
+		return;
+
+	guard(spinlock_irqsave)(&core->shadow_lock);
+
+	written = READ_ONCE(core->log->current_entry);
+	if (written == core->shadow_seen)
+		return;
+
+	/* Anything more than a ring behind is already gone. */
+	first = max(core->shadow_seen, written > n ? written - n : 0);
+
+	for (i = first; i < written; i++) {
+		struct nss_log_entry *src = &core->log->log_ring_buffer[i % n];
+
+		if (core->shadow_held >= NSS_LOG_SHADOW_ENTRIES)
+			break;
+
+		core->shadow[core->shadow_held++] = *src;
+	}
+
+	core->shadow_seen = written;
+}
+
+static enum hrtimer_restart nss_log_shadow_tick(struct hrtimer *t)
+{
+	struct nss_core *core = container_of(t, struct nss_core, shadow_timer);
+
+	nss_log_shadow_take(core);
+	hrtimer_forward_now(t, us_to_ktime(NSS_LOG_SHADOW_POLL_US));
+
+	return HRTIMER_RESTART;
+}
+
+int nss_log_shadow_init(struct nss_core *core)
+{
+	core->shadow = devm_kcalloc(core->dev, NSS_LOG_SHADOW_ENTRIES,
+				    sizeof(*core->shadow), GFP_KERNEL);
+	if (!core->shadow)
+		return -ENOMEM;
+
+	spin_lock_init(&core->shadow_lock);
+	hrtimer_setup(&core->shadow_timer, nss_log_shadow_tick, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL);
+
+	return 0;
+}
+
+void nss_log_shadow_start(struct nss_core *core)
+{
+	scoped_guard(spinlock_irqsave, &core->shadow_lock) {
+		core->shadow_seen = 0;
+		core->shadow_held = 0;
+	}
+
+	hrtimer_start(&core->shadow_timer, us_to_ktime(NSS_LOG_SHADOW_POLL_US),
+		      HRTIMER_MODE_REL);
+}
+
+void nss_log_shadow_stop(struct nss_core *core)
+{
+	hrtimer_cancel(&core->shadow_timer);
+	nss_log_shadow_take(core);
+}
+
 /* Walk what the firmware has been saying, oldest first.
  *
- * Three things about the ring are the firmware's and not negotiable. Its
- * write position is a free-running count of lines ever written, not an index,
- * so how many are valid follows from it rather than from the ring being full.
- * Each entry's cookie is written last, after the text, so the cookie is what
- * says a slot is complete. And the descriptor's own cookie is written once at
- * boot and left in the core's cache until some later line flushes the line it
- * shares, so it is absent on exactly the boot that went well - the host
- * allocated the block and already knows how many entries fit, so nothing here
- * needs to ask.
+ * The write position is a free-running count of lines ever written, not an
+ * index, so how many are valid follows from it rather than from the ring
+ * being full. The host zeroed the block, so a slot whose cookie does not read
+ * back as NSS_LOG_COOKIE has not been written and is skipped.
  */
 static void nss_log_walk(struct nss_core *core, struct seq_file *s)
 {
@@ -154,12 +237,17 @@ static void nss_log_walk(struct nss_core *core, struct seq_file *s)
 	if (!core->log || !n)
 		return;
 
+	nss_log_shadow_take(core);
+
 	written = READ_ONCE(core->log->current_entry);
-	count = min(written, n);
+	scoped_guard(spinlock_irqsave, &core->shadow_lock)
+		count = core->shadow_held;
+	if (written > count && s)
+		seq_printf(s, "[%u lines arrived faster than they could be kept]\n",
+			   written - count);
 
 	for (i = 0; i < count; i++) {
-		struct nss_log_entry *e =
-			&core->log->log_ring_buffer[(written - count + i) % n];
+		struct nss_log_entry *e = &core->shadow[i];
 
 		if (e->cookie != NSS_LOG_COOKIE)
 			continue;
@@ -184,8 +272,9 @@ int nss_log_show_ring(struct nss_core *core, struct seq_file *s)
 }
 
 /* The only account of a core that has stopped, so it is dumped whenever one
- * does. A retail image compiles out every message but a trap, so a silent
- * ring here is itself the finding: the core stopped without trapping.
+ * does. The ring has been empty on every start observed here and has carried
+ * entries only after a trap, so an empty ring is a result and not a failed
+ * read: the core stopped without trapping.
  */
 void nss_log_dump(struct nss_core *core, const char *why)
 {
