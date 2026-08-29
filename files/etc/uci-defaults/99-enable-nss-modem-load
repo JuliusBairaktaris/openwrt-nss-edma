@@ -1,0 +1,3 @@
+#!/bin/sh
+/etc/init.d/nss-modem-load enable
+exit 0
