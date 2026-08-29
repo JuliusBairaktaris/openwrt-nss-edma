@@ -21,6 +21,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/mutex.h>
 #include <linux/seq_file.h>
+#include <linux/slab.h>
 #include <linux/spinlock.h>
 
 #include "nss_drv.h"
@@ -150,6 +151,36 @@ int nss_msg_send(struct nss_core *core, void *msg, size_t len)
 	return ret;
 }
 
+/* Whether the firmware has a node of this kind to give, and what it calls it.
+ * A type it does not implement is refused at allocation, which is the cheapest
+ * way to find out before a design leans on one.
+ */
+static void nss_alloc_probe(struct nss_core *core, struct seq_file *s,
+			    enum nss_dynamic_interface_type type,
+			    const char *what)
+{
+	struct nss_dynamic_interface_msg m;
+	int if_num, ret;
+
+	memset(&m, 0, sizeof(m));
+	m.cm.interface = NSS_INTERFACE_DYNAMIC;
+	m.cm.type = NSS_DYNAMIC_INTERFACE_ALLOC_NODE;
+	m.msg.alloc_node.type = type;
+	ret = nss_msg_send(core, &m, sizeof(m));
+	if_num = m.msg.alloc_node.if_num;
+	seq_printf(s, "%-14s rc %d response %u error %u if_num %d\n",
+		   what, ret, m.cm.response, m.cm.error, if_num);
+	if (ret)
+		return;
+
+	memset(&m, 0, sizeof(m));
+	m.cm.interface = NSS_INTERFACE_DYNAMIC;
+	m.cm.type = NSS_DYNAMIC_INTERFACE_DEALLOC_NODE;
+	m.msg.dealloc_node.type = type;
+	m.msg.dealloc_node.if_num = if_num;
+	nss_msg_send(core, &m, sizeof(m));
+}
+
 /* Ask the firmware three questions whose answers can only come from it.
  *
  * A message layer with no consumer cannot be shown to work by reading it, and
@@ -191,5 +222,10 @@ int nss_msg_probe(struct nss_core *core, struct seq_file *s)
 	seq_printf(s, "dealloc %d:    rc %d response %u error %u\n",
 		   if_num, ret, m.cm.response, m.cm.error);
 
-	return 0;
+	nss_alloc_probe(core, s, NSS_DYNAMIC_INTERFACE_TYPE_GENERIC_REDIR_N2H,
+			"redir n2h");
+	nss_alloc_probe(core, s, NSS_DYNAMIC_INTERFACE_TYPE_GENERIC_REDIR_H2N,
+			"redir h2n");
+
+	return nss_wifili_probe(core, s);
 }
