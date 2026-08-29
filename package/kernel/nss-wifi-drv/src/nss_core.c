@@ -27,7 +27,9 @@
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/regulator/consumer.h>
+#include <linux/rtnetlink.h>
 #include <linux/seq_file.h>
+#include <linux/soc/qcom/qca_edma.h>
 
 #include "nss_drv.h"
 
@@ -175,6 +177,27 @@ out:
 	return ret;
 }
 
+/* A running core takes CPU-port delivery away from the host, and the EDMA
+ * conduit is what takes it back. There is one on this SoC, and the switch is
+ * behind it, so it is found rather than described.
+ */
+static struct net_device *nss_conduit_get(void)
+{
+	struct net_device *dev;
+
+	rtnl_lock();
+	for_each_netdev(&init_net, dev) {
+		if (qca_edma_netdev_is_conduit(dev)) {
+			dev_hold(dev);
+			rtnl_unlock();
+			return dev;
+		}
+	}
+	rtnl_unlock();
+
+	return NULL;
+}
+
 static void nss_core_release(struct nss_core *core)
 {
 	u32 val;
@@ -232,6 +255,19 @@ static void nss_core_halt(void *data)
 	core->running = false;
 
 	nss_rings_stop(core);
+
+	/* After the rings, because a receive poll still running would find the
+	 * conduit gone underneath it. The core is in reset by now, so the
+	 * firmware-owned rings may be written: this returns the whole block to
+	 * its cold-boot state rather than only the queue table, and a later
+	 * boot starts from the same place this one did.
+	 */
+	if (core->conduit) {
+		qca_edma_fw_baseline_restore(core->conduit);
+		dev_put(core->conduit);
+		core->conduit = NULL;
+	}
+
 	nss_mem_free_all(core);
 }
 
@@ -275,6 +311,15 @@ static int nss_core_boot(struct nss_core *core)
 	if (ret)
 		goto stop;
 
+	/* Taken before the core is released rather than after: a core that is
+	 * running with nowhere to hand the CPU port back to leaves the board
+	 * with no wired path at all, and no way to ask for one.
+	 */
+	core->conduit = nss_conduit_get();
+	if (!core->conduit)
+		return dev_err_probe(core->dev, -ENODEV, "no EDMA conduit\n");
+
+	core->cpu_port_taken = true;
 	core->loaded = true;
 	nss_core_release(core);
 
