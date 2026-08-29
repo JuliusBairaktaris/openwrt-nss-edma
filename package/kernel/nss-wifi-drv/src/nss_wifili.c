@@ -147,8 +147,13 @@ void nss_wifi_soc_unregister(void)
 	nss_wifili_have_soc = false;
 	nss_wifili_pdevs = 0;
 
-	/* The WLAN driver is about to free the rings this reaches into. */
+	/* The WLAN driver is about to free the rings this reaches into, and a
+	 * receive poll that read the callback a moment ago is still holding
+	 * it, so the withdrawal is not complete until that poll has ended.
+	 */
 	WRITE_ONCE(nss_wifili_soc.link_desc_return, NULL);
+	if (nss_wifili_core)
+		nss_rings_quiesce(nss_wifili_core);
 }
 EXPORT_SYMBOL_GPL(nss_wifi_soc_unregister);
 
