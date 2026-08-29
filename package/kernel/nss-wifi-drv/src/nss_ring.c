@@ -219,6 +219,7 @@ static int nss_poll_n2h(struct napi_struct *napi, int budget)
 	struct nss_n2h_ring *ring;
 	struct nss_if_mem_map *map;
 	u32 nss_index, count;
+	int returned = 0;
 	int done = 0;
 	int qid;
 
@@ -241,11 +242,18 @@ static int nss_poll_n2h(struct napi_struct *napi, int budget)
 		struct n2h_descriptor *desc = &ring->desc[ring->hlos_index];
 		struct sk_buff *skb = (struct sk_buff *)(uintptr_t)desc->opaque;
 
-		if (skb) {
+		/* The message buffer comes back on this ring like everything
+		 * else, and is the host's own: it is answered rather than
+		 * freed, and it was never one of the donated buffers.
+		 */
+		if (nss_msg_complete(core, desc)) {
+			/* nothing to release */
+		} else if (skb) {
 			dma_unmap_single(core->dev, NSS_SKB_CB(skb)->dma,
 					 NSS_EMPTY_BUFFER_ALLOC, DMA_FROM_DEVICE);
 			dev_kfree_skb_any(skb);
 			atomic_dec(&core->buffers_queued);
+			returned++;
 		}
 
 		ring->hlos_index = (ring->hlos_index + 1) &
@@ -253,14 +261,15 @@ static int nss_poll_n2h(struct napi_struct *napi, int budget)
 		done++;
 	}
 
-	if (done) {
+	if (done)
 		WRITE_ONCE(map->n2h_hlos_index[qid], ring->hlos_index);
-		if (qid != NSS_N2H_RING_EMPTY_BUF)
-			nss_cpu_port_reclaim(core);
-	}
+
+	/* A frame on a data queue is one the firmware took from the host. */
+	if (returned && qid != NSS_N2H_RING_EMPTY_BUF)
+		nss_cpu_port_reclaim(core);
 
 	/* Whatever came back leaves the firmware that much shorter. */
-	nss_refill(core, done);
+	nss_refill(core, returned);
 
 	if (done < budget) {
 		napi_complete(napi);
