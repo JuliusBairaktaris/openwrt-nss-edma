@@ -307,6 +307,9 @@ struct nss_core {
 	struct nss_n2h_ring n2h[NSS_N2H_RINGS];
 	struct nss_irq_ctx irq[NSS_CAUSE_MAX];
 	struct net_device *ndev;
+	struct net_device *conduit;
+	/* A core has run on the EDMA block since it was last reset. */
+	bool edma_stale;
 
 	atomic_t buffers_queued;
 	struct completion booted;
