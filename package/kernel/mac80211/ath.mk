@@ -12,6 +12,7 @@ PKG_CONFIG_DEPENDS += \
 	CONFIG_ATH9K_TX99 \
 	CONFIG_ATH10K_LEDS \
 	CONFIG_ATH10K_THERMAL \
+	CONFIG_ATH11K_NSS_WIFI \
 	CONFIG_ATH11K_THERMAL \
 	CONFIG_ATH12K_THERMAL \
 	CONFIG_ATH_USER_REGD
@@ -318,7 +319,8 @@ define KernelPackage/ath11k
   URL:=https://wireless.wiki.kernel.org/en/users/drivers/ath11k
   DEPENDS+= +kmod-ath +@DRIVER_11AC_SUPPORT +@DRIVER_11AX_SUPPORT \
   +kmod-crypto-michael-mic +ATH11K_THERMAL:kmod-hwmon-core \
-  +ATH11K_THERMAL:kmod-thermal +kmod-qcom-qmi-helpers
+  +ATH11K_THERMAL:kmod-thermal +kmod-qcom-qmi-helpers \
+  +ATH11K_NSS_WIFI:kmod-nss-wifi-drv
   FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath11k/ath11k.ko
 endef
 
@@ -333,6 +335,20 @@ define KernelPackage/ath11k/config
                bool "Enable thermal sensors and throttling support"
                depends on PACKAGE_kmod-ath11k
                default y if TARGET_qualcommax
+
+       config ATH11K_NSS_WIFI
+               bool "Describe the data-path rings to the NSS firmware"
+               depends on PACKAGE_kmod-ath11k && TARGET_qualcommax
+               default n
+               help
+                 The NSS cores can reap the WLAN hardware's rings
+                 themselves, which takes the Wi-Fi data path off the host.
+                 Say Y to have ath11k describe those rings to the NSS
+                 firmware driver when its data path is set up.
+
+                 Describing is not handing over: nothing moves until the
+                 firmware is started by hand, so an image built with this
+                 still boots with ath11k owning its own data path.
 
 endef
 
