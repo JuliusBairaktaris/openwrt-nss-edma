@@ -12,6 +12,7 @@
 
 #include <linux/clk.h>
 #include <linux/dma-mapping.h>
+#include <linux/hrtimer.h>
 #include <linux/list.h>
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
@@ -314,6 +315,11 @@ struct nss_core {
 	struct nss_if_mem_map *if_map;
 	struct nss_log_descriptor *log;
 	u32 log_entries;
+	struct nss_log_entry *shadow;
+	u32 shadow_seen;
+	u32 shadow_held;
+	struct hrtimer shadow_timer;
+	spinlock_t shadow_lock;
 	struct nss_h2n_ring h2n[NSS_H2N_RINGS];
 	struct nss_n2h_ring n2h[NSS_N2H_RINGS];
 	struct nss_irq_ctx irq[NSS_CAUSE_MAX];
@@ -346,5 +352,8 @@ int nss_wifili_start(struct seq_file *s);
 void nss_wifili_bind(struct nss_core *core);
 int nss_log_show_ring(struct nss_core *core, struct seq_file *s);
 void nss_log_dump(struct nss_core *core, const char *why);
+int nss_log_shadow_init(struct nss_core *core);
+void nss_log_shadow_start(struct nss_core *core);
+void nss_log_shadow_stop(struct nss_core *core);
 
 #endif /* __NSS_DRV_H */
