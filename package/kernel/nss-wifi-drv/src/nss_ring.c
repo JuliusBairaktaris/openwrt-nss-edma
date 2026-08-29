@@ -174,7 +174,15 @@ static void nss_cpu_port_reclaim(struct nss_core *core)
  * many rather than hiding it.
  */
 #define NSS_LOG_SHADOW_ENTRIES	1024
-#define NSS_LOG_SHADOW_POLL_US	200
+/* How often the shadow samples the firmware's write index. A sample that
+ * finds nothing new costs one read, but the timer itself is armed for as long
+ * as a core is loaded, so the rate is a standing cost on a box whose whole
+ * point is not to have one. It is a parameter so the cost can be measured
+ * against the risk of missing a line rather than argued about.
+ */
+static unsigned int nss_log_poll_us = 200;
+module_param_named(log_poll_us, nss_log_poll_us, uint, 0644);
+MODULE_PARM_DESC(log_poll_us, "how often to sample the firmware log ring");
 
 /* Runs from a timer and from whoever is reading, so it is serialised: two
  * appenders racing on the same index would write past the buffer.
@@ -213,7 +221,7 @@ static enum hrtimer_restart nss_log_shadow_tick(struct hrtimer *t)
 	struct nss_core *core = container_of(t, struct nss_core, shadow_timer);
 
 	nss_log_shadow_take(core);
-	hrtimer_forward_now(t, us_to_ktime(NSS_LOG_SHADOW_POLL_US));
+	hrtimer_forward_now(t, us_to_ktime(nss_log_poll_us));
 
 	return HRTIMER_RESTART;
 }
@@ -239,7 +247,7 @@ void nss_log_shadow_start(struct nss_core *core)
 		core->shadow_held = 0;
 	}
 
-	hrtimer_start(&core->shadow_timer, us_to_ktime(NSS_LOG_SHADOW_POLL_US),
+	hrtimer_start(&core->shadow_timer, us_to_ktime(nss_log_poll_us),
 		      HRTIMER_MODE_REL);
 }
 
