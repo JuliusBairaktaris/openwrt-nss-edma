@@ -241,7 +241,6 @@ struct nss_h2n_ring {
 	struct h2n_descriptor *desc;
 	spinlock_t lock;
 	u32 hlos_index;
-	u32 nss_index_local;
 };
 
 struct nss_n2h_ring {
