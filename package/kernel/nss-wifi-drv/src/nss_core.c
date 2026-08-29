@@ -453,6 +453,10 @@ static int nss_rx_show(struct seq_file *s, void *unused)
 			seq_printf(s, "interface %d: %llu\n", i,
 				   core->rx_iface[i]);
 
+	seq_printf(s, "notify: %llu link-desc seen: %llu returned: %llu\n",
+		   core->notify, core->link_desc_seen,
+		   core->link_desc_returned);
+
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(nss_rx);
