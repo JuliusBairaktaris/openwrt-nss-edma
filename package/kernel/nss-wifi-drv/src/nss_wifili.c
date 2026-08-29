@@ -109,7 +109,6 @@ struct nss_wifili_ctx {
  * knows nothing about which core is which, so the binding lives here.
  */
 static struct nss_core *nss_wifili_core;
-static int nss_wifili_vdev_if = -1;
 static struct nss_wifi_soc nss_wifili_soc;
 static struct nss_wifi_pdev nss_wifili_pdev[NSS_WIFILI_MAX_PDEV_NUM_MSG];
 static bool nss_wifili_have_soc;
@@ -434,78 +433,193 @@ static int nss_wifili_radio_alloc(struct nss_core *core,
 	return d.msg.alloc_node.if_num;
 }
 
-/* Put one virtual device on a radio, and take it up.
- *
- * A radio carries no traffic on its own: a frame belongs to a virtual device,
- * and it is the vdev's interface number a received frame arrives under and
- * that a transmitted one is addressed to. This is the smallest thing that
- * shows the firmware will accept one. The numbers a real interface would
- * supply are left at zero, so whatever the firmware insists on shows up as a
- * refusal rather than as a silence.
+/* The operating modes the firmware distinguishes. Only the two a router
+ * builds are named; an access point forwards between its own stations and a
+ * station does not, so the two are not interchangeable.
  */
-static void nss_wifili_vdev_probe(struct nss_core *core, struct seq_file *s,
-				  int radio_if)
+#define NSS_WIFI_VDEV_OPMODE_AP		1
+#define NSS_WIFI_VDEV_OPMODE_STA	3
+
+/* One per WLAN interface. Two radios with a handful of access points each is
+ * what this hardware is asked for; the limit is here so a leak shows up as a
+ * refusal rather than as an interface number nobody owns.
+ */
+#define NSS_WIFILI_VDEV_MAX	16
+
+/* Give a dynamic interface number back to the firmware. */
+static void nss_wifili_vdev_free(struct nss_core *core, int if_num)
 {
 	struct nss_dynamic_interface_msg d;
+
+	memset(&d, 0, sizeof(d));
+	d.cm.interface = NSS_INTERFACE_DYNAMIC;
+	d.cm.type = NSS_DYNAMIC_INTERFACE_DEALLOC_NODE;
+	d.msg.dealloc_node.type = NSS_DYNAMIC_INTERFACE_TYPE_VAP;
+	d.msg.dealloc_node.if_num = if_num;
+	nss_msg_send(core, &d, sizeof(d));
+}
+
+/* One virtual device: the interface number the firmware knows it by, and the
+ * network device a frame arriving under that number belongs to.
+ */
+struct nss_wifili_vdev {
+	struct net_device *dev;
+	int if_num;
+};
+
+static struct nss_wifili_vdev nss_wifili_vdev_tbl[NSS_WIFILI_VDEV_MAX];
+
+static int nss_wifili_vdev_msg(struct nss_core *core, int if_num, u32 type,
+			       const struct nss_wifi_vdev_config_msg *cfg)
+{
 	struct nss_wifi_vdev_msg *v;
-	int if_num, ret;
+	int ret;
+
+	v = kzalloc(sizeof(*v), GFP_KERNEL);
+	if (!v)
+		return -ENOMEM;
+
+	v->cm.interface = if_num;
+	v->cm.type = type;
+	if (cfg)
+		v->msg.vdev_config = *cfg;
+
+	ret = nss_msg_send(core, v, offsetof(struct nss_wifi_vdev_msg, msg) +
+				    sizeof(v->msg.vdev_config));
+	if (!ret && v->cm.error)
+		ret = -EIO;
+
+	kfree(v);
+
+	return ret;
+}
+
+/* Put one virtual device on a radio and take it up.
+ *
+ * A radio carries no traffic on its own: a frame belongs to a virtual device,
+ * and it is the vdev's interface number that a received frame arrives under
+ * and that a transmitted one is addressed to. The network device is bound to
+ * that number here, which is the whole of the receive path - the firmware
+ * exceptions a frame naming the interface, and the table the wired ports
+ * already use carries it the rest of the way.
+ *
+ * The frames crossing this are ethernet, so the WLAN interface has to be
+ * running the hardware's own encapsulation and decapsulation.
+ */
+int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
+			   const u8 *mac, bool ap)
+{
+	struct nss_wifi_vdev_config_msg cfg = {};
+	struct nss_dynamic_interface_msg d;
+	struct nss_core *core;
+	int if_num, ret, i;
+
+	guard(mutex)(&nss_wifili_lock);
+
+	core = nss_wifili_core;
+	if (!core || !core->wifili_started)
+		return -EAGAIN;
+
+	if (radio >= nss_wifili_pdevs || nss_wifili_radio_if[radio] < 0)
+		return -ENODEV;
+
+	for (i = 0; i < ARRAY_SIZE(nss_wifili_vdev_tbl); i++)
+		if (!nss_wifili_vdev_tbl[i].dev)
+			break;
+	if (i == ARRAY_SIZE(nss_wifili_vdev_tbl))
+		return -ENOSPC;
 
 	memset(&d, 0, sizeof(d));
 	d.cm.interface = NSS_INTERFACE_DYNAMIC;
 	d.cm.type = NSS_DYNAMIC_INTERFACE_ALLOC_NODE;
 	d.msg.alloc_node.type = NSS_DYNAMIC_INTERFACE_TYPE_VAP;
 	ret = nss_msg_send(core, &d, sizeof(d));
-	if_num = d.msg.alloc_node.if_num;
-	seq_printf(s, "vdev node:     rc %d response %u if_num %d\n", ret,
-		   d.cm.response, if_num);
 	if (ret)
+		return ret;
+
+	if_num = d.msg.alloc_node.if_num;
+	if (if_num < 0 || if_num >= NSS_INTERFACE_MAX)
+		return -ERANGE;
+
+	ether_addr_copy(cfg.mac_addr, mac);
+	cfg.radio_ifnum = nss_wifili_radio_if[radio];
+	cfg.vdev_id = vdev_id;
+	cfg.opmode = ap ? NSS_WIFI_VDEV_OPMODE_AP : NSS_WIFI_VDEV_OPMODE_STA;
+
+	ret = nss_wifili_vdev_msg(core, if_num,
+				  NSS_WIFI_VDEV_INTERFACE_CONFIGURE_MSG, &cfg);
+	if (!ret)
+		ret = nss_wifili_vdev_msg(core, if_num,
+					  NSS_WIFI_VDEV_INTERFACE_UP_MSG, NULL);
+	if (ret) {
+		nss_wifili_vdev_free(core, if_num);
+		return ret;
+	}
+
+	nss_wifili_vdev_tbl[i].dev = dev;
+	nss_wifili_vdev_tbl[i].if_num = if_num;
+
+	dev_hold(dev);
+	rcu_assign_pointer(core->iface[if_num], dev);
+
+	dev_info(core->dev, "vdev %u on radio %u is interface %d\n",
+		 vdev_id, radio, if_num);
+
+	return if_num;
+}
+EXPORT_SYMBOL_GPL(nss_wifi_vdev_register);
+
+void nss_wifi_vdev_unregister(struct net_device *dev)
+{
+	struct nss_core *core;
+	int i;
+
+	guard(mutex)(&nss_wifili_lock);
+
+	core = nss_wifili_core;
+	if (!core)
 		return;
 
-	v = kzalloc(sizeof(*v), GFP_KERNEL);
-	if (!v)
-		return;
+	for (i = 0; i < ARRAY_SIZE(nss_wifili_vdev_tbl); i++) {
+		int if_num = nss_wifili_vdev_tbl[i].if_num;
 
-	v->cm.interface = if_num;
-	v->cm.type = NSS_WIFI_VDEV_INTERFACE_CONFIGURE_MSG;
-	v->msg.vdev_config.radio_ifnum = radio_if;
-	eth_random_addr(v->msg.vdev_config.mac_addr);
-	ret = nss_msg_send(core, v, offsetof(struct nss_wifi_vdev_msg, msg) +
-				    sizeof(v->msg.vdev_config));
-	seq_printf(s, "vdev config:   rc %d response %u error %u\n", ret,
-		   v->cm.response, v->cm.error);
+		if (nss_wifili_vdev_tbl[i].dev != dev)
+			continue;
 
-	if (!ret) {
-		memset(v, 0, sizeof(*v));
-		v->cm.interface = if_num;
-		v->cm.type = NSS_WIFI_VDEV_INTERFACE_UP_MSG;
-		ret = nss_msg_send(core, v,
-				   offsetof(struct nss_wifi_vdev_msg, msg) +
-				   sizeof(v->msg.vdev_config));
-		seq_printf(s, "vdev up:       rc %d response %u error %u\n",
-			   ret, v->cm.response, v->cm.error);
+		/* The frame table first, and a grace period, so no receive
+		 * poll is still holding the device when it goes. Halting a
+		 * core clears the whole table on its own, so the reference is
+		 * dropped against what was there rather than against this
+		 * having been the one to remove it.
+		 */
+		if (rcu_replace_pointer(core->iface[if_num], NULL, true)) {
+			synchronize_rcu();
+			dev_put(dev);
+		}
+
+		nss_wifili_vdev_tbl[i].dev = NULL;
+		nss_wifili_vdev_tbl[i].if_num = -1;
 
 		/* Down before the node goes: a virtual device released while
 		 * it is still up faults the firmware.
 		 */
-		memset(v, 0, sizeof(*v));
-		v->cm.interface = if_num;
-		v->cm.type = NSS_WIFI_VDEV_INTERFACE_DOWN_MSG;
-		ret = nss_msg_send(core, v,
-				   offsetof(struct nss_wifi_vdev_msg, msg) +
-				   sizeof(v->msg.vdev_config));
-		seq_printf(s, "vdev down:     rc %d response %u error %u\n",
-			   ret, v->cm.response, v->cm.error);
+		nss_wifili_vdev_msg(core, if_num,
+				    NSS_WIFI_VDEV_INTERFACE_DOWN_MSG, NULL);
+		nss_wifili_vdev_free(core, if_num);
 	}
-
-	/* The node is deliberately left allocated. Releasing it is what the
-	 * next arm has to answer for; this one is about whether a virtual
-	 * device can be made at all, and the probe runs once per core.
-	 */
-	nss_wifili_vdev_if = if_num;
-	seq_puts(s, "vdev node left allocated\n");
-
-	kfree(v);
 }
+EXPORT_SYMBOL_GPL(nss_wifi_vdev_unregister);
+
+int nss_wifi_vdev_tx(int if_num, struct sk_buff *skb)
+{
+	struct nss_core *core = READ_ONCE(nss_wifili_core);
+
+	if (!core || if_num < 0)
+		return -ENODEV;
+
+	return nss_data_send(core, skb, if_num);
+}
+EXPORT_SYMBOL_GPL(nss_wifi_vdev_tx);
 
 /* Hand one frame down, to see whether the firmware takes it.
  *
@@ -525,13 +639,14 @@ int nss_wifili_tx(struct seq_file *s)
 	struct nss_core *core = nss_wifili_core;
 	u64 before, after;
 	struct sk_buff *skb;
-	int i, ret, sent = 0;
+	int i, ret, if_num, sent = 0;
 
 	if (!core || !core->running)
 		return -ENODEV;
 
-	if (nss_wifili_vdev_if < 0) {
-		seq_puts(s, "no virtual device: run wifili_start first\n");
+	if_num = nss_wifili_vdev_tbl[0].dev ? nss_wifili_vdev_tbl[0].if_num : -1;
+	if (if_num < 0) {
+		seq_puts(s, "no virtual device: bring a WLAN interface up first\n");
 		return 0;
 	}
 
@@ -551,7 +666,7 @@ int nss_wifili_tx(struct seq_file *s)
 		skb->data[12] = 0x88;
 		skb->data[13] = 0xb5;
 
-		ret = nss_data_send(core, skb, nss_wifili_vdev_if);
+		ret = nss_data_send(core, skb, if_num);
 		if (ret) {
 			dev_kfree_skb_any(skb);
 			seq_printf(s, "post %d: rc %d\n", i, ret);
@@ -564,7 +679,7 @@ int nss_wifili_tx(struct seq_file *s)
 	after = core->tx_done;
 
 	seq_printf(s, "posted %d to interface %d, completed %llu\n",
-		   sent, nss_wifili_vdev_if, after - before);
+		   sent, if_num, after - before);
 
 	return 0;
 }
@@ -748,7 +863,7 @@ int nss_wifili_start(struct seq_file *s)
 	seq_printf(s, "%-14s rc %d response %u error %u\n", "start:", ret,
 		   m->cm.response, m->cm.error);
 	if (!ret)
-		nss_wifili_vdev_probe(core, s, nss_wifili_radio_if[0]);
+		core->wifili_started = true;
 out:
 	kfree(w);
 	kfree(m);
