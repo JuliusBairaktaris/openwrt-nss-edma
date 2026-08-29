@@ -177,6 +177,5 @@
 		qcom,pvxlan-enabled;
 		qcom,clmap-enabled;
 		qcom,rmnet_rx-enabled;
-		status = "disabled";
 	};
 };
