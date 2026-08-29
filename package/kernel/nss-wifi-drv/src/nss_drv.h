@@ -18,6 +18,10 @@
 #include <linux/seq_file.h>
 #include <linux/types.h>
 
+#include "nss_arch.h"
+#include "nss_def.h"
+#include "nss_cmn.h"
+
 /* Ring geometry. The index page always describes 16 host-to-firmware and 15
  * firmware-to-host slots whatever the SoC populates, so the arrays are sized
  * by the page and the counts say how many are real.
@@ -46,7 +50,8 @@
 #define NSS_N2H_BUFFER_PACKET	3
 #define NSS_N2H_BUFFER_STATUS	6
 
-#define NSS_H2N_FLAG_BUFFER_REUSABLE	0x8000
+#define NSS_H2N_FLAG_FIRST_SEGMENT	0x0004
+#define NSS_H2N_FLAG_LAST_SEGMENT	0x0008
 
 /* The firmware chooses its own offset inside a receive buffer, so the buffer
  * it is given is the head of the allocation and it reports where the payload
@@ -58,6 +63,7 @@
 /* Interface numbers the firmware dispatches on. */
 #define NSS_INTERFACE_N2H	156
 #define NSS_INTERFACE_ETH_RX	158
+#define NSS_INTERFACE_DYNAMIC	176
 #define NSS_INTERFACE_MAX	228
 
 /* Interrupt causes, one GIC line each: there are no mask or status registers
@@ -204,32 +210,16 @@ struct nss_log_descriptor {
 static_assert(sizeof(struct nss_log_entry) == 160);
 static_assert(sizeof(struct nss_log_descriptor) == 32);
 
-/* Message header. The firmware echoes cb and app_data back untouched, and
- * that echo is the only thing tying a reply to its request - there is no
+/* The message header is the exported ABI, shared with every wifili and vdev
+ * message that embeds it. What the firmware stores at cb and app_data is
+ * sixteen bytes it never reads: they come back exactly as they were sent,
+ * which is the only thing tying a reply to its request - there is no
  * sequence number anywhere in the protocol.
  */
-enum nss_cmn_response {
-	NSS_CMN_RESPONSE_ACK,
-	NSS_CMN_RESPONSE_EVERSION,
-	NSS_CMN_RESPONSE_EINTERFACE,
-	NSS_CMN_RESPONSE_ELENGTH,
-	NSS_CMN_RESPONSE_EMSG,
-	NSS_CMN_RESPONSE_NOTIFY,
-};
-
-struct nss_cmn_msg {
-	u16 version;
-	u16 len;
-	u32 interface;
-	enum nss_cmn_response response;
-	u32 type;
-	u32 error;
-	u32 reserved;
-	u64 cb;
-	u64 app_data;
-};
-
 #define NSS_HLOS_MESSAGE_VERSION	1
+
+static_assert(sizeof(struct nss_cmn_msg) == 40);
+static_assert(offsetof(struct nss_cmn_msg, cb) == 24);
 
 /* What the host knows about a buffer it lent the firmware. The descriptor a
  * buffer comes back in is written by the other side, so its address and
@@ -255,6 +245,22 @@ struct nss_h2n_ring {
 struct nss_n2h_ring {
 	struct n2h_descriptor *desc;
 	u32 hlos_index;
+};
+
+/* One message in flight at a time, in a block the host owns outright.
+ *
+ * The firmware writes its answer into the same buffer the request arrived
+ * in and hands it back, so the buffer is read and written by both sides and
+ * belongs in coherent memory rather than in a streaming mapping whose
+ * direction would have to be wrong in one of the two phases. It is also what
+ * identifies the reply: the descriptor comes back carrying the address the
+ * host handed out, so nothing has to trust a pointer the firmware echoed.
+ */
+struct nss_msg {
+	void *buf;
+	dma_addr_t dma;
+	struct mutex lock;
+	struct completion done;
 };
 
 struct nss_core;
@@ -310,6 +316,7 @@ struct nss_core {
 	struct net_device *ndev;
 	struct net_device *conduit;
 
+	struct nss_msg msg;
 	atomic_t buffers_queued;
 	struct completion booted;
 
@@ -321,6 +328,10 @@ void nss_mem_free_all(struct nss_core *core);
 int nss_rings_start(struct nss_core *core);
 void nss_rings_stop(struct nss_core *core);
 void nss_doorbell(struct nss_core *core, u32 intr);
+int nss_msg_init(struct nss_core *core);
+int nss_msg_send(struct nss_core *core, void *msg, size_t len);
+bool nss_msg_complete(struct nss_core *core, const struct n2h_descriptor *desc);
+int nss_msg_probe(struct nss_core *core, struct seq_file *s);
 int nss_log_show_ring(struct nss_core *core, struct seq_file *s);
 void nss_log_dump(struct nss_core *core, const char *why);
 
