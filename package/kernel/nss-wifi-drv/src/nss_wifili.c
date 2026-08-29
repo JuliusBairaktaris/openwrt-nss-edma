@@ -20,6 +20,7 @@
  */
 
 #include <linux/dma-mapping.h>
+#include <linux/etherdevice.h>
 #include <linux/if_ether.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
@@ -27,6 +28,9 @@
 #include "nss_drv.h"
 #include "nss_cmn.h"
 #include "nss_dynamic_interface.h"
+#include "nss_shaper.h"
+#include "nss_if.h"
+#include "nss_wifi_vdev.h"
 #include "nss_wifili_if.h"
 #include <linux/soc/qcom/nss_wifi.h>
 
@@ -96,6 +100,7 @@ static struct nss_wifi_soc nss_wifili_soc;
 static struct nss_wifi_pdev nss_wifili_pdev[NSS_WIFILI_MAX_PDEV_NUM_MSG];
 static bool nss_wifili_have_soc;
 static u8 nss_wifili_pdevs;
+static int nss_wifili_radio_if[NSS_WIFILI_MAX_PDEV_NUM_MSG];
 static DEFINE_MUTEX(nss_wifili_lock);
 
 void nss_wifili_bind(struct nss_core *core)
@@ -371,6 +376,78 @@ static int nss_wifili_radio_alloc(struct nss_core *core,
 	return d.msg.alloc_node.if_num;
 }
 
+/* Put one virtual device on a radio, and take it up.
+ *
+ * A radio carries no traffic on its own: a frame belongs to a virtual device,
+ * and it is the vdev's interface number a received frame arrives under and
+ * that a transmitted one is addressed to. This is the smallest thing that
+ * shows the firmware will accept one. The numbers a real interface would
+ * supply are left at zero, so whatever the firmware insists on shows up as a
+ * refusal rather than as a silence.
+ */
+static void nss_wifili_vdev_probe(struct nss_core *core, struct seq_file *s,
+				  int radio_if)
+{
+	struct nss_dynamic_interface_msg d;
+	struct nss_wifi_vdev_msg *v;
+	int if_num, ret;
+
+	memset(&d, 0, sizeof(d));
+	d.cm.interface = NSS_INTERFACE_DYNAMIC;
+	d.cm.type = NSS_DYNAMIC_INTERFACE_ALLOC_NODE;
+	d.msg.alloc_node.type = NSS_DYNAMIC_INTERFACE_TYPE_VAP;
+	ret = nss_msg_send(core, &d, sizeof(d));
+	if_num = d.msg.alloc_node.if_num;
+	seq_printf(s, "vdev node:     rc %d response %u if_num %d\n", ret,
+		   d.cm.response, if_num);
+	if (ret)
+		return;
+
+	v = kzalloc(sizeof(*v), GFP_KERNEL);
+	if (!v)
+		return;
+
+	v->cm.interface = if_num;
+	v->cm.type = NSS_WIFI_VDEV_INTERFACE_CONFIGURE_MSG;
+	v->msg.vdev_config.radio_ifnum = radio_if;
+	eth_random_addr(v->msg.vdev_config.mac_addr);
+	ret = nss_msg_send(core, v, offsetof(struct nss_wifi_vdev_msg, msg) +
+				    sizeof(v->msg.vdev_config));
+	seq_printf(s, "vdev config:   rc %d response %u error %u\n", ret,
+		   v->cm.response, v->cm.error);
+
+	if (!ret) {
+		memset(v, 0, sizeof(*v));
+		v->cm.interface = if_num;
+		v->cm.type = NSS_WIFI_VDEV_INTERFACE_UP_MSG;
+		ret = nss_msg_send(core, v,
+				   offsetof(struct nss_wifi_vdev_msg, msg) +
+				   sizeof(v->msg.vdev_config));
+		seq_printf(s, "vdev up:       rc %d response %u error %u\n",
+			   ret, v->cm.response, v->cm.error);
+
+		/* Down before the node goes: a virtual device released while
+		 * it is still up faults the firmware.
+		 */
+		memset(v, 0, sizeof(*v));
+		v->cm.interface = if_num;
+		v->cm.type = NSS_WIFI_VDEV_INTERFACE_DOWN_MSG;
+		ret = nss_msg_send(core, v,
+				   offsetof(struct nss_wifi_vdev_msg, msg) +
+				   sizeof(v->msg.vdev_config));
+		seq_printf(s, "vdev down:     rc %d response %u error %u\n",
+			   ret, v->cm.response, v->cm.error);
+	}
+
+	/* The node is deliberately left allocated. Releasing it is what the
+	 * next arm has to answer for; this one is about whether a virtual
+	 * device can be made at all, and the probe runs once per core.
+	 */
+	seq_puts(s, "vdev node left allocated\n");
+
+	kfree(v);
+}
+
 /* Start the firmware's Wi-Fi data plane on the rings the WLAN driver owns.
  *
  * This is where the ring set stops being invented. Everything the probe above
@@ -473,6 +550,7 @@ int nss_wifili_start(struct seq_file *s)
 		 * and the firmware has nothing to name until one exists.
 		 */
 		if_num = nss_wifili_radio_alloc(core, m);
+		nss_wifili_radio_if[i] = if_num;
 		seq_printf(s, "radio %u node:  if_num %d\n",
 			   nss_wifili_pdev[i].radio_id, if_num);
 		if (if_num < 0) {
@@ -505,6 +583,8 @@ int nss_wifili_start(struct seq_file *s)
 	ret = nss_msg_send(core, m, offsetof(struct nss_wifili_msg, msg));
 	seq_printf(s, "%-14s rc %d response %u error %u\n", "start:", ret,
 		   m->cm.response, m->cm.error);
+	if (!ret)
+		nss_wifili_vdev_probe(core, s, nss_wifili_radio_if[0]);
 out:
 	kfree(w);
 	kfree(m);
