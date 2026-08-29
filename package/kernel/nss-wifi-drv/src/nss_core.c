@@ -310,6 +310,7 @@ static void nss_core_halt(struct nss_core *core)
 
 	core->loaded = false;
 	core->wifili_probed = false;
+	core->wifili_started = false;
 	core->cpu_port_taken = false;
 }
 
