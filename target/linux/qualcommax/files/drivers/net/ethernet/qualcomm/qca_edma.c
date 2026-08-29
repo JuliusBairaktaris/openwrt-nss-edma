@@ -977,6 +977,23 @@ static void edma_hw_reset(struct edma_priv *priv)
 	udelay(100);
 }
 
+/*
+ * Every CPU-port queue names the one receive ring this driver enables. The
+ * vendor writes the first queue alone and leaves the rest pointing at ring 0
+ * for its firmware to claim; here that ring stays disabled, so a queue other
+ * than the first would deliver nowhere - and the CPU port has more than one,
+ * because a classified frame is enqueued a class above best effort.
+ */
+static void edma_qid2rid_host(struct edma_priv *priv)
+{
+	u32 val = (priv->soc->rxdesc_ring & EDMA_QID2RID_RING_MASK) *
+		  0x11111111u;
+	int i;
+
+	for (i = 0; i < EDMA_QID2RID_DEPTH; i++)
+		regmap_write(priv->regmap, EDMA_QID2RID_TABLE_MEM(i), val);
+}
+
 static int edma_hw_init(struct edma_priv *priv)
 {
 	const struct edma_soc_data *soc = priv->soc;
@@ -993,14 +1010,7 @@ static int edma_hw_init(struct edma_priv *priv)
 	edma_irq_disable_all(priv);
 	edma_rings_disable(priv);
 
-	/* Every queue names the one receive ring this driver enables. The
-	 * vendor writes the first queue alone and leaves the rest pointing at
-	 * ring 0 for its firmware to claim; here that ring stays disabled, so
-	 * a queue other than the first would deliver nowhere.
-	 */
-	val = (soc->rxdesc_ring & EDMA_QID2RID_RING_MASK) * 0x11111111u;
-	for (i = 0; i < EDMA_QID2RID_DEPTH; i++)
-		regmap_write(priv->regmap, EDMA_QID2RID_TABLE_MEM(i), val);
+	edma_qid2rid_host(priv);
 
 	ret = edma_rings_alloc(priv);
 	if (ret)
@@ -1252,6 +1262,34 @@ bool qca_edma_netdev_is_conduit(const struct net_device *netdev)
 EXPORT_SYMBOL_GPL(qca_edma_netdev_is_conduit);
 
 /*
+ * Point every CPU-port queue back at the host receive ring while the NSS
+ * firmware runs.
+ *
+ * The queue-to-ring table is the one part of the firmware's takeover of
+ * CPU-port delivery that needs no agreement from the host: a per-frame lookup
+ * of one nibble per queue, in a register block the firmware programs once at
+ * init and never revisits. Rewriting it under a running core hands wired
+ * traffic back to the host without touching a ring the firmware owns, so the
+ * two data planes share the block instead of taking turns with it. Every
+ * other register the firmware touched names one of its own rings, so nothing
+ * else has to be undone for the host to receive again.
+ *
+ * qca_edma_fw_baseline_restore() is the other half of the pair: it returns the
+ * whole block to its cold-boot state and may only be called with the cores
+ * stopped.
+ */
+int qca_edma_cpu_queues_to_host(struct net_device *conduit)
+{
+	if (!qca_edma_netdev_is_conduit(conduit))
+		return -EINVAL;
+
+	edma_qid2rid_host(netdev_priv(conduit));
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qca_edma_cpu_queues_to_host);
+
+/*
  * Restore the EDMA registers the NSS firmware reprograms when it takes
  * over CPU-port delivery: the QID2RID table (CPU-port queues back to the
  * host rx ring), the firmware-range ring enables, and the shared
@@ -1276,11 +1314,7 @@ int qca_edma_fw_baseline_restore(struct net_device *conduit)
 
 	edma_rings_disable(priv);
 
-	/* Queue 0 to the host rx ring, every other entry parked at 0 */
-	regmap_write(priv->regmap, EDMA_QID2RID_TABLE_MEM(0),
-		     soc->rxdesc_ring & 0xF);
-	for (i = 1; i < EDMA_QID2RID_DEPTH; i++)
-		regmap_write(priv->regmap, EDMA_QID2RID_TABLE_MEM(i), 0);
+	edma_qid2rid_host(priv);
 
 	regmap_write(priv->regmap, EDMA_REG_RXDESC2FILL_MAP_0, 0);
 	regmap_write(priv->regmap, EDMA_REG_RXDESC2FILL_MAP_1,
