@@ -396,6 +396,15 @@ int nss_wifili_start(struct seq_file *s)
 		return 0;
 	}
 
+	/* One initialisation per core, whichever asks for it: an accepted one
+	 * leaves the radio in a state the next is judged against.
+	 */
+	if (core->wifili_probed) {
+		seq_puts(s, "wifili is already initialised on this core\n");
+		return 0;
+	}
+	core->wifili_probed = true;
+
 	m = kzalloc(sizeof(*m), GFP_KERNEL);
 	w = kzalloc(sizeof(*w), GFP_KERNEL);
 	if (!m || !w) {
