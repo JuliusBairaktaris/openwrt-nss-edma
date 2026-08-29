@@ -323,8 +323,14 @@ define Build/Prepare
 	echo 'compat-wireless-$(PKG_VERSION)-$(PKG_RELEASE)-$(REVISION)' > $(PKG_BUILD_DIR)/compat_version
 endef
 
+# The ring description ath11k hands the NSS firmware driver is staged by that
+# driver's package, and kbuild does not look in the staging tree on its own.
+ifdef CONFIG_ATH11K_NSS_WIFI
+  MAKE_OPTS += CFLAGS="-I$(STAGING_DIR)/usr/include/nss-wifi-drv -DCONFIG_NSS_WIFI_DRV=1"
+endif
+
 ifneq ($(CONFIG_PACKAGE_kmod-cfg80211),)
- define Build/Compile/kmod
+define Build/Compile/kmod
 	rm -rf $(PKG_BUILD_DIR)/modules
 	+$(MAKE) $(PKG_JOBS) $(MAKE_OPTS) modules
  endef
@@ -348,6 +354,7 @@ define Build/Patch
 	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/ath9k,ath9k/)
 	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/ath10k,ath10k/)
 	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/ath11k,ath11k/)
+	$(if $(CONFIG_ATH11K_NSS_WIFI),$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/nss-wifi,nss-wifi/))
 	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/ath12k,ath12k/)
 	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/rt2x00,rt2x00/)
 	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/mt7601u,mt7601u/)
