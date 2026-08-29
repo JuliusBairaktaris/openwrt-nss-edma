@@ -21,6 +21,7 @@
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/reset.h>
+#include <linux/soc/qcom/qca_edma.h>
 #include <net/netdev_queues.h>
 
 #include "qca_edma.h"
@@ -1275,6 +1276,20 @@ static void edma_hw_reset(struct edma_priv *priv)
 	udelay(100);
 }
 
+/* Every queue names the one receive ring this driver enables. Ring 0 is
+ * never given a base address here, so a queue left pointing at it would
+ * deliver nowhere.
+ */
+static void edma_qid2rid_host(struct edma_priv *priv)
+{
+	u32 val = (priv->soc->rxdesc_ring & EDMA_QID2RID_RING_MASK) *
+		  0x11111111u;
+	int i;
+
+	for (i = 0; i < EDMA_QID2RID_DEPTH; i++)
+		regmap_write(priv->regmap, EDMA_QID2RID_TABLE_MEM(i), val);
+}
+
 static int edma_hw_init(struct edma_priv *priv)
 {
 	const struct edma_soc_data *soc = priv->soc;
@@ -1283,14 +1298,7 @@ static int edma_hw_init(struct edma_priv *priv)
 
 	edma_hw_reset(priv);
 	edma_hw_stop(priv);
-
-	/* Every queue names the one receive ring this driver enables. Ring 0 is
-	 * never given a base address here, so a queue left pointing at it would
-	 * deliver nowhere.
-	 */
-	val = (soc->rxdesc_ring & EDMA_QID2RID_RING_MASK) * 0x11111111u;
-	for (i = 0; i < EDMA_QID2RID_DEPTH; i++)
-		regmap_write(priv->regmap, EDMA_QID2RID_TABLE_MEM(i), val);
+	edma_qid2rid_host(priv);
 
 	ret = edma_rings_alloc(priv);
 	if (ret)
@@ -1332,6 +1340,24 @@ static int edma_hw_init(struct edma_priv *priv)
 	edma_rings_enable(priv);
 
 	return 0;
+}
+
+/* A receive ring below the host's is enabled only by the NSS firmware, which
+ * shares this block. Rebuilding the rings resets the block and takes that ring
+ * down under it.
+ */
+static bool edma_shared(struct edma_priv *priv)
+{
+	u32 val;
+	int i;
+
+	for (i = 0; i < priv->soc->rxdesc_ring; i++) {
+		regmap_read(priv->regmap, EDMA_REG_RXDESC_CTRL(i), &val);
+		if (val & EDMA_RXDESC_RX_EN)
+			return true;
+	}
+
+	return false;
 }
 
 static void edma_get_ringparam(struct net_device *netdev,
@@ -1378,23 +1404,35 @@ static int edma_set_ringparam(struct net_device *netdev,
 	    ring->rx_pending == priv->rx_ring_size)
 		return 0;
 
+	if (edma_shared(priv)) {
+		NL_SET_ERR_MSG_MOD(extack, "the NSS firmware shares the rings");
+		return -EBUSY;
+	}
+
 	return edma_reconfigure(priv, priv->rx_page_order, ring->tx_pending,
 				ring->rx_pending);
 }
 
-/* The rebuild asserts the block's reset line, so it is the DMA reset too. */
+/* The rebuild asserts the block's reset line, so it is the DMA reset too.
+ * While the NSS firmware shares the block, only a request for the shared
+ * component resets it.
+ */
 static int edma_reset(struct net_device *netdev, u32 *flags)
 {
 	struct edma_priv *priv = netdev_priv(netdev);
+	u32 shared = ETH_RESET_DMA << ETH_RESET_SHARED_SHIFT;
 	int ret;
 
-	if (!(*flags & ETH_RESET_DMA))
+	if (!(*flags & (ETH_RESET_DMA | shared)))
 		return -EINVAL;
+
+	if (!(*flags & shared) && edma_shared(priv))
+		return -EBUSY;
 
 	ret = edma_reconfigure(priv, priv->rx_page_order, priv->tx_ring_size,
 			       priv->rx_ring_size);
 	if (!ret)
-		*flags &= ~ETH_RESET_DMA;
+		*flags &= ~(ETH_RESET_DMA | shared);
 
 	return ret;
 }
@@ -1764,6 +1802,21 @@ static const struct net_device_ops edma_netdev_ops = {
 	.ndo_get_stats64 = dev_get_tstats64,
 };
 
+/* Point every CPU-port queue back at the host receive ring while the NSS
+ * firmware runs. Once written, the table reads back unchanged for as long as
+ * the firmware runs.
+ */
+int qca_edma_cpu_queues_to_host(struct net_device *conduit)
+{
+	if (!conduit || conduit->netdev_ops != &edma_netdev_ops)
+		return -EINVAL;
+
+	edma_qid2rid_host(netdev_priv(conduit));
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qca_edma_cpu_queues_to_host);
+
 static int edma_irq_init(struct edma_priv *priv)
 {
 	struct platform_device *pdev = priv->pdev;
@@ -1922,6 +1975,11 @@ static int edma_ndo_change_mtu(struct net_device *netdev, int new_mtu)
 	int ret;
 
 	if (order != priv->rx_page_order) {
+		if (edma_shared(priv)) {
+			netdev_warn(netdev, "the NSS firmware shares the rings\n");
+			return -EBUSY;
+		}
+
 		ret = edma_reconfigure(priv, order, priv->tx_ring_size,
 				       priv->rx_ring_size);
 		if (ret)
