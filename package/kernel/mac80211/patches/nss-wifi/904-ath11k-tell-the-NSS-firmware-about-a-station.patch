@@ -1,0 +1,96 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] ath11k: tell the NSS firmware about a station
+
+The firmware places a frame for a station it knows, so a station this
+driver creates has to be created there too. The message carries the
+identifier, the hardware address-search index and the transmit hash, all
+of which the WLAN firmware supplies through the peer map that peer
+creation already waits for, so the values are read from the host record
+while it is held and the message is sent after the lock is dropped.
+
+The delete goes ahead of the deletion rather than after it. The firmware
+names a peer by the identifier the host record carries, and by the time
+the unmap event runs that record is gone; sending it here, under the
+mutex the whole peer lifecycle is serialised by, means no message ever
+has to leave a context that cannot sleep.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/peer.c
+===================================================================
+--- backports-6.18.39.orig/drivers/net/wireless/ath/ath11k/peer.c
++++ backports-6.18.39/drivers/net/wireless/ath/ath11k/peer.c
+@@ -5,6 +5,8 @@
+  */
+ 
+ #include "core.h"
++
++#include <linux/soc/qcom/nss_wifi.h>
+ #include "peer.h"
+ #include "debug.h"
+ 
+@@ -353,6 +355,24 @@ int ath11k_peer_delete(struct ath11k *ar
+ 
+ 	lockdep_assert_held(&ar->conf_mutex);
+ 
++	/* Ahead of the deletion, because the firmware names a peer by the
++	 * identifier the host record carries and that record is gone by the
++	 * time the unmap event runs.
++	 */
++	if (ath11k_nss_offload) {
++		struct ath11k_peer *peer;
++		u16 peer_id = 0;
++
++		spin_lock_bh(&ar->ab->base_lock);
++		peer = ath11k_peer_find(ar->ab, vdev_id, addr);
++		if (peer)
++			peer_id = peer->peer_id;
++		spin_unlock_bh(&ar->ab->base_lock);
++
++		if (peer)
++			nss_wifi_peer_delete(vdev_id, addr, peer_id);
++	}
++
+ 	ret = __ath11k_peer_delete(ar, vdev_id, addr);
+ 	if (ret)
+ 		return ret;
+@@ -372,6 +392,7 @@ int ath11k_peer_create(struct ath11k *ar
+ {
+ 	struct ath11k_peer *peer;
+ 	struct ath11k_sta *arsta;
++	u16 peer_id, ast_idx, ast_hash;
+ 	int ret, fbret;
+ 
+ 	lockdep_assert_held(&ar->conf_mutex);
+@@ -457,9 +478,31 @@ int ath11k_peer_create(struct ath11k *ar
+ 
+ 	ar->num_peers++;
+ 
++	peer_id = peer->peer_id;
++	ast_idx = peer->hw_peer_id;
++	ast_hash = peer->ast_hash;
++
+ 	spin_unlock_bh(&ar->ab->base_lock);
+ 	mutex_unlock(&ar->ab->tbl_mtx_lock);
+ 
++	/* Outside the lock, because telling the firmware is a message that
++	 * waits for its answer. Everything the message carries was read while
++	 * the record was held, and the record cannot go before this returns:
++	 * the delete runs under the mutex this call already holds.
++	 */
++	if (ath11k_nss_offload) {
++		ret = nss_wifi_peer_create(param->vdev_id, param->peer_addr,
++					   peer_id, ast_idx, ast_hash);
++		if (ret) {
++			ath11k_warn(ar->ab, "failed to give peer %pM to the NSS firmware: %d\n",
++				    param->peer_addr, ret);
++			spin_lock_bh(&ar->ab->base_lock);
++			ar->num_peers--;
++			spin_unlock_bh(&ar->ab->base_lock);
++			goto cleanup;
++		}
++	}
++
+ 	return 0;
+ 
+ cleanup:
