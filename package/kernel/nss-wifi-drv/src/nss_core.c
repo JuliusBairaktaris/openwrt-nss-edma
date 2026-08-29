@@ -361,6 +361,11 @@ static int nss_core_boot(struct nss_core *core)
 	core->cpu_port_taken = true;
 	core->loaded = true;
 	nss_log_shadow_start(core);
+
+	/* A boot that timed out and was then answered leaves the completion
+	 * signalled, and the next boot would take that for its own answer.
+	 */
+	reinit_completion(&core->booted);
 	nss_core_release(core);
 
 	if (!wait_for_completion_timeout(&core->booted,
