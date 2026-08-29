@@ -15,6 +15,8 @@
 #include <linux/cleanup.h>
 #include <linux/interrupt.h>
 #include <linux/of_irq.h>
+#include <linux/etherdevice.h>
+#include <net/dsa.h>
 #include <linux/platform_device.h>
 #include <linux/seq_file.h>
 #include <linux/soc/qcom/qca_edma.h>
@@ -31,6 +33,87 @@ void nss_doorbell(struct nss_core *core, u32 which)
 	       core->qgic + NSS_QGIC_IPC_REG);
 }
 
+/* Give the firmware's interface numbers something to deliver to.
+ *
+ * A frame the firmware exceptions carries the number of the interface it came
+ * in on, and for a switch port that number is the port's own index - measured
+ * on this SoC, and derived here rather than written down, because the port set
+ * is a property of the board. Everything above a switch port gets its number
+ * when it is created, and registers itself.
+ */
+void nss_iface_bind(struct nss_core *core)
+{
+	struct net_device *dev;
+
+	rtnl_lock();
+	for_each_netdev(&init_net, dev) {
+		struct dsa_port *dp;
+
+		if (!dsa_user_dev_check(dev))
+			continue;
+
+		dp = dsa_port_from_netdev(dev);
+		if (IS_ERR(dp) || dp->index >= NSS_INTERFACE_MAX)
+			continue;
+
+		if (dsa_port_to_conduit(dp) != core->conduit)
+			continue;
+
+		dev_hold(dev);
+		rcu_assign_pointer(core->iface[dp->index], dev);
+	}
+	rtnl_unlock();
+}
+
+void nss_iface_unbind(struct nss_core *core)
+{
+	int i;
+
+	for (i = 0; i < NSS_INTERFACE_MAX; i++) {
+		struct net_device *dev;
+
+		dev = rcu_replace_pointer(core->iface[i], NULL, true);
+		if (dev)
+			dev_put(dev);
+	}
+
+	synchronize_rcu();
+}
+
+/* Hand up a frame the firmware exceptioned.
+ *
+ * The offset and length come from the other side, so they are checked against
+ * the allocation the host made rather than believed: the buffer is the one
+ * this driver donated, and nothing the firmware writes into the descriptor can
+ * make it larger.
+ */
+static bool nss_data_recv(struct nss_core *core, struct napi_struct *napi,
+			  const struct n2h_descriptor *desc,
+			  struct sk_buff *skb)
+{
+	u32 end = (u32)desc->payload_offs + desc->payload_len;
+	struct net_device *dev;
+
+	if (desc->buffer_type != NSS_N2H_BUFFER_PACKET)
+		return false;
+
+	dev = rcu_dereference(core->iface[desc->interface_num]);
+	if (!dev || end > NSS_EMPTY_BUFFER_ALLOC || desc->payload_len < ETH_HLEN)
+		return false;
+
+	dma_unmap_single(core->dev, NSS_SKB_CB(skb)->dma,
+			 NSS_EMPTY_BUFFER_ALLOC, DMA_FROM_DEVICE);
+
+	skb_reserve(skb, desc->payload_offs);
+	skb_put(skb, desc->payload_len);
+	skb->protocol = eth_type_trans(skb, dev);
+
+	dev_sw_netstats_rx_add(dev, desc->payload_len);
+	napi_gro_receive(napi, skb);
+
+	return true;
+}
+
 /* Take the switch's CPU port back off the firmware.
  *
  * The firmware programs the queue-to-ring table as part of its own EDMA
@@ -43,7 +126,7 @@ void nss_doorbell(struct nss_core *core, u32 which)
  */
 static void nss_cpu_port_reclaim(struct nss_core *core)
 {
-	if (!core->cpu_port_taken)
+	if (!core->cpu_port_taken || core->cpu_port_to_fw)
 		return;
 
 	core->cpu_port_taken = false;
@@ -246,8 +329,15 @@ static int nss_poll_n2h(struct napi_struct *napi, int budget)
 		 * else, and is the host's own: it is answered rather than
 		 * freed, and it was never one of the donated buffers.
 		 */
+		core->rx_type[desc->buffer_type & 7]++;
+		if (desc->interface_num < NSS_INTERFACE_MAX)
+			core->rx_iface[desc->interface_num]++;
+
 		if (nss_msg_complete(core, desc)) {
 			/* nothing to release */
+		} else if (skb && nss_data_recv(core, napi, desc, skb)) {
+			atomic_dec(&core->buffers_queued);
+			returned++;
 		} else if (skb) {
 			dma_unmap_single(core->dev, NSS_SKB_CB(skb)->dma,
 					 NSS_EMPTY_BUFFER_ALLOC, DMA_FROM_DEVICE);
