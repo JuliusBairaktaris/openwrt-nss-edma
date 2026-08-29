@@ -344,6 +344,7 @@ int nss_rings_start(struct nss_core *core);
 void nss_iface_bind(struct nss_core *core);
 void nss_iface_unbind(struct nss_core *core);
 void nss_rings_stop(struct nss_core *core);
+void nss_rings_quiesce(struct nss_core *core);
 void nss_doorbell(struct nss_core *core, u32 intr);
 int nss_msg_init(struct nss_core *core);
 int nss_msg_send(struct nss_core *core, void *msg, size_t len);
