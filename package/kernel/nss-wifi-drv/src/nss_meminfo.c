@@ -33,7 +33,7 @@ static void *nss_mem_alloc(struct nss_core *core, size_t size, u32 align,
 	dma_addr_t dma;
 	void *cpu;
 
-	a = devm_kzalloc(core->dev, sizeof(*a), GFP_KERNEL);
+	a = kzalloc(sizeof(*a), GFP_KERNEL);
 	if (!a)
 		return NULL;
 
@@ -64,7 +64,17 @@ void nss_mem_free_all(struct nss_core *core)
 	list_for_each_entry_safe(a, tmp, &core->allocs, node) {
 		dma_free_coherent(core->dev, a->size, a->cpu, a->dma);
 		list_del(&a->node);
+		kfree(a);
 	}
+
+	/* The instruction-memory window is handed out by bumping a pointer
+	 * through it, so it is only reusable if the pointer goes back. A core
+	 * booted a second time asks for the same blocks again.
+	 */
+	core->imem_used = 0;
+	core->if_map = NULL;
+	core->log = NULL;
+	core->log_entries = 0;
 }
 
 /* IMEM is handed out by bumping a pointer through the window the core boots
