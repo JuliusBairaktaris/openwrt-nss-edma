@@ -325,6 +325,7 @@ static void nss_core_halt(struct nss_core *core)
 
 	core->running = false;
 
+	nss_log_shadow_stop(core);
 	nss_rings_stop(core);
 	nss_iface_unbind(core);
 
@@ -383,6 +384,7 @@ static int nss_core_boot(struct nss_core *core)
 
 	core->loaded = true;
 	core->edma_stale = true;
+	nss_log_shadow_start(core);
 	nss_core_release(core);
 
 	if (!wait_for_completion_timeout(&core->booted,
@@ -630,6 +632,10 @@ static int nss_probe(struct platform_device *pdev)
 	ret = devm_regulator_get_enable(dev, "npu");
 	if (ret)
 		return dev_err_probe(dev, ret, "npu supply\n");
+
+	ret = nss_log_shadow_init(core);
+	if (ret)
+		return ret;
 
 	ret = nss_msg_init(core);
 	if (ret)
