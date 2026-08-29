@@ -340,6 +340,7 @@ static void nss_core_halt(struct nss_core *core)
 
 	core->loaded = false;
 	core->wifili_probed = false;
+	core->wifili_started = false;
 }
 
 static int nss_core_boot(struct nss_core *core)
