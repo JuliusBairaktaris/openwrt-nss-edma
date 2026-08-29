@@ -302,6 +302,7 @@ struct nss_core {
 	u32 id;
 	bool loaded;
 	bool running;
+	bool cpu_port_to_fw;
 	struct mutex lock;
 	struct dentry *debugfs;
 
@@ -318,6 +319,9 @@ struct nss_core {
 	bool edma_stale;
 
 	struct nss_msg msg;
+	struct net_device __rcu *iface[NSS_INTERFACE_MAX];
+	u64 rx_iface[NSS_INTERFACE_MAX];
+	u64 rx_type[8];
 	atomic_t buffers_queued;
 	struct completion booted;
 
@@ -327,6 +331,8 @@ struct nss_core {
 int nss_meminfo_init(struct nss_core *core);
 void nss_mem_free_all(struct nss_core *core);
 int nss_rings_start(struct nss_core *core);
+void nss_iface_bind(struct nss_core *core);
+void nss_iface_unbind(struct nss_core *core);
 void nss_rings_stop(struct nss_core *core);
 void nss_doorbell(struct nss_core *core, u32 intr);
 int nss_msg_init(struct nss_core *core);
