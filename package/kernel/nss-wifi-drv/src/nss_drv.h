@@ -341,6 +341,8 @@ int nss_msg_send(struct nss_core *core, void *msg, size_t len);
 bool nss_msg_complete(struct nss_core *core, const struct n2h_descriptor *desc);
 int nss_msg_probe(struct nss_core *core, struct seq_file *s);
 int nss_wifili_probe(struct nss_core *core, struct seq_file *s);
+int nss_wifili_start(struct seq_file *s);
+void nss_wifili_bind(struct nss_core *core);
 int nss_log_show_ring(struct nss_core *core, struct seq_file *s);
 void nss_log_dump(struct nss_core *core, const char *why);
 
