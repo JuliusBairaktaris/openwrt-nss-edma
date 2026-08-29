@@ -40,6 +40,7 @@
 
 #define NSS_H2N_RING_EMPTY_BUF	0
 #define NSS_H2N_RING_COMMAND	1
+#define NSS_H2N_RING_DATA	3
 #define NSS_N2H_RING_EMPTY_BUF	0
 
 /* Buffer types, in the descriptors. */
@@ -230,6 +231,7 @@ static_assert(offsetof(struct nss_cmn_msg, cb) == 24);
  */
 struct nss_skb_cb {
 	dma_addr_t dma;
+	bool tx;	/* a frame handed down, not a buffer handed over */
 };
 
 #define NSS_SKB_CB(skb) ((struct nss_skb_cb *)(skb)->cb)
@@ -330,6 +332,7 @@ struct nss_core {
 	u64 rx_iface[NSS_INTERFACE_MAX];
 	u64 rx_type[8];
 	u64 notify;
+	u64 tx_done;
 	u64 link_desc_seen;
 	u64 link_desc_returned;
 	atomic_t buffers_queued;
@@ -345,6 +348,7 @@ void nss_iface_bind(struct nss_core *core);
 void nss_iface_unbind(struct nss_core *core);
 void nss_rings_stop(struct nss_core *core);
 void nss_rings_quiesce(struct nss_core *core);
+int nss_data_send(struct nss_core *core, struct sk_buff *skb, u32 if_num);
 void nss_doorbell(struct nss_core *core, u32 intr);
 int nss_msg_init(struct nss_core *core);
 int nss_msg_send(struct nss_core *core, void *msg, size_t len);
@@ -352,6 +356,7 @@ bool nss_msg_complete(struct nss_core *core, const struct n2h_descriptor *desc);
 int nss_msg_probe(struct nss_core *core, struct seq_file *s);
 int nss_wifili_probe(struct nss_core *core, struct seq_file *s);
 int nss_wifili_start(struct seq_file *s);
+int nss_wifili_tx(struct seq_file *s);
 void nss_wifili_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
 		       u32 len);
 void nss_wifili_bind(struct nss_core *core);

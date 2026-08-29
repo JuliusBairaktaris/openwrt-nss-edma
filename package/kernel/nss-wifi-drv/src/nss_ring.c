@@ -161,6 +161,78 @@ static void nss_cpu_port_reclaim(struct nss_core *core)
 	dev_info(core->dev, "CPU-port queues returned to the host\n");
 }
 
+/* Hand a frame down to the firmware to place.
+ *
+ * The same descriptor the message layer fills, on the data queue rather than
+ * the command one, with the interface the firmware is to send it out of. The
+ * buffer is the host's until the firmware gives it back on a receive ring
+ * carrying the address handed out here, so it is marked to say which of the
+ * two kinds of buffer it is: a donated one is replaced when it returns, a
+ * transmitted one is simply freed.
+ *
+ * One descriptor, so one segment: a frame arriving in pieces is linearised
+ * rather than described piecewise, because nothing here yet has a reason to
+ * chain them and a chain the firmware reads wrongly is a fault rather than a
+ * dropped frame.
+ */
+int nss_data_send(struct nss_core *core, struct sk_buff *skb, u32 if_num)
+{
+	struct nss_h2n_ring *ring = &core->h2n[NSS_H2N_RING_DATA];
+	struct nss_if_mem_map *map = core->if_map;
+	struct h2n_descriptor *desc;
+	dma_addr_t dma;
+	u32 next;
+
+	if (!core->running)
+		return -ENODEV;
+
+	if (skb_is_nonlinear(skb) && skb_linearize(skb))
+		return -ENOMEM;
+
+	dma = dma_map_single(core->dev, skb->head,
+			     skb_end_pointer(skb) - skb->head, DMA_TO_DEVICE);
+	if (dma_mapping_error(core->dev, dma))
+		return -ENOMEM;
+
+	scoped_guard(spinlock_bh, &ring->lock) {
+		next = (ring->hlos_index + 1) & (NSS_RING_ENTRIES - 1);
+		if (next == READ_ONCE(map->h2n_nss_index[NSS_H2N_RING_DATA])) {
+			dma_unmap_single(core->dev, dma,
+					 skb_end_pointer(skb) - skb->head,
+					 DMA_TO_DEVICE);
+			return -EBUSY;
+		}
+
+		NSS_SKB_CB(skb)->dma = dma;
+		NSS_SKB_CB(skb)->tx = true;
+
+		desc = &ring->desc[ring->hlos_index];
+		desc->interface_num = if_num;
+		desc->buffer = dma;
+		desc->buffer_len = skb_end_pointer(skb) - skb->head;
+		desc->payload_offs = skb->data - skb->head;
+		desc->payload_len = skb->len;
+		desc->mss = 0;
+		/* Not the frame's priority: the tag is a classid whose upper
+		 * half selects a shaper node, so a bare priority written here
+		 * would name node zero. It is filled by whatever assigns the
+		 * shaping, and nothing does yet.
+		 */
+		desc->qos_tag = 0;
+		desc->buffer_type = NSS_H2N_BUFFER_PACKET;
+		desc->bit_flags = NSS_H2N_FLAG_FIRST_SEGMENT |
+				  NSS_H2N_FLAG_LAST_SEGMENT;
+		desc->opaque = (uintptr_t)skb;
+
+		ring->hlos_index = next;
+		WRITE_ONCE(map->h2n_hlos_index[NSS_H2N_RING_DATA], next);
+	}
+
+	nss_doorbell(core, NSS_H2N_INTR_DATA_CMD);
+
+	return 0;
+}
+
 /* Keep every line the firmware writes, not just the last ringful.
  *
  * The block the firmware asks for at boot fits thirty-two entries and a fault
@@ -462,6 +534,16 @@ static int nss_poll_n2h(struct napi_struct *napi, int budget)
 		} else if (skb && nss_data_recv(core, napi, desc, skb)) {
 			atomic_dec(&core->buffers_queued);
 			returned++;
+		} else if (skb && NSS_SKB_CB(skb)->tx) {
+			/* A frame handed down, now sent. Nothing replaces it:
+			 * the count this ring keeps is of buffers lent, and
+			 * this was never one.
+			 */
+			dma_unmap_single(core->dev, NSS_SKB_CB(skb)->dma,
+					 skb_end_pointer(skb) - skb->head,
+					 DMA_TO_DEVICE);
+			core->tx_done++;
+			dev_kfree_skb_any(skb);
 		} else if (skb) {
 			dma_unmap_single(core->dev, NSS_SKB_CB(skb)->dma,
 					 NSS_EMPTY_BUFFER_ALLOC, DMA_FROM_DEVICE);
