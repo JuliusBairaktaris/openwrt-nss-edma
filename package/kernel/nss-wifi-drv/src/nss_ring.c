@@ -17,6 +17,7 @@
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
 #include <linux/seq_file.h>
+#include <linux/soc/qcom/qca_edma.h>
 #include <linux/spinlock.h>
 
 #include "nss_drv.h"
@@ -28,6 +29,26 @@ void nss_doorbell(struct nss_core *core, u32 which)
 {
 	writel(BIT(NSS_H2N_INTR_BASE(core->id) + which),
 	       core->qgic + NSS_QGIC_IPC_REG);
+}
+
+/* Take the switch's CPU port back off the firmware.
+ *
+ * The firmware programs the queue-to-ring table as part of its own EDMA
+ * bring-up, which happens after it asks for the buffers that tell the host it
+ * is running, and it publishes no moment at which it has finished. A frame
+ * arriving on a data queue is that moment: the only way one gets there is
+ * through a table entry naming a firmware ring. So the first frame the
+ * firmware takes from the host is what buys the port back, and every frame
+ * after it stays with the host.
+ */
+static void nss_cpu_port_reclaim(struct nss_core *core)
+{
+	if (!core->cpu_port_taken)
+		return;
+
+	core->cpu_port_taken = false;
+	qca_edma_cpu_queues_to_host(core->conduit);
+	dev_info(core->dev, "CPU-port queues returned to the host\n");
 }
 
 /* Walk what the firmware has been saying, oldest first.
@@ -232,8 +253,11 @@ static int nss_poll_n2h(struct napi_struct *napi, int budget)
 		done++;
 	}
 
-	if (done)
+	if (done) {
 		WRITE_ONCE(map->n2h_hlos_index[qid], ring->hlos_index);
+		if (qid != NSS_N2H_RING_EMPTY_BUF)
+			nss_cpu_port_reclaim(core);
+	}
 
 	/* Whatever came back leaves the firmware that much shorter. */
 	nss_refill(core, done);
@@ -260,6 +284,14 @@ static int nss_poll_coredump(struct napi_struct *napi, int budget)
 	dev_err(core->dev, "core %u has crashed; leaving it stopped\n",
 		core->id);
 	nss_log_dump(core, "coredump");
+
+	/* Whatever the dead core still holds of the CPU port is given back
+	 * here rather than at detach. Keeping the box routing through a
+	 * firmware fault is the whole reason this driver does not panic, and
+	 * a host that cannot receive is not routing.
+	 */
+	core->cpu_port_taken = true;
+	nss_cpu_port_reclaim(core);
 
 	napi_complete(napi);
 
