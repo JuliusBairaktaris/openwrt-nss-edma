@@ -289,6 +289,19 @@ struct nss_clk_cfg {
 	unsigned long rate;
 };
 
+/* One unsolicited message type: how many arrived, and what the first one
+ * said. Eight words reaches past the common header into the body, which is
+ * where a request the host must answer carries its numbers, and the first
+ * word is the interface the message came from.
+ */
+#define NSS_MSG_SEEN_MAX	64
+
+struct nss_msg_seen {
+	u64 count;
+	u32 words;
+	u32 word[8];
+};
+
 struct nss_core {
 	struct device *dev;
 	void __iomem *nphys;
@@ -330,6 +343,7 @@ struct nss_core {
 	struct nss_msg msg;
 	struct net_device __rcu *iface[NSS_INTERFACE_MAX];
 	u64 rx_iface[NSS_INTERFACE_MAX];
+	struct nss_msg_seen seen[NSS_MSG_SEEN_MAX];
 	u64 rx_type[8];
 	u64 notify;
 	u64 tx_done;
@@ -354,6 +368,8 @@ int nss_msg_init(struct nss_core *core);
 int nss_msg_send(struct nss_core *core, void *msg, size_t len);
 bool nss_msg_complete(struct nss_core *core, const struct n2h_descriptor *desc);
 int nss_msg_probe(struct nss_core *core, struct seq_file *s);
+void nss_msg_seen(struct nss_core *core, const struct nss_cmn_msg *ncm,
+		  u32 len);
 int nss_wifili_probe(struct nss_core *core, struct seq_file *s);
 int nss_wifili_start(struct seq_file *s);
 int nss_wifili_tx(struct seq_file *s);

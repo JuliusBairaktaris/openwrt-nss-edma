@@ -72,6 +72,35 @@ bool nss_msg_complete(struct nss_core *core, const struct n2h_descriptor *desc)
  * would need a way to tell two answers apart that the protocol does not
  * provide.
  */
+/* What the firmware says when nothing asked it.
+ *
+ * Every unsolicited message is counted by type, and the first of each type
+ * keeps its opening words. Two of them the host owes an answer to and the
+ * shape of the answer is not derivable from the header: the peer memory
+ * request names how much memory per station the running firmware wants for
+ * its own peer record, which differs between firmware lines and is a
+ * structure the host writes into blind. Reading it off the blob is the only
+ * honest way to size that allocation.
+ */
+void nss_msg_seen(struct nss_core *core, const struct nss_cmn_msg *ncm,
+		  u32 len)
+{
+	struct nss_msg_seen *seen;
+	u32 words, i;
+
+	if (ncm->type >= ARRAY_SIZE(core->seen))
+		return;
+
+	seen = &core->seen[ncm->type];
+	if (seen->count++)
+		return;
+
+	words = min_t(u32, len / sizeof(u32), ARRAY_SIZE(seen->word));
+	for (i = 0; i < words; i++)
+		seen->word[i] = ((const u32 *)ncm)[i];
+	seen->words = words;
+}
+
 int nss_msg_send(struct nss_core *core, void *msg, size_t len)
 {
 	struct nss_cmn_msg *ncm = msg;
