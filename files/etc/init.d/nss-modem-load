@@ -1,0 +1,21 @@
+#!/bin/sh /etc/rc.common
+START=98
+STOP=10
+
+start() {
+	# Modem/wwan hic yoksa hemen cik, gereksiz bekleme yapma
+	[ -d /sys/class/net/wwan0 ] || exit 0
+
+	(
+		for i in $(seq 1 30); do
+			dmesg | grep -q "nss core 1 booted successfully" && break
+			sleep 1
+		done
+		sleep 1
+		if lsmod | grep -q "^qmi_wwan_q"; then
+			rmmod qmi_wwan_q 2>/dev/null
+			sleep 1
+			modprobe qmi_wwan_q 2>/dev/null
+		fi
+	) &
+}
