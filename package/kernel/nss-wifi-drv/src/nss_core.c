@@ -255,6 +255,7 @@ static void nss_core_halt(void *data)
 	core->running = false;
 
 	nss_rings_stop(core);
+	nss_iface_unbind(core);
 
 	/* After the rings, because a receive poll still running would find the
 	 * conduit gone underneath it. The core is in reset by now, so the
@@ -319,6 +320,8 @@ static int nss_core_boot(struct nss_core *core)
 	if (!core->conduit)
 		return dev_err_probe(core->dev, -ENODEV, "no EDMA conduit\n");
 
+	nss_iface_bind(core);
+
 	core->cpu_port_taken = true;
 	core->loaded = true;
 	nss_core_release(core);
@@ -381,6 +384,60 @@ static int nss_probe_show(struct seq_file *s, void *unused)
 	return nss_msg_probe(core, s);
 }
 DEFINE_SHOW_ATTRIBUTE(nss_probe);
+
+/* What the firmware has actually delivered, by the interface number it named
+ * and by the kind of buffer it arrived in. Which interface numbers a running
+ * firmware sends on is not something the host can look up, and the exception
+ * path has to be written against the ones it really uses.
+ */
+static int nss_rx_show(struct seq_file *s, void *unused)
+{
+	struct nss_core *core = s->private;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(core->rx_type); i++)
+		if (core->rx_type[i])
+			seq_printf(s, "type %d: %llu\n", i, core->rx_type[i]);
+
+	for (i = 0; i < NSS_INTERFACE_MAX; i++)
+		if (core->rx_iface[i])
+			seq_printf(s, "interface %d: %llu\n", i,
+				   core->rx_iface[i]);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(nss_rx);
+
+/* Leave the switch CPU port with the firmware instead of taking it back.
+ *
+ * The two data planes share the block and which of them owns the port is a
+ * runtime property, so it is one the host can set. Written before a core
+ * boots, this leaves wired traffic arriving on the firmware's data queues,
+ * which is the only way to exercise the exception path before there is a
+ * radio to exception from.
+ */
+static int nss_fwport_set(void *data, u64 val)
+{
+	struct nss_core *core = data;
+
+	guard(mutex)(&core->lock);
+	core->cpu_port_to_fw = val;
+
+	return 0;
+}
+
+static int nss_fwport_get(void *data, u64 *val)
+{
+	struct nss_core *core = data;
+
+	guard(mutex)(&core->lock);
+	*val = core->cpu_port_to_fw;
+
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(nss_fwport_fops, nss_fwport_get, nss_fwport_set,
+			 "%llu\n");
 
 /* The region the core boots from is described once, on the node the two cores
  * share, and each core's load address points into it.
@@ -520,6 +577,9 @@ static int nss_probe(struct platform_device *pdev)
 	debugfs_create_file("log", 0400, core->debugfs, core, &nss_log_fops);
 	debugfs_create_file("msg_probe", 0400, core->debugfs, core,
 			    &nss_probe_fops);
+	debugfs_create_file("rx", 0400, core->debugfs, core, &nss_rx_fops);
+	debugfs_create_file("cpu_port_to_fw", 0600, core->debugfs, core,
+			    &nss_fwport_fops);
 
 	return 0;
 }
