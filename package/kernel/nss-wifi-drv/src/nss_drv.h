@@ -306,6 +306,7 @@ struct nss_core {
 	bool cpu_port_taken;
 	bool cpu_port_to_fw;
 	bool wifili_probed;
+	bool clocks_on;
 	struct mutex lock;
 	struct dentry *debugfs;
 
