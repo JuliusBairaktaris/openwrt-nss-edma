@@ -453,9 +453,9 @@ static int nss_rx_show(struct seq_file *s, void *unused)
 			seq_printf(s, "interface %d: %llu\n", i,
 				   core->rx_iface[i]);
 
-	seq_printf(s, "notify: %llu link-desc seen: %llu returned: %llu\n",
+	seq_printf(s, "notify: %llu link-desc seen: %llu returned: %llu tx-done: %llu\n",
 		   core->notify, core->link_desc_seen,
-		   core->link_desc_returned);
+		   core->link_desc_returned, core->tx_done);
 
 	return 0;
 }
@@ -466,6 +466,12 @@ static int nss_wifili_show(struct seq_file *s, void *unused)
 	return nss_wifili_start(s);
 }
 DEFINE_SHOW_ATTRIBUTE(nss_wifili);
+
+static int nss_wifili_tx_show(struct seq_file *s, void *unused)
+{
+	return nss_wifili_tx(s);
+}
+DEFINE_SHOW_ATTRIBUTE(nss_wifili_tx);
 
 /* Leave the switch CPU port with the firmware instead of taking it back.
  *
@@ -644,6 +650,8 @@ static int nss_probe(struct platform_device *pdev)
 	debugfs_create_file("rx", 0400, core->debugfs, core, &nss_rx_fops);
 	debugfs_create_file("wifili_start", 0400, core->debugfs, core,
 			    &nss_wifili_fops);
+	debugfs_create_file("wifili_tx", 0400, core->debugfs, core,
+			    &nss_wifili_tx_fops);
 	debugfs_create_file("cpu_port_to_fw", 0600, core->debugfs, core,
 			    &nss_fwport_fops);
 
