@@ -296,6 +296,7 @@ struct nss_core {
 	u32 id;
 	bool loaded;
 	bool running;
+	bool cpu_port_taken;
 	struct mutex lock;
 	struct dentry *debugfs;
 
@@ -307,6 +308,7 @@ struct nss_core {
 	struct nss_n2h_ring n2h[NSS_N2H_RINGS];
 	struct nss_irq_ctx irq[NSS_CAUSE_MAX];
 	struct net_device *ndev;
+	struct net_device *conduit;
 
 	atomic_t buffers_queued;
 	struct completion booted;
