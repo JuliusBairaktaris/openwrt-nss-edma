@@ -1,0 +1,135 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] ath11k: stop driving the rings the NSS firmware owns
+
+The NSS firmware reaps and fills the data-path rings once its Wi-Fi data
+plane is started, so this driver has to be off them before it is. It is not
+enough to stop servicing them: a frame this driver puts on the transmit ring
+completes with a software cookie the firmware resolves against its own
+descriptor table, and a buffer this driver puts in the receive-DMA ring comes
+back under a cookie the firmware never minted.
+
+nss_offload, off by default, is read once at probe. Interrupt registration,
+the data-path service loop and the MSI group lookup are all driven from
+hw_params.ring_mask, which is a pointer inside a per-device copy of the
+hardware table, so pointing it at a copy carrying only the reorder-status and
+monitor-status masks is the whole of the handover for the six it drops. The
+receive-DMA pre-fill is skipped, hash-based receive steering is off because
+the firmware pairs one reorder-destination ring with one radio's buffer pool,
+and transmit is refused at the single site that produces an entry.
+
+Management frames leave over WMI above the refusal, so a station still
+associates. No data crosses the air while the offload is on.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -39,6 +39,10 @@
+ module_param_named(ftm_mode, ath11k_ftm_mode, bool, 0444);
+ MODULE_PARM_DESC(ftm_mode, "Boots up in factory test mode");
+ 
++bool ath11k_nss_offload;
++module_param_named(nss_offload, ath11k_nss_offload, bool, 0444);
++MODULE_PARM_DESC(nss_offload, "Hand the data-path rings to the NSS firmware");
++
+ static struct ath11k_hw_params ath11k_hw_params[] = {
+ 	{
+ 		.hw_rev = ATH11K_HW_IPQ8074,
+@@ -2656,6 +2660,22 @@
+ 
+ 	ab->hw_params = *hw_params;
+ 
++	/* Interrupt registration, the service loop and the MSI group lookup
++	 * are driven from this mask alone, so an all-zero entry is the whole
++	 * of the handover for a ring type. Only the two the host keeps are
++	 * carried over, which also leaves a ring type added later owned by
++	 * whoever asks for it rather than silently serviced here.
++	 */
++	if (ath11k_nss_offload) {
++		const struct ath11k_hw_ring_mask *m = ab->hw_params.ring_mask;
++
++		memcpy(ab->nss_ring_mask.reo_status, m->reo_status,
++		       sizeof(m->reo_status));
++		memcpy(ab->nss_ring_mask.rx_mon_status, m->rx_mon_status,
++		       sizeof(m->rx_mon_status));
++		ab->hw_params.ring_mask = &ab->nss_ring_mask;
++	}
++
+ 	ret = of_property_read_u32(ab->dev->of_node,
+ 				   "qcom,ath11k-fw-memory-mode",
+ 				   &fw_mem_mode);
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -62,6 +62,7 @@
+ 
+ extern unsigned int ath11k_frame_mode;
+ extern bool ath11k_ftm_mode;
++extern bool ath11k_nss_offload;
+ 
+ #define ATH11K_SCAN_TIMEOUT_HZ (20 * HZ)
+ 
+@@ -981,6 +982,11 @@
+ 
+ 	struct ath11k_hw_params hw_params;
+ 
++	/* What hw_params.ring_mask points at while the firmware owns the
++	 * data-path rings.
++	 */
++	struct ath11k_hw_ring_mask nss_ring_mask;
++
+ 	const struct firmware *cal_file;
+ 
+ 	/* Below regd's are protected by ab->data_lock */
+--- a/drivers/net/wireless/ath/ath11k/dp.c
++++ b/drivers/net/wireless/ath/ath11k/dp.c
+@@ -57,9 +57,14 @@
+ 
+ 	/* NOTE: reo_dest ring id starts from 1 unlike mac_id which starts from 0 */
+ 	reo_dest = ar->dp.mac_id + 1;
++	/* The firmware pairs one reorder destination ring with one radio's
++	 * receive buffer pool, so a peer's frames may not be spread over the
++	 * four while it owns them.
++	 */
+ 	ret = ath11k_wmi_set_peer_param(ar, addr, vdev_id,
+ 					WMI_PEER_SET_DEFAULT_ROUTING,
+-					DP_RX_HASH_ENABLE | (reo_dest << 1));
++					(ath11k_nss_offload ? 0 :
++					 DP_RX_HASH_ENABLE) | (reo_dest << 1));
+ 
+ 	if (ret) {
+ 		ath11k_warn(ab, "failed to set default routing %d peer :%pM vdev_id :%d\n",
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
+@@ -499,7 +499,12 @@
+ 	struct dp_rxdma_ring *rx_ring = &dp->rx_refill_buf_ring;
+ 	int i;
+ 
+-	ath11k_dp_rxdma_ring_buf_setup(ar, rx_ring, HAL_RXDMA_BUF);
++	/* The firmware fills this one from its own pool and names a returned
++	 * buffer by a cookie it minted, so a ring holding both sides' buffers
++	 * is a ring neither can reap.
++	 */
++	if (!ath11k_nss_offload)
++		ath11k_dp_rxdma_ring_buf_setup(ar, rx_ring, HAL_RXDMA_BUF);
+ 
+ 	if (ar->ab->hw_params.rxdma1_enable) {
+ 		rx_ring = &dp->rxdma_mon_buf_ring;
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -6216,6 +6216,17 @@
+ 		return;
+ 	}
+ 
++	/* The transmit ring belongs to the firmware, which reaps its own
++	 * completions by a cookie it minted and resolves that cookie to one
++	 * of its own descriptors. A frame the host puts there completes as a
++	 * descriptor the firmware never handed out. Management has already
++	 * left over the control path above.
++	 */
++	if (ath11k_nss_offload) {
++		ieee80211_free_txskb(ar->hw, skb);
++		return;
++	}
++
+ 	if (control->sta)
+ 		arsta = ath11k_sta_to_arsta(control->sta);
