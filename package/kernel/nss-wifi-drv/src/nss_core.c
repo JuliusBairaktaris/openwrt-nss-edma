@@ -371,6 +371,17 @@ static int nss_log_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(nss_log);
 
+static int nss_probe_show(struct seq_file *s, void *unused)
+{
+	struct nss_core *core = s->private;
+
+	if (!core->running)
+		return -ENODEV;
+
+	return nss_msg_probe(core, s);
+}
+DEFINE_SHOW_ATTRIBUTE(nss_probe);
+
 /* The region the core boots from is described once, on the node the two cores
  * share, and each core's load address points into it.
  */
@@ -489,6 +500,10 @@ static int nss_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "npu supply\n");
 
+	ret = nss_msg_init(core);
+	if (ret)
+		return ret;
+
 	ret = nss_region_get(core);
 	if (ret)
 		return dev_err_probe(dev, ret, "no boot region\n");
@@ -503,6 +518,8 @@ static int nss_probe(struct platform_device *pdev)
 	core->debugfs = debugfs_create_dir(dev_name(dev), NULL);
 	debugfs_create_file("boot", 0600, core->debugfs, core, &nss_boot_fops);
 	debugfs_create_file("log", 0400, core->debugfs, core, &nss_log_fops);
+	debugfs_create_file("msg_probe", 0400, core->debugfs, core,
+			    &nss_probe_fops);
 
 	return 0;
 }
