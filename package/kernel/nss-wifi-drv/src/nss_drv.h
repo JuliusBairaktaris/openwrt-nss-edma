@@ -305,6 +305,7 @@ struct nss_core {
 	bool running;
 	bool cpu_port_to_fw;
 	bool wifili_probed;
+	bool clocks_on;
 	struct mutex lock;
 	struct dentry *debugfs;
 
@@ -319,6 +320,7 @@ struct nss_core {
 	struct net_device *conduit;
 	/* A core has run on the EDMA block since it was last reset. */
 	bool edma_stale;
+	struct work_struct edma_reset;
 
 	struct nss_msg msg;
 	struct net_device __rcu *iface[NSS_INTERFACE_MAX];
