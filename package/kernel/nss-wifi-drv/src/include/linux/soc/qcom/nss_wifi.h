@@ -61,6 +61,15 @@ struct nss_wifi_soc {
 	struct nss_wifi_ring reo_reinject;
 	struct nss_wifi_ring rx_rel;
 	struct nss_wifi_ring reo_exception;
+
+	/*
+	 * The firmware reaps rings holding MSDU-link descriptors it cannot
+	 * put back, because the ring that returns one to the idle list is not
+	 * among those it is told about. It hands each one back by message,
+	 * and this is the way home. Called from softirq, may not sleep.
+	 */
+	void *priv;
+	void (*link_desc_return)(void *priv, const u32 *buf_addr_info);
 };
 
 #if IS_REACHABLE(CONFIG_NSS_WIFI_DRV)
