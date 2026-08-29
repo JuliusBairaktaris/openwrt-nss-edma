@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Host driver for the NSS firmware behind the Wi-Fi data plane.
  *
- * This is the half that prepares a core: its clocks and supply are turned on,
- * the instruction memory it boots with is cleared, and the firmware image is
- * copied into the reserved region it runs from. The core is left in reset;
- * releasing it belongs with the shared memory the firmware expects to find
- * already described, which is not here yet.
+ * Bringing a core up is: turn on its clocks and supply, clear the instruction
+ * memory it starts executing out of, copy the firmware image into the
+ * reserved region it runs from, satisfy the memory the image asks for, and
+ * only then release it from reset. The order matters at one point in
+ * particular - the image's memory requests carry the addresses the firmware
+ * will use, so a core released before they are answered reads pointers that
+ * were never written.
  *
  * None of it happens on probe. A running core takes over the switch CPU port,
  * so an image that started one while probing could not also bring up the host
- * ethernet stack; preparation is asked for through debugfs instead, and a
- * reboot returns the board to the host data plane.
+ * ethernet stack; bring-up is asked for through debugfs, and a reboot returns
+ * the board to the host data plane.
  */
 
 #include <linux/cleanup.h>
@@ -25,11 +27,38 @@
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/regulator/consumer.h>
+#include <linux/seq_file.h>
 
-struct nss_clk_cfg {
-	const char *name;
-	unsigned long rate;
-};
+#include "nss_drv.h"
+
+/* Core control registers, in the "nphys" range. */
+#define NSS_CORE_RESET_CTRL		0x0004
+#define NSS_CORE_BAR			0x0008
+#define NSS_CORE_AMC			0x000c
+#define NSS_CORE_BOOT_ADDR		0x0010
+#define NSS_CORE_INT_STAT2_TYPE		0x0040
+#define NSS_CORE_INT_STAT3_TYPE		0x0044
+#define NSS_CORE_IFETCH_RANGE		0x0048
+
+/* The core reaches its peripherals through a fixed aperture, and may fetch
+ * instructions only from the window the image is linked into. Both are
+ * properties of how the firmware was built.
+ */
+#define NSS_CORE_BAR_ADDR		0x3c000000
+#define NSS_CORE_IFETCH_RANGE_ADDR	0xbf004001
+
+/* Copy engine and core-to-core interrupts are level sensitive. */
+#define NSS_CORE_INT_STAT2_LEVEL	0xffff
+#define NSS_CORE_INT_STAT3_LEVEL	0xff
+
+/* The two reset sets are released in order, and each core's bits sit one byte
+ * apart in the register the cores share.
+ */
+#define NSS_MISC_RESET_FIRST		0x00000020
+#define NSS_MISC_RESET_SECOND		0x00000017
+#define NSS_MISC_RESET_SHIFT(id)	((id) << 3)
+
+#define NSS_BOOT_TIMEOUT_MS		2000
 
 /* Every clock the core needs, at the rate the firmware is built for. The
  * fabric clocks are shared between the two cores; a Wi-Fi data plane boots
@@ -37,7 +66,7 @@ struct nss_clk_cfg {
  * clock alone carries no rate here: the device tree states the frequencies
  * this SoC supports, and the core runs at the highest of them.
  */
-static const struct nss_clk_cfg nss_clks[] = {
+static const struct nss_clk_cfg nss_clk_tbl[] = {
 	{ "nss-core-clk",			0 },
 	{ "nss-noc-clk",		461500000 },
 	{ "nss-ptp-ref-clk",		150000000 },
@@ -59,46 +88,33 @@ static const struct nss_clk_cfg nss_clks[] = {
 	{ "nss-nc-axi-clk",		461500000 },
 };
 
-struct nss_core {
-	struct device *dev;
-	void __iomem *imem;
-	resource_size_t imem_size;
-	phys_addr_t load_addr;
-	resource_size_t region_base;
-	resource_size_t region_size;
-	unsigned long core_rate;
-	u32 id;
-	bool loaded;
-	struct mutex lock;
-	struct dentry *debugfs;
-	struct clk_bulk_data clks[];
-};
+#define NSS_CLK_COUNT ARRAY_SIZE(nss_clk_tbl)
 
 static void nss_clocks_disable(void *data)
 {
 	struct nss_core *core = data;
 
-	clk_bulk_disable_unprepare(ARRAY_SIZE(nss_clks), core->clks);
+	clk_bulk_disable_unprepare(NSS_CLK_COUNT, core->clks);
 }
 
 static int nss_clocks_get(struct nss_core *core)
 {
 	int i, ret;
 
-	for (i = 0; i < ARRAY_SIZE(nss_clks); i++)
-		core->clks[i].id = nss_clks[i].name;
+	for (i = 0; i < NSS_CLK_COUNT; i++)
+		core->clks[i].id = nss_clk_tbl[i].name;
 
-	ret = devm_clk_bulk_get(core->dev, ARRAY_SIZE(nss_clks), core->clks);
+	ret = devm_clk_bulk_get(core->dev, NSS_CLK_COUNT, core->clks);
 	if (ret)
 		return dev_err_probe(core->dev, ret, "clocks\n");
 
-	for (i = 0; i < ARRAY_SIZE(nss_clks); i++) {
-		unsigned long rate = nss_clks[i].rate ? : core->core_rate;
+	for (i = 0; i < NSS_CLK_COUNT; i++) {
+		unsigned long rate = nss_clk_tbl[i].rate ? : core->core_rate;
 
 		ret = clk_set_rate(core->clks[i].clk, rate);
 		if (ret)
 			return dev_err_probe(core->dev, ret, "%s rate\n",
-					     nss_clks[i].name);
+					     nss_clk_tbl[i].name);
 	}
 
 	return 0;
@@ -108,18 +124,17 @@ static int nss_clocks_enable(struct nss_core *core)
 {
 	int ret;
 
-	ret = clk_bulk_prepare_enable(ARRAY_SIZE(nss_clks), core->clks);
+	ret = clk_bulk_prepare_enable(NSS_CLK_COUNT, core->clks);
 	if (ret)
 		return dev_err_probe(core->dev, ret, "clock enable\n");
 
 	return devm_add_action_or_reset(core->dev, nss_clocks_disable, core);
 }
 
-/* The firmware is linked to run from a fixed address, so it is copied to
- * that address rather than anywhere within the region. The region the
- * device tree reserved is what bounds the copy: an image larger than the
- * space between its load address and the end of the region would run into
- * whatever follows it.
+/* The firmware is linked to run from a fixed address, so it is copied to that
+ * address rather than anywhere within the region. The region the device tree
+ * reserved is what bounds the copy: an image larger than the space between
+ * its load address and the end of the region would run into whatever follows.
  */
 static int nss_firmware_load(struct nss_core *core)
 {
@@ -160,7 +175,67 @@ out:
 	return ret;
 }
 
-static int nss_core_prepare(struct nss_core *core)
+static void nss_core_release(struct nss_core *core)
+{
+	u32 val;
+
+	val = readl(core->misc_reset);
+	val &= ~(NSS_MISC_RESET_FIRST << NSS_MISC_RESET_SHIFT(core->id));
+	writel(val, core->misc_reset);
+
+	/* The core needs 10 to 20 cycles after its reset clamp is released
+	 * before the second set may follow.
+	 */
+	usleep_range(10, 20);
+
+	val &= ~(NSS_MISC_RESET_SECOND << NSS_MISC_RESET_SHIFT(core->id));
+	writel(val, core->misc_reset);
+
+	/* Hold the core while its address configuration is written, so it
+	 * cannot fetch from a window it has not been given yet.
+	 */
+	writel(1, core->nphys + NSS_CORE_RESET_CTRL);
+
+	writel(1, core->nphys + NSS_CORE_AMC);
+	writel(NSS_CORE_BAR_ADDR, core->nphys + NSS_CORE_BAR);
+	writel(core->load_addr, core->nphys + NSS_CORE_BOOT_ADDR);
+
+	writel(NSS_CORE_INT_STAT2_LEVEL, core->nphys + NSS_CORE_INT_STAT2_TYPE);
+	writel(NSS_CORE_INT_STAT3_LEVEL, core->nphys + NSS_CORE_INT_STAT3_TYPE);
+
+	writel(NSS_CORE_IFETCH_RANGE_ADDR, core->nphys + NSS_CORE_IFETCH_RANGE);
+
+	writel(0, core->nphys + NSS_CORE_RESET_CTRL);
+}
+
+/* Stop the core before anything it is using is taken away. A core left
+ * executing keeps driving the switch CPU port and keeps fetching, so a later
+ * probe would copy a new image over live firmware and trap it; taking its
+ * clocks first would leave a gated register behind, which resets the SoC.
+ * Reset is asserted in the reverse order it was released, and only then is
+ * the memory it was reading released.
+ */
+static void nss_core_halt(void *data)
+{
+	struct nss_core *core = data;
+	u32 val;
+
+	writel(1, core->nphys + NSS_CORE_RESET_CTRL);
+
+	val = readl(core->misc_reset);
+	val |= NSS_MISC_RESET_SECOND << NSS_MISC_RESET_SHIFT(core->id);
+	writel(val, core->misc_reset);
+
+	val |= NSS_MISC_RESET_FIRST << NSS_MISC_RESET_SHIFT(core->id);
+	writel(val, core->misc_reset);
+
+	core->running = false;
+
+	nss_rings_stop(core);
+	nss_mem_free_all(core);
+}
+
+static int nss_core_boot(struct nss_core *core)
 {
 	int ret;
 
@@ -184,33 +259,75 @@ static int nss_core_prepare(struct nss_core *core)
 	if (ret)
 		return ret;
 
+	ret = nss_meminfo_init(core);
+	if (ret)
+		return ret;
+
+	ret = nss_rings_start(core);
+	if (ret)
+		goto free;
+
+	/* Registered after the clocks and the rings, so teardown runs in the
+	 * order the hardware needs: the core stops first, and only then loses
+	 * the memory and the interrupts it was using.
+	 */
+	ret = devm_add_action_or_reset(core->dev, nss_core_halt, core);
+	if (ret)
+		goto stop;
+
 	core->loaded = true;
+	nss_core_release(core);
+
+	if (!wait_for_completion_timeout(&core->booted,
+					 msecs_to_jiffies(NSS_BOOT_TIMEOUT_MS))) {
+		dev_err(core->dev, "core %u did not answer in %u ms\n",
+			core->id, NSS_BOOT_TIMEOUT_MS);
+		nss_log_dump(core, "boot timeout");
+		return -ETIMEDOUT;
+	}
 
 	return 0;
+
+stop:
+	nss_rings_stop(core);
+free:
+	nss_mem_free_all(core);
+
+	return ret;
 }
 
-static int nss_load_set(void *data, u64 val)
+static int nss_boot_set(void *data, u64 val)
 {
 	if (val != 1)
 		return -EINVAL;
 
-	return nss_core_prepare(data);
+	return nss_core_boot(data);
 }
 
-static int nss_load_get(void *data, u64 *val)
+static int nss_boot_get(void *data, u64 *val)
 {
 	struct nss_core *core = data;
 
 	guard(mutex)(&core->lock);
-	*val = core->loaded;
+	*val = core->running;
 
 	return 0;
 }
 
-DEFINE_DEBUGFS_ATTRIBUTE(nss_load_fops, nss_load_get, nss_load_set, "%llu\n");
+DEFINE_DEBUGFS_ATTRIBUTE(nss_boot_fops, nss_boot_get, nss_boot_set, "%llu\n");
 
-/* The region the core boots from is described once, on the node the two
- * cores share, and each core's load address points into it.
+static int nss_log_show(struct seq_file *s, void *unused)
+{
+	struct nss_core *core = s->private;
+
+	guard(mutex)(&core->lock);
+
+	return nss_log_show_ring(core, s);
+}
+DEFINE_SHOW_ATTRIBUTE(nss_log);
+
+/* The region the core boots from is described once, on the node the two cores
+ * share, and each core's load address points into it.
  */
 static int nss_region_get(struct nss_core *core)
 {
@@ -218,9 +335,24 @@ static int nss_region_get(struct nss_core *core)
 		of_find_compatible_node(NULL, NULL, "qcom,nss-common");
 	struct device_node *mem;
 	struct reserved_mem *rmem;
+	struct resource res;
+	int ret;
 
 	if (!cmn)
 		return -ENODEV;
+
+	ret = of_address_to_resource(cmn, 0, &res);
+	if (ret)
+		return ret;
+
+	/* The reset register sits inside the range the clock controller
+	 * claims, so it is mapped without being requested; asking for it
+	 * would be refused.
+	 */
+	core->misc_reset = devm_ioremap(core->dev, res.start,
+					resource_size(&res));
+	if (!core->misc_reset)
+		return -ENOMEM;
 
 	mem = of_parse_phandle(cmn, "memory-region", 0);
 	if (!mem)
@@ -245,16 +377,25 @@ static int nss_probe(struct platform_device *pdev)
 	struct resource *res;
 	int ret;
 
-	core = devm_kzalloc(dev, struct_size(core, clks, ARRAY_SIZE(nss_clks)),
+	core = devm_kzalloc(dev, struct_size(core, clks, NSS_CLK_COUNT),
 			    GFP_KERNEL);
 	if (!core)
 		return -ENOMEM;
 
 	core->dev = dev;
+	INIT_LIST_HEAD(&core->allocs);
+	init_completion(&core->booted);
 
 	ret = devm_mutex_init(dev, &core->lock);
 	if (ret)
 		return ret;
+
+	/* The firmware addresses everything it is given with 32 bits, so
+	 * every block handed to it has to come from below 4 GB.
+	 */
+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+	if (ret)
+		return dev_err_probe(dev, ret, "no 32-bit DMA\n");
 
 	ret = of_property_read_u32(dev->of_node, "qcom,id", &core->id);
 	if (ret)
@@ -270,10 +411,26 @@ static int nss_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, ret, "no qcom,max-frequency\n");
 	core->core_rate = rate;
 
+	core->nphys = devm_platform_ioremap_resource_byname(pdev, "nphys");
+	if (IS_ERR(core->nphys))
+		return PTR_ERR(core->nphys);
+
+	/* Shared with the other core and with the interrupt controller, so it
+	 * is mapped rather than claimed.
+	 */
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "qgic-phys");
+	if (!res)
+		return -ENODEV;
+
+	core->qgic = devm_ioremap(dev, res->start, resource_size(res));
+	if (!core->qgic)
+		return -ENOMEM;
+
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "vphys");
 	if (!res)
 		return -ENODEV;
 
+	core->imem_base = res->start;
 	core->imem_size = resource_size(res);
 	core->imem = devm_ioremap_resource(dev, res);
 	if (IS_ERR(core->imem))
@@ -299,7 +456,8 @@ static int nss_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, core);
 
 	core->debugfs = debugfs_create_dir(dev_name(dev), NULL);
-	debugfs_create_file("load", 0600, core->debugfs, core, &nss_load_fops);
+	debugfs_create_file("boot", 0600, core->debugfs, core, &nss_boot_fops);
+	debugfs_create_file("log", 0400, core->debugfs, core, &nss_log_fops);
 
 	return 0;
 }
