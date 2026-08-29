@@ -1,0 +1,181 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] ath11k: describe the data-path rings to the NSS firmware
+
+The NSS cores can reap the WLAN hardware's rings themselves, which takes
+the Wi-Fi data path off the host entirely, but they have to be told where
+those rings are. Everything needed is already known where the data path is
+set up, so copy it into a plain description and hand it over once.
+
+Describing is not handing over. The firmware is started by a separate
+deliberate act, and until then this driver owns its rings exactly as
+before, which is what keeps an image carrying this at stock behaviour.
+
+The one value that is converted rather than copied is the ring register
+address: the offsets this driver keeps are into its own mapping, and the
+firmware has no such mapping, so they go over with the register window's
+physical base added.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/drivers/net/wireless/ath/ath11k/dp.c
+--- a/drivers/net/wireless/ath/ath11k/dp.c
++++ b/drivers/net/wireless/ath/ath11k/dp.c
+@@ -15,6 +15,11 @@
+ #include "dp_rx.h"
+ #include "peer.h"
+ 
++#include <linux/platform_device.h>
++#include <linux/soc/qcom/nss_wifi.h>
++
++#define ATH11K_NSS_TARGET_IPQ8074	24
++
+ static void ath11k_dp_htt_htc_tx_complete(struct ath11k_base *ab,
+ 					  struct sk_buff *skb)
+ {
+@@ -872,6 +877,119 @@
+ }
+ EXPORT_SYMBOL(ath11k_dp_service_srng);
+ 
++/* Describe this data path to the NSS firmware driver.
++ *
++ * The firmware can reap these rings itself, which takes the Wi-Fi data path
++ * off the host entirely, but it has to be told where they are. Everything it
++ * needs is already known here, so it is copied into a plain description and
++ * handed over once. Nothing is given away by describing it: the firmware is
++ * started by a separate deliberate act, and until then this driver owns its
++ * rings exactly as before.
++ *
++ * The ring register addresses this driver keeps are offsets into its own
++ * mapping, and the firmware has no such mapping - it writes them as absolute
++ * addresses. So they are handed over with the register window's physical base
++ * added, which is the one thing here that has to be converted rather than
++ * copied.
++ */
++static void ath11k_nss_wifi_ring(struct nss_wifi_ring *r,
++				 struct ath11k_base *ab, u32 ring_id,
++				 u32 reg_base)
++{
++	struct hal_srng *srng = &ab->hal.srng_list[ring_id];
++
++	r->id = srng->ring_id;
++	r->dir = srng->ring_dir;
++	r->num_entries = srng->num_entries;
++	r->entry_size = srng->entry_size;
++	r->flags = srng->flags;
++	r->base = srng->ring_base_paddr;
++	r->hwreg[0] = reg_base + srng->hwreg_base[0];
++	r->hwreg[1] = reg_base + srng->hwreg_base[1];
++}
++
++static void ath11k_nss_wifi_describe(struct ath11k_base *ab)
++{
++	struct ath11k_dp *dp = &ab->dp;
++	struct nss_wifi_soc *soc;
++	struct resource *res;
++	u32 reg_base;
++	int i;
++
++	res = platform_get_resource(to_platform_device(ab->dev),
++				    IORESOURCE_MEM, 0);
++	if (!res)
++		return;
++
++	reg_base = res->start;
++
++	soc = kzalloc(sizeof(*soc), GFP_KERNEL);
++	if (!soc)
++		return;
++
++	soc->dev_base = reg_base;
++	soc->shadow_rd = ab->hal.rdp.paddr;
++	soc->shadow_wr = ab->hal.wrp.paddr;
++	soc->lmac_ring_start = HAL_SRNG_RING_ID_LMAC1_ID_START;
++	/* The target as the firmware enumerates it, which is its own numbering
++	 * and not this driver's hardware revision. This SoC is the only one
++	 * the description is built for.
++	 */
++	soc->target_type = ATH11K_NSS_TARGET_IPQ8074;
++	soc->tlv_size = ab->hw_params.hal_desc_sz;
++	soc->rx_buf_len = DP_RX_BUFFER_SIZE;
++	soc->num_tcl = ab->hw_params.max_tx_ring;
++	soc->num_reo = DP_REO_DST_RING_MAX;
++
++	for (i = 0; i < soc->num_tcl; i++) {
++		ath11k_nss_wifi_ring(&soc->tcl[i], ab,
++				     dp->tx_ring[i].tcl_data_ring.ring_id,
++				     reg_base);
++		ath11k_nss_wifi_ring(&soc->txcomp[i], ab,
++				     dp->tx_ring[i].tcl_comp_ring.ring_id,
++				     reg_base);
++	}
++
++	for (i = 0; i < soc->num_reo; i++)
++		ath11k_nss_wifi_ring(&soc->reo_dest[i], ab,
++				     dp->reo_dst_ring[i].ring_id, reg_base);
++
++	ath11k_nss_wifi_ring(&soc->reo_reinject, ab,
++			     dp->reo_reinject_ring.ring_id, reg_base);
++	ath11k_nss_wifi_ring(&soc->rx_rel, ab, dp->rx_rel_ring.ring_id,
++			     reg_base);
++	ath11k_nss_wifi_ring(&soc->reo_exception, ab,
++			     dp->reo_except_ring.ring_id, reg_base);
++
++	if (nss_wifi_soc_register(soc))
++		ath11k_warn(ab, "NSS firmware would not take the ring description\n");
++
++	kfree(soc);
++}
++
++
++static void ath11k_nss_wifi_describe_pdev(struct ath11k_base *ab, int id)
++{
++	struct ath11k *ar = ab->pdevs[id].ar;
++	struct nss_wifi_pdev pdev = {};
++	struct resource *res;
++
++	res = platform_get_resource(to_platform_device(ab->dev),
++				    IORESOURCE_MEM, 0);
++	if (!res)
++		return;
++
++	ath11k_nss_wifi_ring(&pdev.rxdma, ab,
++			     ar->dp.rx_refill_buf_ring.refill_buf_ring.ring_id,
++			     res->start);
++	pdev.radio_id = id;
++	pdev.lmac_id = ar->pdev_idx;
++	pdev.num_rx_swdesc = DP_RXDMA_BUF_RING_SIZE;
++
++	if (nss_wifi_pdev_register(&pdev))
++		ath11k_warn(ab, "NSS firmware would not take radio %d\n", id);
++}
++
+ void ath11k_dp_pdev_free(struct ath11k_base *ab)
+ {
+ 	struct ath11k *ar;
+@@ -932,6 +1050,8 @@
+ 				    i);
+ 			goto err;
+ 		}
++
++		ath11k_nss_wifi_describe_pdev(ab, i);
+ 	}
+ 
+ 	return 0;
+@@ -1025,6 +1145,8 @@
+ 
+ void ath11k_dp_free(struct ath11k_base *ab)
+ {
++	nss_wifi_soc_unregister();
++
+ 	struct ath11k_dp *dp = &ab->dp;
+ 	int i;
+ 
+@@ -1106,6 +1228,8 @@
+ 
+ 	/* Init any SOC level resource for DP */
+ 
++	ath11k_nss_wifi_describe(ab);
++
+ 	return 0;
+ 
+ fail_cmn_srng_cleanup:
