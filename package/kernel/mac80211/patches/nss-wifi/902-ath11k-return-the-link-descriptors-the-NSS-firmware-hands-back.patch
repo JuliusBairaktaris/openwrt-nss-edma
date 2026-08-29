@@ -1,0 +1,73 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] ath11k: return the link descriptors the NSS firmware hands back
+
+The firmware reaps rings holding MSDU-link descriptors it cannot release
+itself: the ring that returns one to the idle list is not among those it is
+told about, so it hands each one back by message instead. The two words it
+sends are the buffer-address information of a release descriptor, which is
+what the return already consumes, so the payload goes through untouched.
+
+ath11k_dp_rx_link_desc_return() is the function that does it and it already
+takes the action that puts a descriptor in the idle list. Give it external
+linkage and hang a thunk off the ring description.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/drivers/net/wireless/ath/ath11k/dp.c
++++ b/drivers/net/wireless/ath/ath11k/dp.c
+@@ -913,6 +913,21 @@
+ 	r->hwreg[1] = reg_base + srng->hwreg_base[1];
+ }
+ 
++/* Put back an MSDU-link descriptor the firmware cannot release itself: the
++ * ring that returns one to the idle list is not among those it is told about.
++ * The two words it sends back are the buffer-address info of a release
++ * descriptor, which is exactly what the return consumes.
++ *
++ * Called from the firmware driver's receive poll, so it may not sleep. Late is
++ * the same as never - a descriptor is out of the idle list until this runs,
++ * and an empty idle list stops receive on every radio.
++ */
++static void ath11k_nss_link_desc_return(void *priv, const u32 *buf_addr_info)
++{
++	ath11k_dp_rx_link_desc_return(priv, (u32 *)buf_addr_info,
++				      HAL_WBM_REL_BM_ACT_PUT_IN_IDLE);
++}
++
+ static void ath11k_nss_wifi_describe(struct ath11k_base *ab)
+ {
+ 	struct ath11k_dp *dp = &ab->dp;
+@@ -945,6 +960,8 @@
+ 	soc->rx_buf_len = DP_RX_BUFFER_SIZE;
+ 	soc->num_tcl = ab->hw_params.max_tx_ring;
+ 	soc->num_reo = DP_REO_DST_RING_MAX;
++	soc->priv = ab;
++	soc->link_desc_return = ath11k_nss_link_desc_return;
+ 
+ 	for (i = 0; i < soc->num_tcl; i++) {
+ 		ath11k_nss_wifi_ring(&soc->tcl[i], ab,
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
+@@ -848,9 +848,8 @@
+ 	rx_tid->unaligned_size = 0;
+ }
+ 
+-static int ath11k_dp_rx_link_desc_return(struct ath11k_base *ab,
+-					 u32 *link_desc,
+-					 enum hal_wbm_rel_bm_act action)
++int ath11k_dp_rx_link_desc_return(struct ath11k_base *ab, u32 *link_desc,
++				  enum hal_wbm_rel_bm_act action)
+ {
+ 	struct ath11k_dp *dp = &ab->dp;
+ 	struct hal_srng *srng;
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.h
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.h
+@@ -73,6 +73,8 @@
+ int ath11k_dp_process_rx(struct ath11k_base *ab, int mac_id,
+ 			 struct napi_struct *napi,
+ 			 int budget);
++int ath11k_dp_rx_link_desc_return(struct ath11k_base *ab, u32 *link_desc,
++				  enum hal_wbm_rel_bm_act action);
+ int ath11k_dp_rxbufs_replenish(struct ath11k_base *ab, int mac_id,
+ 			       struct dp_rxdma_ring *rx_ring,
+ 			       int req_entries,
