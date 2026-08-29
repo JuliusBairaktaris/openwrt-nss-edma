@@ -1,0 +1,376 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* The message and data rings between the host and a running core.
+ *
+ * The rings live in coherent memory, so the indices each side publishes are
+ * visible to the other without maintenance of our own. Each of the ten
+ * interrupt causes is its own line - this SoC has no mask or status register
+ * for them - so a cause is fixed when its line is claimed and never has to be
+ * decoded.
+ *
+ * A running core's first act is to ask for buffers, because it has none. That
+ * request is also how the host learns it is up: there is no ready message in
+ * this protocol.
+ */
+
+#include <linux/cleanup.h>
+#include <linux/interrupt.h>
+#include <linux/of_irq.h>
+#include <linux/platform_device.h>
+#include <linux/seq_file.h>
+#include <linux/spinlock.h>
+
+#include "nss_drv.h"
+
+#define NSS_NAPI_WEIGHT		64
+#define NSS_REFILL_BATCH	64
+
+void nss_doorbell(struct nss_core *core, u32 which)
+{
+	writel(BIT(NSS_H2N_INTR_BASE(core->id) + which),
+	       core->qgic + NSS_QGIC_IPC_REG);
+}
+
+/* Walk what the firmware has been saying, oldest first.
+ *
+ * Three things about the ring are the firmware's and not negotiable. Its
+ * write position is a free-running count of lines ever written, not an index,
+ * so how many are valid follows from it rather than from the ring being full.
+ * Each entry's cookie is written last, after the text, so the cookie is what
+ * says a slot is complete. And the descriptor's own cookie is written once at
+ * boot and left in the core's cache until some later line flushes the line it
+ * shares, so it is absent on exactly the boot that went well - the host
+ * allocated the block and already knows how many entries fit, so nothing here
+ * needs to ask.
+ */
+static void nss_log_walk(struct nss_core *core, struct seq_file *s)
+{
+	u32 n = core->log_entries;
+	u32 written, count, i;
+
+	if (!core->log || !n)
+		return;
+
+	written = READ_ONCE(core->log->current_entry);
+	count = min(written, n);
+
+	for (i = 0; i < count; i++) {
+		struct nss_log_entry *e =
+			&core->log->log_ring_buffer[(written - count + i) % n];
+
+		if (e->cookie != NSS_LOG_COOKIE)
+			continue;
+
+		if (s)
+			seq_printf(s, "[%llu] %.*s\n", e->sequence_num,
+				   NSS_LOG_LINE_WIDTH, e->message);
+		else
+			dev_err(core->dev, "  fw[%llu] %.*s\n", e->sequence_num,
+				NSS_LOG_LINE_WIDTH, e->message);
+	}
+}
+
+int nss_log_show_ring(struct nss_core *core, struct seq_file *s)
+{
+	if (!core->log || !core->log_entries)
+		return -ENODEV;
+
+	nss_log_walk(core, s);
+
+	return 0;
+}
+
+/* The only account of a core that has stopped, so it is dumped whenever one
+ * does. A retail image compiles out every message but a trap, so a silent
+ * ring here is itself the finding: the core stopped without trapping.
+ */
+void nss_log_dump(struct nss_core *core, const char *why)
+{
+	dev_err(core->dev, "%s: firmware log follows\n", why);
+	nss_log_walk(core, NULL);
+}
+
+/* Hand the firmware empty buffers. It picks its own offset inside each one
+ * and reports where the payload landed, so what it is given is the head of
+ * the allocation rather than the data pointer.
+ */
+static int nss_refill(struct nss_core *core, int budget)
+{
+	struct nss_h2n_ring *ring = &core->h2n[NSS_H2N_RING_EMPTY_BUF];
+	struct nss_if_mem_map *map = core->if_map;
+	u32 size = NSS_EMPTY_BUFFER_ALLOC;
+	int filled = 0;
+
+	guard(spinlock_bh)(&ring->lock);
+
+	while (filled < budget) {
+		u32 next = (ring->hlos_index + 1) & (NSS_RING_ENTRIES - 1);
+		struct h2n_descriptor *desc;
+		struct sk_buff *skb;
+		dma_addr_t dma;
+
+		if (next == READ_ONCE(map->h2n_nss_index[NSS_H2N_RING_EMPTY_BUF]))
+			break;
+
+		/* Custody of these buffers passes to the firmware for as long
+		 * as it likes, so they are allocated outright rather than
+		 * carved out of the per-CPU fragment cache, where each one in
+		 * flight would pin the whole page it came from.
+		 */
+		skb = alloc_skb(size, GFP_ATOMIC);
+		if (!skb)
+			break;
+
+		dma = dma_map_single(core->dev, skb->head, size,
+				     DMA_FROM_DEVICE);
+		if (dma_mapping_error(core->dev, dma)) {
+			kfree_skb(skb);
+			break;
+		}
+
+		NSS_SKB_CB(skb)->dma = dma;
+
+		desc = &ring->desc[ring->hlos_index];
+		desc->buffer = dma;
+		desc->buffer_len = size;
+		desc->payload_len = 0;
+		desc->payload_offs = 0;
+		desc->buffer_type = NSS_H2N_BUFFER_EMPTY;
+		desc->bit_flags = 0;
+		desc->interface_num = 0;
+		desc->opaque = (uintptr_t)skb;
+
+		ring->hlos_index = next;
+		filled++;
+	}
+
+	if (filled) {
+		WRITE_ONCE(map->h2n_hlos_index[NSS_H2N_RING_EMPTY_BUF],
+			   ring->hlos_index);
+		atomic_add(filled, &core->buffers_queued);
+		nss_doorbell(core, NSS_H2N_INTR_EMPTY_BUF);
+	}
+
+	return filled;
+}
+
+/* The firmware is up the first time it asks for buffers. Before believing it,
+ * check that the page both sides share carries the value the firmware writes
+ * once it has taken it over.
+ */
+static void nss_check_booted(struct nss_core *core)
+{
+	if (core->running)
+		return;
+
+	if (core->if_map->magic != NSS_IF_MEM_MAP_MAGIC) {
+		dev_err(core->dev, "core %u answered with magic %#x\n",
+			core->id, core->if_map->magic);
+		return;
+	}
+
+	core->running = true;
+	complete(&core->booted);
+	dev_info(core->dev, "core %u booted\n", core->id);
+}
+
+static int nss_poll_sos(struct napi_struct *napi, int budget)
+{
+	struct nss_irq_ctx *ctx = container_of(napi, struct nss_irq_ctx, napi);
+	struct nss_core *core = ctx->core;
+
+	nss_check_booted(core);
+	nss_refill(core, min(budget, NSS_REFILL_BATCH));
+
+	napi_complete(napi);
+	enable_irq(ctx->irq);
+
+	return 0;
+}
+
+/* Take back whatever the firmware has returned. A buffer comes back either as
+ * a packet on a data queue or as an unused one on the return queue; both are
+ * released here, because nothing above this driver consumes them yet.
+ */
+static int nss_poll_n2h(struct napi_struct *napi, int budget)
+{
+	struct nss_irq_ctx *ctx = container_of(napi, struct nss_irq_ctx, napi);
+	struct nss_core *core = ctx->core;
+	struct nss_n2h_ring *ring;
+	struct nss_if_mem_map *map;
+	u32 nss_index, count;
+	int done = 0;
+	int qid;
+
+	/* Ring 0 carries buffers the firmware is giving back unused; rings 1
+	 * to 4 are the four data queues.
+	 */
+	if (ctx->cause == NSS_CAUSE_EMPTY_BUFFER_QUEUE)
+		qid = NSS_N2H_RING_EMPTY_BUF;
+	else
+		qid = ctx->cause - NSS_CAUSE_DATA_QUEUE_0 + 1;
+
+	ring = &core->n2h[qid];
+	map = core->if_map;
+
+	nss_index = READ_ONCE(map->n2h_nss_index[qid]);
+	count = (nss_index - ring->hlos_index) & (NSS_RING_ENTRIES - 1);
+	count = min_t(u32, count, budget);
+
+	while (done < count) {
+		struct n2h_descriptor *desc = &ring->desc[ring->hlos_index];
+		struct sk_buff *skb = (struct sk_buff *)(uintptr_t)desc->opaque;
+
+		if (skb) {
+			dma_unmap_single(core->dev, NSS_SKB_CB(skb)->dma,
+					 NSS_EMPTY_BUFFER_ALLOC, DMA_FROM_DEVICE);
+			dev_kfree_skb_any(skb);
+			atomic_dec(&core->buffers_queued);
+		}
+
+		ring->hlos_index = (ring->hlos_index + 1) &
+				   (NSS_RING_ENTRIES - 1);
+		done++;
+	}
+
+	if (done)
+		WRITE_ONCE(map->n2h_hlos_index[qid], ring->hlos_index);
+
+	/* Whatever came back leaves the firmware that much shorter. */
+	nss_refill(core, done);
+
+	if (done < budget) {
+		napi_complete(napi);
+		enable_irq(ctx->irq);
+	}
+
+	return done;
+}
+
+/* A core that has dumped is finished. Stock brings the whole box down here,
+ * on the argument that the data plane is gone either way; this driver keeps
+ * the box up, because the host stack is still perfectly able to route and the
+ * firmware log is worth more read than lost to a panic.
+ */
+static int nss_poll_coredump(struct napi_struct *napi, int budget)
+{
+	struct nss_irq_ctx *ctx = container_of(napi, struct nss_irq_ctx, napi);
+	struct nss_core *core = ctx->core;
+
+	core->running = false;
+	dev_err(core->dev, "core %u has crashed; leaving it stopped\n",
+		core->id);
+	nss_log_dump(core, "coredump");
+
+	napi_complete(napi);
+
+	/* The line is deliberately left masked: the core is not coming back
+	 * without a reset, and re-arming would only invite the same interrupt
+	 * again.
+	 */
+	return 0;
+}
+
+static irqreturn_t nss_isr(int irq, void *data)
+{
+	struct nss_irq_ctx *ctx = data;
+
+	disable_irq_nosync(irq);
+	napi_schedule(&ctx->napi);
+
+	return IRQ_HANDLED;
+}
+
+typedef int (*nss_poll_t)(struct napi_struct *napi, int budget);
+
+static nss_poll_t nss_poll_fn(enum nss_cause cause)
+{
+	switch (cause) {
+	case NSS_CAUSE_EMPTY_BUFFER_SOS:
+		return nss_poll_sos;
+	case NSS_CAUSE_EMPTY_BUFFER_QUEUE:
+	case NSS_CAUSE_DATA_QUEUE_0:
+	case NSS_CAUSE_DATA_QUEUE_1:
+	case NSS_CAUSE_DATA_QUEUE_2:
+	case NSS_CAUSE_DATA_QUEUE_3:
+		return nss_poll_n2h;
+	case NSS_CAUSE_COREDUMP_COMPLETE:
+		return nss_poll_coredump;
+	default:
+		/* Paged buffers, transmit unblocking and the profiler are not
+		 * used by this driver, so their lines are left unclaimed:
+		 * they are edge triggered, and nothing here would act on
+		 * them.
+		 */
+		return NULL;
+	}
+}
+
+int nss_rings_start(struct nss_core *core)
+{
+	struct platform_device *pdev = to_platform_device(core->dev);
+	int i, ret;
+
+	core->ndev = alloc_netdev_dummy(0);
+	if (!core->ndev)
+		return -ENOMEM;
+
+	for (i = 0; i < NSS_CAUSE_MAX; i++) {
+		struct nss_irq_ctx *ctx = &core->irq[i];
+		nss_poll_t poll = nss_poll_fn(i);
+
+		ctx->core = core;
+		ctx->cause = i;
+
+		if (!poll)
+			continue;
+
+		ctx->irq = platform_get_irq(pdev, i);
+		if (ctx->irq < 0) {
+			ret = ctx->irq;
+			goto err;
+		}
+
+		netif_napi_add_weight(core->ndev, &ctx->napi, poll,
+				      NSS_NAPI_WEIGHT);
+		napi_enable(&ctx->napi);
+		ctx->napi_added = true;
+
+		ret = request_irq(ctx->irq, nss_isr, 0, dev_name(core->dev),
+				  ctx);
+		if (ret)
+			goto err;
+	}
+
+	return 0;
+
+err:
+	nss_rings_stop(core);
+
+	return ret;
+}
+
+void nss_rings_stop(struct nss_core *core)
+{
+	int i;
+
+	for (i = 0; i < NSS_CAUSE_MAX; i++) {
+		struct nss_irq_ctx *ctx = &core->irq[i];
+
+		if (!ctx->napi_added)
+			continue;
+
+		/* Free the line before stopping the poll: an interrupt that
+		 * arrived while this ran would otherwise schedule a NAPI
+		 * instance that is about to be deleted.
+		 */
+		free_irq(ctx->irq, ctx);
+		napi_disable(&ctx->napi);
+		netif_napi_del(&ctx->napi);
+		ctx->napi_added = false;
+	}
+
+	if (core->ndev) {
+		free_netdev(core->ndev);
+		core->ndev = NULL;
+	}
+}
