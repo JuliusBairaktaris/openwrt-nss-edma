@@ -597,6 +597,21 @@ err:
 	return ret;
 }
 
+/* Wait out any receive poll already running.
+ *
+ * A poll that has read a callback the WLAN driver is withdrawing is holding a
+ * pointer into memory that driver is about to free, and clearing the pointer
+ * does not reach a poll that read it a moment earlier.
+ */
+void nss_rings_quiesce(struct nss_core *core)
+{
+	int i;
+
+	for (i = 0; i < NSS_CAUSE_MAX; i++)
+		if (core->irq[i].napi_added)
+			napi_synchronize(&core->irq[i].napi);
+}
+
 void nss_rings_stop(struct nss_core *core)
 {
 	int i;
