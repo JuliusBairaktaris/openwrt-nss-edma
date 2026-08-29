@@ -109,6 +109,7 @@ struct nss_wifili_ctx {
  * knows nothing about which core is which, so the binding lives here.
  */
 static struct nss_core *nss_wifili_core;
+static int nss_wifili_vdev_if = -1;
 static struct nss_wifi_soc nss_wifili_soc;
 static struct nss_wifi_pdev nss_wifili_pdev[NSS_WIFILI_MAX_PDEV_NUM_MSG];
 static bool nss_wifili_have_soc;
@@ -500,9 +501,72 @@ static void nss_wifili_vdev_probe(struct nss_core *core, struct seq_file *s,
 	 * next arm has to answer for; this one is about whether a virtual
 	 * device can be made at all, and the probe runs once per core.
 	 */
+	nss_wifili_vdev_if = if_num;
 	seq_puts(s, "vdev node left allocated\n");
 
 	kfree(v);
+}
+
+/* Hand one frame down, to see whether the firmware takes it.
+ *
+ * Nothing above this yet posts a frame: the WLAN driver refuses transmit while
+ * the offload is on, and the divert that replaces that refusal needs a virtual
+ * device per interface, which needs a peer to be worth having. This is the
+ * step below all of it - a frame the host builds, addressed to the virtual
+ * device the probe already makes, so the data queue and the completion that
+ * comes back can be exercised before any of that exists.
+ *
+ * The frame goes nowhere: with no peer, the firmware has nobody to send it to.
+ * What is being asked is whether the descriptor is consumed and the buffer
+ * handed back, which is the whole of the transmit contract minus its purpose.
+ */
+int nss_wifili_tx(struct seq_file *s)
+{
+	struct nss_core *core = nss_wifili_core;
+	u64 before, after;
+	struct sk_buff *skb;
+	int i, ret, sent = 0;
+
+	if (!core || !core->running)
+		return -ENODEV;
+
+	if (nss_wifili_vdev_if < 0) {
+		seq_puts(s, "no virtual device: run wifili_start first\n");
+		return 0;
+	}
+
+	before = core->tx_done;
+
+	for (i = 0; i < 8; i++) {
+		skb = alloc_skb(128 + NET_SKB_PAD, GFP_KERNEL);
+		if (!skb)
+			break;
+		skb_reserve(skb, NET_SKB_PAD);
+		/* A broadcast frame of its own making: destination, source and
+		 * an ethertype nothing claims, so nothing downstream of a
+		 * firmware that did forward it would act on one.
+		 */
+		memset(skb_put(skb, 60), 0, 60);
+		memset(skb->data, 0xff, ETH_ALEN);
+		skb->data[12] = 0x88;
+		skb->data[13] = 0xb5;
+
+		ret = nss_data_send(core, skb, nss_wifili_vdev_if);
+		if (ret) {
+			dev_kfree_skb_any(skb);
+			seq_printf(s, "post %d: rc %d\n", i, ret);
+			break;
+		}
+		sent++;
+	}
+
+	msleep(200);
+	after = core->tx_done;
+
+	seq_printf(s, "posted %d to interface %d, completed %llu\n",
+		   sent, nss_wifili_vdev_if, after - before);
+
+	return 0;
 }
 
 /* Start the firmware's Wi-Fi data plane on the rings the WLAN driver owns.
