@@ -249,6 +249,7 @@ static int nss_meminfo_rings(struct nss_core *core)
 	atomic_set(&core->buffers_queued, 0);
 	memset(core->rx_iface, 0, sizeof(core->rx_iface));
 	memset(core->rx_type, 0, sizeof(core->rx_type));
+	memset(core->seen, 0, sizeof(core->seen));
 
 	core->if_map->h2n_rings = NSS_H2N_RINGS;
 	core->if_map->n2h_rings = NSS_N2H_RINGS;
