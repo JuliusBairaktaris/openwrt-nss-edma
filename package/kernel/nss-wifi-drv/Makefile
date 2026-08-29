@@ -34,4 +34,12 @@ define Build/Compile
 	+$(KERNEL_MAKE) M="$(PKG_BUILD_DIR)" modules
 endef
 
+# The WLAN driver describes its rings through this, and is built by another
+# package, so the description has to be reachable from the staging tree.
+define Build/InstallDev
+	$(INSTALL_DIR) $(1)/usr/include/nss-wifi-drv/linux/soc/qcom
+	$(CP) ./src/include/linux/soc/qcom/nss_wifi.h \
+		$(1)/usr/include/nss-wifi-drv/linux/soc/qcom/
+endef
+
 $(eval $(call KernelPackage,nss-wifi-drv))
