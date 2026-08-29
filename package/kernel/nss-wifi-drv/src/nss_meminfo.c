@@ -225,6 +225,7 @@ static int nss_meminfo_rings(struct nss_core *core)
 			  NSS_RING_STRIDE_ENTRIES;
 
 		core->h2n[i].desc = h2n + off;
+		core->h2n[i].hlos_index = 0;
 		spin_lock_init(&core->h2n[i].lock);
 		core->if_map->h2n_desc_if[i].desc_addr = h2n_addr + off;
 		core->if_map->h2n_desc_if[i].size = NSS_RING_ENTRIES;
@@ -235,9 +236,19 @@ static int nss_meminfo_rings(struct nss_core *core)
 			  NSS_RING_STRIDE_ENTRIES;
 
 		core->n2h[i].desc = n2h + off;
+		core->n2h[i].hlos_index = 0;
 		core->if_map->n2h_desc_if[i].desc_addr = n2h_addr + off;
 		core->if_map->n2h_desc_if[i].size = NSS_RING_ENTRIES;
 	}
+
+	/* The rings are new and empty, so every count of what is in them
+	 * starts again with them. The index the host publishes is one half of
+	 * a pair the firmware subtracts, and the block was just allocated and
+	 * zeroed, so the other half reads zero when the core is released.
+	 */
+	atomic_set(&core->buffers_queued, 0);
+	memset(core->rx_iface, 0, sizeof(core->rx_iface));
+	memset(core->rx_type, 0, sizeof(core->rx_type));
 
 	core->if_map->h2n_rings = NSS_H2N_RINGS;
 	core->if_map->n2h_rings = NSS_N2H_RINGS;
