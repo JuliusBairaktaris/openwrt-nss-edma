@@ -446,6 +446,11 @@ static int nss_wifili_radio_alloc(struct nss_core *core,
  */
 #define NSS_WIFILI_VDEV_MAX	16
 
+/* Stations. The record the firmware keeps for one is host memory, so this
+ * bounds what a leak can cost rather than what the radio can hold.
+ */
+#define NSS_WIFILI_PEER_MAX	64
+
 /* Give a dynamic interface number back to the firmware. */
 static void nss_wifili_vdev_free(struct nss_core *core, int if_num)
 {
@@ -465,6 +470,7 @@ static void nss_wifili_vdev_free(struct nss_core *core, int if_num)
 struct nss_wifili_vdev {
 	struct net_device *dev;
 	int if_num;
+	u32 vdev_id;
 };
 
 static struct nss_wifili_vdev nss_wifili_vdev_tbl[NSS_WIFILI_VDEV_MAX];
@@ -558,6 +564,7 @@ int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
 
 	nss_wifili_vdev_tbl[i].dev = dev;
 	nss_wifili_vdev_tbl[i].if_num = if_num;
+	nss_wifili_vdev_tbl[i].vdev_id = vdev_id;
 
 	dev_hold(dev);
 	rcu_assign_pointer(core->iface[if_num], dev);
@@ -568,6 +575,8 @@ int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
 	return if_num;
 }
 EXPORT_SYMBOL_GPL(nss_wifi_vdev_register);
+
+static void nss_wifili_peer_flush(struct nss_core *core, u32 vdev_id);
 
 void nss_wifi_vdev_unregister(struct net_device *dev)
 {
@@ -600,6 +609,8 @@ void nss_wifi_vdev_unregister(struct net_device *dev)
 		nss_wifili_vdev_tbl[i].dev = NULL;
 		nss_wifili_vdev_tbl[i].if_num = -1;
 
+		nss_wifili_peer_flush(core, nss_wifili_vdev_tbl[i].vdev_id);
+
 		/* Down before the node goes: a virtual device released while
 		 * it is still up faults the firmware.
 		 */
@@ -609,6 +620,189 @@ void nss_wifi_vdev_unregister(struct net_device *dev)
 	}
 }
 EXPORT_SYMBOL_GPL(nss_wifi_vdev_unregister);
+
+/* Tell the firmware about a station.
+ *
+ * The firmware keeps its own record of a peer, in memory the host owns and
+ * hands over by address, so a create is an allocation as much as a message.
+ * How large that record is differs between firmware lines and the host writes
+ * into it blind, so a whole page is given and the whole page is declared: a
+ * firmware that checks the size is satisfied, and one that does not cannot
+ * run past what was allocated.
+ *
+ * The address-search index and hash come from the WLAN firmware by way of the
+ * peer map, so this runs after the driver has waited for that - which is what
+ * makes every one of these sends an ordinary sleeping one and needs no
+ * machinery for posting from a context that cannot sleep.
+ */
+#define NSS_WIFILI_PEER_MEM	PAGE_SIZE
+
+struct nss_wifili_peer {
+	u16 peer_id;
+	u32 vdev_id;
+	u8 mac[ETH_ALEN];
+	void *mem;
+	dma_addr_t dma;
+};
+
+static struct nss_wifili_peer nss_wifili_peer_tbl[NSS_WIFILI_PEER_MAX];
+
+/* Each message carries its own body and its own length, for the same reason
+ * the virtual device's do: the firmware reads the body it expects where it
+ * expects it, and a length borrowed from another message is not refused.
+ */
+static int nss_wifili_soc_msg(struct nss_core *core, u32 type,
+			      const void *body, size_t len)
+{
+	struct nss_wifili_msg *m;
+	int ret;
+
+	m = kzalloc(sizeof(*m), GFP_KERNEL);
+	if (!m)
+		return -ENOMEM;
+
+	m->cm.interface = NSS_INTERFACE_WIFILI;
+	m->cm.type = type;
+	memcpy(&m->msg, body, len);
+
+	ret = nss_msg_send(core, m,
+			   offsetof(struct nss_wifili_msg, msg) + len);
+	if (!ret && m->cm.error)
+		ret = -EIO;
+
+	kfree(m);
+
+	return ret;
+}
+
+static int nss_wifili_peer_msg(struct nss_core *core, u32 type,
+			       const struct nss_wifili_peer_msg *pm)
+{
+	return nss_wifili_soc_msg(core, type, pm, sizeof(*pm));
+}
+
+static void nss_wifili_peer_release(struct nss_core *core, int i);
+
+int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
+			 u16 hw_ast_idx, u32 tx_ast_hash)
+{
+	struct nss_wifili_peer_msg pm = {};
+	struct nss_core *core;
+	dma_addr_t dma;
+	void *mem;
+	int ret, i;
+
+	guard(mutex)(&nss_wifili_lock);
+
+	core = nss_wifili_core;
+	if (!core || !core->wifili_started)
+		return -EAGAIN;
+
+	/* The WLAN driver drops a station's record on paths that never reach a
+	 * per-peer deletion - a device going down, a recovery sweep - and the
+	 * station then associates again. Releasing any record this address
+	 * already holds is what bounds the table, and it covers every one of
+	 * those paths because each ends here.
+	 */
+	for (i = 0; i < ARRAY_SIZE(nss_wifili_peer_tbl); i++)
+		if (nss_wifili_peer_tbl[i].mem &&
+		    ether_addr_equal(nss_wifili_peer_tbl[i].mac, mac))
+			nss_wifili_peer_release(core, i);
+
+	for (i = 0; i < ARRAY_SIZE(nss_wifili_peer_tbl); i++)
+		if (!nss_wifili_peer_tbl[i].mem)
+			break;
+	if (i == ARRAY_SIZE(nss_wifili_peer_tbl))
+		return -ENOSPC;
+
+	mem = dma_alloc_coherent(core->dev, NSS_WIFILI_PEER_MEM, &dma,
+				 GFP_KERNEL);
+	if (!mem)
+		return -ENOMEM;
+
+	ether_addr_copy(pm.peer_mac_addr, mac);
+	pm.vdev_id = vdev_id;
+	pm.peer_id = peer_id;
+	pm.hw_ast_idx = hw_ast_idx;
+	pm.tx_ast_hash = tx_ast_hash;
+	pm.nss_peer_mem = dma;
+	pm.peer_memory_size = NSS_WIFILI_PEER_MEM;
+
+	ret = nss_wifili_peer_msg(core, NSS_WIFILI_PEER_CREATE_MSG, &pm);
+	if (ret) {
+		dma_free_coherent(core->dev, NSS_WIFILI_PEER_MEM, mem, dma);
+		return ret;
+	}
+
+	nss_wifili_peer_tbl[i].peer_id = peer_id;
+	nss_wifili_peer_tbl[i].vdev_id = vdev_id;
+	ether_addr_copy(nss_wifili_peer_tbl[i].mac, mac);
+	nss_wifili_peer_tbl[i].mem = mem;
+	nss_wifili_peer_tbl[i].dma = dma;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(nss_wifi_peer_create);
+
+/* The memory is freed only after the delete is answered: the firmware writes
+ * into it until it has let the peer go, and a synchronous send is what makes
+ * "after" mean anything here.
+ */
+static void nss_wifili_peer_release(struct nss_core *core, int i)
+{
+	struct nss_wifili_peer_msg pm = {};
+
+	ether_addr_copy(pm.peer_mac_addr, nss_wifili_peer_tbl[i].mac);
+	pm.vdev_id = nss_wifili_peer_tbl[i].vdev_id;
+	pm.peer_id = nss_wifili_peer_tbl[i].peer_id;
+	nss_wifili_peer_msg(core, NSS_WIFILI_PEER_DELETE_MSG, &pm);
+
+	dev_info(core->dev, "peer %pM: id %u released from vdev %u\n",
+		 nss_wifili_peer_tbl[i].mac, nss_wifili_peer_tbl[i].peer_id,
+		 nss_wifili_peer_tbl[i].vdev_id);
+
+	dma_free_coherent(core->dev, NSS_WIFILI_PEER_MEM,
+			  nss_wifili_peer_tbl[i].mem,
+			  nss_wifili_peer_tbl[i].dma);
+	nss_wifili_peer_tbl[i].mem = NULL;
+}
+
+/* A virtual device takes its peers with it. The WLAN driver removes them from
+ * its own records without a per-peer deletion when a device goes down, so a
+ * peer released that way is never named here, and both this table and the
+ * firmware's would keep it for as long as the driver stayed loaded.
+ */
+static void nss_wifili_peer_flush(struct nss_core *core, u32 vdev_id)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(nss_wifili_peer_tbl); i++)
+		if (nss_wifili_peer_tbl[i].mem &&
+		    nss_wifili_peer_tbl[i].vdev_id == vdev_id)
+			nss_wifili_peer_release(core, i);
+}
+
+void nss_wifi_peer_delete(u32 vdev_id, const u8 *mac, u16 peer_id)
+{
+	struct nss_core *core;
+	int i;
+
+	guard(mutex)(&nss_wifili_lock);
+
+	core = nss_wifili_core;
+	if (!core)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(nss_wifili_peer_tbl); i++) {
+		if (!nss_wifili_peer_tbl[i].mem ||
+		    nss_wifili_peer_tbl[i].peer_id != peer_id)
+			continue;
+
+		nss_wifili_peer_release(core, i);
+		return;
+	}
+}
+EXPORT_SYMBOL_GPL(nss_wifi_peer_delete);
 
 int nss_wifi_vdev_tx(int if_num, struct sk_buff *skb)
 {
