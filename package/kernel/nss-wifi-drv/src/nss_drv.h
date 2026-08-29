@@ -64,6 +64,7 @@
 #define NSS_INTERFACE_N2H	156
 #define NSS_INTERFACE_ETH_RX	158
 #define NSS_INTERFACE_DYNAMIC	176
+#define NSS_INTERFACE_WIFILI	203
 #define NSS_INTERFACE_MAX	228
 
 /* Interrupt causes, one GIC line each: there are no mask or status registers
@@ -303,6 +304,7 @@ struct nss_core {
 	bool loaded;
 	bool running;
 	bool cpu_port_to_fw;
+	bool wifili_probed;
 	struct mutex lock;
 	struct dentry *debugfs;
 
@@ -329,6 +331,8 @@ struct nss_core {
 };
 
 int nss_meminfo_init(struct nss_core *core);
+void *nss_mem_alloc(struct nss_core *core, size_t size, u32 align,
+		    u32 *addr_out);
 void nss_mem_free_all(struct nss_core *core);
 int nss_rings_start(struct nss_core *core);
 void nss_iface_bind(struct nss_core *core);
@@ -339,6 +343,7 @@ int nss_msg_init(struct nss_core *core);
 int nss_msg_send(struct nss_core *core, void *msg, size_t len);
 bool nss_msg_complete(struct nss_core *core, const struct n2h_descriptor *desc);
 int nss_msg_probe(struct nss_core *core, struct seq_file *s);
+int nss_wifili_probe(struct nss_core *core, struct seq_file *s);
 int nss_log_show_ring(struct nss_core *core, struct seq_file *s);
 void nss_log_dump(struct nss_core *core, const char *why);
 

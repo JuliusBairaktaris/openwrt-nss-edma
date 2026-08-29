@@ -26,8 +26,8 @@ struct nss_meminfo_reserve {
 	u32 map_addr;
 };
 
-static void *nss_mem_alloc(struct nss_core *core, size_t size, u32 align,
-			   u32 *addr_out)
+void *nss_mem_alloc(struct nss_core *core, size_t size, u32 align,
+		    u32 *addr_out)
 {
 	struct nss_alloc *a;
 	dma_addr_t dma;
