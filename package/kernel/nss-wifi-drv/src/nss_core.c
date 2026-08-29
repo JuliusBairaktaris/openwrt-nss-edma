@@ -68,8 +68,13 @@
  * clock alone carries no rate here: the device tree states the frequencies
  * this SoC supports, and the core runs at the highest of them.
  */
+/* The fabric clocks first, then the six that are the core's own. The split is
+ * load-bearing rather than cosmetic: a core is given its own clocks back at
+ * every start and loses them at every stop, while the fabric ones go on once
+ * and stay on, because the switch sits behind them and a wired data plane
+ * that has nothing to do with this driver goes down when they do.
+ */
 static const struct nss_clk_cfg nss_clk_tbl[] = {
-	{ "nss-core-clk",			0 },
 	{ "nss-noc-clk",		461500000 },
 	{ "nss-ptp-ref-clk",		150000000 },
 	{ "nss-csr-clk",		200000000 },
@@ -84,20 +89,16 @@ static const struct nss_clk_cfg nss_clk_tbl[] = {
 	{ "nss-nssnoc-ce-axi-clk",	200000000 },
 	{ "nss-nssnoc-ce-apb-clk",	200000000 },
 	{ "nss-nssnoc-ahb-clk",		200000000 },
+	{ "nss-core-clk",			0 },
 	{ "nss-ahb-clk",		200000000 },
 	{ "nss-axi-clk",		461500000 },
 	{ "nss-mpt-clk",		 25000000 },
 	{ "nss-nc-axi-clk",		461500000 },
 };
 
-#define NSS_CLK_COUNT ARRAY_SIZE(nss_clk_tbl)
-
-static void nss_clocks_disable(void *data)
-{
-	struct nss_core *core = data;
-
-	clk_bulk_disable_unprepare(NSS_CLK_COUNT, core->clks);
-}
+#define NSS_CLK_COUNT	ARRAY_SIZE(nss_clk_tbl)
+#define NSS_CLK_FABRIC	13
+#define NSS_CLK_OWN	(NSS_CLK_COUNT - NSS_CLK_FABRIC)
 
 static int nss_clocks_get(struct nss_core *core)
 {
@@ -122,15 +123,39 @@ static int nss_clocks_get(struct nss_core *core)
 	return 0;
 }
 
+/* Turn the core's clocks on once and leave them on.
+ *
+ * Thirteen of the nineteen are fabric clocks the switch is behind, not the
+ * core's own, so taking them away between one boot and the next disturbs a
+ * data plane that has nothing to do with this driver. They go off when the
+ * device does.
+ */
 static int nss_clocks_enable(struct nss_core *core)
 {
 	int ret;
 
-	ret = clk_bulk_prepare_enable(NSS_CLK_COUNT, core->clks);
-	if (ret)
-		return dev_err_probe(core->dev, ret, "clock enable\n");
+	if (!core->clocks_on) {
+		ret = clk_bulk_prepare_enable(NSS_CLK_FABRIC, core->clks);
+		if (ret)
+			return dev_err_probe(core->dev, ret, "fabric clocks\n");
 
-	return devm_add_action_or_reset(core->dev, nss_clocks_disable, core);
+		core->clocks_on = true;
+	}
+
+	ret = clk_bulk_prepare_enable(NSS_CLK_OWN, &core->clks[NSS_CLK_FABRIC]);
+	if (ret)
+		return dev_err_probe(core->dev, ret, "core clocks\n");
+
+	return 0;
+}
+
+static void nss_clocks_disable(struct nss_core *core)
+{
+	if (!core->clocks_on)
+		return;
+
+	clk_bulk_disable_unprepare(NSS_CLK_FABRIC, core->clks);
+	core->clocks_on = false;
 }
 
 /* The firmware is linked to run from a fixed address, so it is copied to that
@@ -238,10 +263,20 @@ static void nss_core_release(struct nss_core *core)
  * Reset is asserted in the reverse order it was released, and only then is
  * the memory it was reading released.
  */
-static void nss_core_halt(void *data)
+/* Stop a core and put back everything it was using.
+ *
+ * Asked for by hand as well as at teardown, because a WLAN driver holding a
+ * reference to this module means unloading it is no longer a way to stop the
+ * firmware - and stopping the firmware is what returns the switch block to
+ * the state a cold boot left it in. Idempotent: a core that is not loaded has
+ * nothing to put back.
+ */
+static void nss_core_halt(struct nss_core *core)
 {
-	struct nss_core *core = data;
 	u32 val;
+
+	if (!core->loaded)
+		return;
 
 	writel(1, core->nphys + NSS_CORE_RESET_CTRL);
 
@@ -270,6 +305,11 @@ static void nss_core_halt(void *data)
 	}
 
 	nss_mem_free_all(core);
+	clk_bulk_disable_unprepare(NSS_CLK_OWN, &core->clks[NSS_CLK_FABRIC]);
+
+	core->loaded = false;
+	core->wifili_probed = false;
+	core->cpu_port_taken = false;
 }
 
 static int nss_core_boot(struct nss_core *core)
@@ -304,21 +344,16 @@ static int nss_core_boot(struct nss_core *core)
 	if (ret)
 		goto free;
 
-	/* Registered after the clocks and the rings, so teardown runs in the
-	 * order the hardware needs: the core stops first, and only then loses
-	 * the memory and the interrupts it was using.
-	 */
-	ret = devm_add_action_or_reset(core->dev, nss_core_halt, core);
-	if (ret)
-		goto stop;
-
 	/* Taken before the core is released rather than after: a core that is
 	 * running with nowhere to hand the CPU port back to leaves the board
 	 * with no wired path at all, and no way to ask for one.
 	 */
 	core->conduit = nss_conduit_get();
-	if (!core->conduit)
-		return dev_err_probe(core->dev, -ENODEV, "no EDMA conduit\n");
+	if (!core->conduit) {
+		ret = -ENODEV;
+		dev_err(core->dev, "no EDMA conduit\n");
+		goto stop;
+	}
 
 	nss_iface_bind(core);
 
@@ -331,6 +366,7 @@ static int nss_core_boot(struct nss_core *core)
 		dev_err(core->dev, "core %u did not answer in %u ms\n",
 			core->id, NSS_BOOT_TIMEOUT_MS);
 		nss_log_dump(core, "boot timeout");
+		nss_core_halt(core);
 		return -ETIMEDOUT;
 	}
 
@@ -340,16 +376,22 @@ stop:
 	nss_rings_stop(core);
 free:
 	nss_mem_free_all(core);
+	clk_bulk_disable_unprepare(NSS_CLK_OWN, &core->clks[NSS_CLK_FABRIC]);
 
 	return ret;
 }
 
 static int nss_boot_set(void *data, u64 val)
 {
-	if (val != 1)
-		return -EINVAL;
+	struct nss_core *core = data;
 
-	return nss_core_boot(data);
+	if (val)
+		return nss_core_boot(core);
+
+	guard(mutex)(&core->lock);
+	nss_core_halt(core);
+
+	return 0;
 }
 
 static int nss_boot_get(void *data, u64 *val)
@@ -599,6 +641,8 @@ static void nss_remove(struct platform_device *pdev)
 
 	nss_wifili_bind(NULL);
 	debugfs_remove_recursive(core->debugfs);
+	nss_core_halt(core);
+	nss_clocks_disable(core);
 }
 
 static const struct of_device_id nss_of_match[] = {
