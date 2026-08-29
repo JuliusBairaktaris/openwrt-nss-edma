@@ -26,7 +26,9 @@
 
 #include "nss_drv.h"
 #include "nss_cmn.h"
+#include "nss_dynamic_interface.h"
 #include "nss_wifili_if.h"
+#include <linux/soc/qcom/nss_wifi.h>
 
 /* Small on purpose. Nothing drains these, and the receive ring the firmware
  * fills from its own pool is the one that would cost something if it were not.
@@ -84,6 +86,76 @@ struct nss_wifili_ctx {
 	struct nss_wifili_mem doorbell;
 	struct nss_wifili_mem txdesc;
 };
+
+/* The one core that runs wifili, and what the WLAN driver said about its
+ * rings. The WLAN driver is loaded and unloaded independently of this one and
+ * knows nothing about which core is which, so the binding lives here.
+ */
+static struct nss_core *nss_wifili_core;
+static struct nss_wifi_soc nss_wifili_soc;
+static struct nss_wifi_pdev nss_wifili_pdev[NSS_WIFILI_MAX_PDEV_NUM_MSG];
+static bool nss_wifili_have_soc;
+static u8 nss_wifili_pdevs;
+static DEFINE_MUTEX(nss_wifili_lock);
+
+void nss_wifili_bind(struct nss_core *core)
+{
+	guard(mutex)(&nss_wifili_lock);
+	nss_wifili_core = core;
+}
+
+/* Keep what the WLAN driver says; starting the firmware is a separate act,
+ * because a running core takes the hardware with it.
+ */
+int nss_wifi_soc_register(const struct nss_wifi_soc *soc)
+{
+	guard(mutex)(&nss_wifili_lock);
+
+	if (soc->num_tcl > NSS_WIFI_MAX_TCL_RINGS ||
+	    soc->num_reo > NSS_WIFI_MAX_REO_RINGS)
+		return -EINVAL;
+
+	nss_wifili_soc = *soc;
+	nss_wifili_pdevs = 0;
+	nss_wifili_have_soc = true;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(nss_wifi_soc_register);
+
+void nss_wifi_soc_unregister(void)
+{
+	guard(mutex)(&nss_wifili_lock);
+	nss_wifili_have_soc = false;
+	nss_wifili_pdevs = 0;
+}
+EXPORT_SYMBOL_GPL(nss_wifi_soc_unregister);
+
+int nss_wifi_pdev_register(const struct nss_wifi_pdev *pdev)
+{
+	guard(mutex)(&nss_wifili_lock);
+
+	if (!nss_wifili_have_soc || nss_wifili_pdevs >= ARRAY_SIZE(nss_wifili_pdev))
+		return -EINVAL;
+
+	nss_wifili_pdev[nss_wifili_pdevs++] = *pdev;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(nss_wifi_pdev_register);
+
+static void nss_wifili_ring_fill(struct nss_wifili_hal_srng_info *r,
+				 const struct nss_wifi_ring *src)
+{
+	r->ring_id = src->id;
+	r->ring_dir = src->dir;
+	r->num_entries = src->num_entries;
+	r->entry_size = src->entry_size;
+	r->flags = src->flags;
+	r->ring_base_paddr = src->base;
+	r->hwreg_base[0] = src->hwreg[0];
+	r->hwreg_base[1] = src->hwreg[1];
+}
 
 static int nss_wifili_mem_get(struct nss_core *core, struct nss_wifili_mem *m,
 			      size_t size)
@@ -278,4 +350,155 @@ out:
 	kfree(m);
 
 	return ret;
+}
+
+/* Give the firmware a node for one radio and return the number it chose. */
+static int nss_wifili_radio_alloc(struct nss_core *core,
+				  struct nss_wifili_msg *scratch)
+{
+	struct nss_dynamic_interface_msg d;
+	int ret;
+
+	memset(&d, 0, sizeof(d));
+	d.cm.interface = NSS_INTERFACE_DYNAMIC;
+	d.cm.type = NSS_DYNAMIC_INTERFACE_ALLOC_NODE;
+	d.msg.alloc_node.type = NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_INTERNAL;
+
+	ret = nss_msg_send(core, &d, sizeof(d));
+	if (ret)
+		return ret;
+
+	return d.msg.alloc_node.if_num;
+}
+
+/* Start the firmware's Wi-Fi data plane on the rings the WLAN driver owns.
+ *
+ * This is where the ring set stops being invented. Everything the probe above
+ * could not reach - the physical-device initialisation, which programs
+ * hardware, and the start that puts the firmware's workers on the rings -
+ * needs rings that exist, and these are them.
+ */
+int nss_wifili_start(struct seq_file *s)
+{
+	struct nss_wifili_ctx *w;
+	struct nss_wifili_msg *m;
+	struct nss_core *core;
+	int i, ret;
+
+	guard(mutex)(&nss_wifili_lock);
+
+	core = nss_wifili_core;
+	if (!core || !core->running)
+		return -ENODEV;
+
+	if (!nss_wifili_have_soc || !nss_wifili_pdevs) {
+		seq_puts(s, "no WLAN driver has described its rings\n");
+		return 0;
+	}
+
+	m = kzalloc(sizeof(*m), GFP_KERNEL);
+	w = kzalloc(sizeof(*w), GFP_KERNEL);
+	if (!m || !w) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	/* The transmit descriptors are the firmware's to carve up and the
+	 * host's to provide, so they are not part of what the WLAN driver
+	 * describes.
+	 */
+	ret = nss_wifili_mem_get(core, &w->txdesc, NSS_WIFILI_TX_DESC_MEM);
+	if (ret)
+		goto out;
+
+	m->cm.interface = NSS_INTERFACE_WIFILI;
+	m->cm.type = NSS_WIFILI_INIT_MSG;
+	m->msg.init.hssm.dev_base_addr = nss_wifili_soc.dev_base;
+	m->msg.init.hssm.shadow_rdptr_mem_addr = nss_wifili_soc.shadow_rd;
+	m->msg.init.hssm.shadow_wrptr_mem_addr = nss_wifili_soc.shadow_wr;
+	m->msg.init.hssm.lmac_rings_start_id = nss_wifili_soc.lmac_ring_start;
+	m->msg.init.num_tcl_data_rings = nss_wifili_soc.num_tcl;
+	m->msg.init.num_reo_dest_rings = nss_wifili_soc.num_reo;
+
+	for (i = 0; i < nss_wifili_soc.num_tcl; i++) {
+		nss_wifili_ring_fill(&m->msg.init.tcl_ring_info[i],
+				     &nss_wifili_soc.tcl[i]);
+		nss_wifili_ring_fill(&m->msg.init.tx_comp_ring[i],
+				     &nss_wifili_soc.txcomp[i]);
+	}
+
+	for (i = 0; i < nss_wifili_soc.num_reo; i++)
+		nss_wifili_ring_fill(&m->msg.init.reo_dest_ring[i],
+				     &nss_wifili_soc.reo_dest[i]);
+
+	nss_wifili_ring_fill(&m->msg.init.reo_reinject_ring,
+			     &nss_wifili_soc.reo_reinject);
+	nss_wifili_ring_fill(&m->msg.init.rx_rel_ring, &nss_wifili_soc.rx_rel);
+	nss_wifili_ring_fill(&m->msg.init.reo_exception_ring,
+			     &nss_wifili_soc.reo_exception);
+
+	m->msg.init.wtdim.num_tx_desc = NSS_WIFILI_TX_DESC;
+	m->msg.init.wtdim.num_tx_desc_ext = NSS_WIFILI_TX_DESC;
+	m->msg.init.wtdim.num_pool = 1;
+	m->msg.init.wtdim.num_memaddr = 1;
+	m->msg.init.wtdim.memory_addr[0] = w->txdesc.dma;
+	m->msg.init.wtdim.memory_size[0] = w->txdesc.size;
+	m->msg.init.wtdim.num_tx_device_limit = NSS_WIFILI_TX_DESC;
+
+	m->msg.init.target_type = nss_wifili_soc.target_type;
+	m->msg.init.wrip.tlv_size = nss_wifili_soc.tlv_size;
+	m->msg.init.wrip.rx_buf_len = nss_wifili_soc.rx_buf_len;
+
+	ret = nss_msg_send(core, m, offsetof(struct nss_wifili_msg, msg) +
+				    sizeof(m->msg.init));
+	seq_printf(s, "%-14s rc %d response %u error %u\n", "soc init:", ret,
+		   m->cm.response, m->cm.error);
+	if (ret)
+		goto out;
+
+	for (i = 0; i < nss_wifili_pdevs; i++) {
+		int if_num;
+
+		/* A radio is a node before it is a radio. The initialisation
+		 * that follows is addressed to the SoC but names the radio,
+		 * and the firmware has nothing to name until one exists.
+		 */
+		if_num = nss_wifili_radio_alloc(core, m);
+		seq_printf(s, "radio %u node:  if_num %d\n",
+			   nss_wifili_pdev[i].radio_id, if_num);
+		if (if_num < 0) {
+			ret = if_num;
+			goto out;
+		}
+
+		memset(m, 0, sizeof(*m));
+		m->cm.interface = NSS_INTERFACE_WIFILI;
+		m->cm.type = NSS_WIFILI_PDEV_INIT_MSG;
+		nss_wifili_ring_fill(&m->msg.pdevmsg.rxdma_ring,
+				     &nss_wifili_pdev[i].rxdma);
+		m->msg.pdevmsg.radio_id = nss_wifili_pdev[i].radio_id;
+		m->msg.pdevmsg.lmac_id = nss_wifili_pdev[i].lmac_id;
+		m->msg.pdevmsg.target_pdev_id = nss_wifili_pdev[i].target_pdev_id;
+		m->msg.pdevmsg.num_rx_swdesc = nss_wifili_pdev[i].num_rx_swdesc;
+		ret = nss_msg_send(core, m,
+				   offsetof(struct nss_wifili_msg, msg) +
+				   sizeof(m->msg.pdevmsg));
+		seq_printf(s, "radio %u init:  rc %d response %u error %u\n",
+			   nss_wifili_pdev[i].radio_id, ret, m->cm.response,
+			   m->cm.error);
+		if (ret)
+			goto out;
+	}
+
+	memset(m, 0, sizeof(*m));
+	m->cm.interface = NSS_INTERFACE_WIFILI;
+	m->cm.type = NSS_WIFILI_START_MSG;
+	ret = nss_msg_send(core, m, offsetof(struct nss_wifili_msg, msg));
+	seq_printf(s, "%-14s rc %d response %u error %u\n", "start:", ret,
+		   m->cm.response, m->cm.error);
+out:
+	kfree(w);
+	kfree(m);
+
+	return 0;
 }
