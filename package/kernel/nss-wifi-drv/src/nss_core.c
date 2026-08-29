@@ -457,6 +457,19 @@ static int nss_rx_show(struct seq_file *s, void *unused)
 		   core->notify, core->link_desc_seen,
 		   core->link_desc_returned, core->tx_done);
 
+	for (i = 0; i < ARRAY_SIZE(core->seen); i++) {
+		const struct nss_msg_seen *seen = &core->seen[i];
+		int w;
+
+		if (!seen->count)
+			continue;
+
+		seq_printf(s, "msg %d: %llu first:", i, seen->count);
+		for (w = 0; w < seen->words; w++)
+			seq_printf(s, " %08x", seen->word[w]);
+		seq_putc(s, '\n');
+	}
+
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(nss_rx);
