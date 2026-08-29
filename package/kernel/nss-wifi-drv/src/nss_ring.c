@@ -114,6 +114,33 @@ static bool nss_data_recv(struct nss_core *core, struct napi_struct *napi,
 	return true;
 }
 
+/* Hand on a message the firmware sent unasked.
+ *
+ * Nothing the host sent is outstanding, so this is never a completion and the
+ * sixteen header bytes reserved for the host hold whatever the buffer's last
+ * user left there. The descriptor's interface number is zero on every message
+ * buffer, so the dispatch is on the interface inside the payload, whose top
+ * byte is a core id. The buffer is already unmapped, so the payload is the
+ * host's to read.
+ */
+static void nss_notify_recv(struct nss_core *core,
+			    const struct n2h_descriptor *desc,
+			    struct sk_buff *skb)
+{
+	u32 end = (u32)desc->payload_offs + desc->payload_len;
+	const struct nss_cmn_msg *ncm;
+
+	if (desc->buffer_type != NSS_N2H_BUFFER_STATUS ||
+	    end > NSS_EMPTY_BUFFER_ALLOC || desc->payload_len < sizeof(*ncm))
+		return;
+
+	core->notify++;
+
+	ncm = (const void *)(skb->head + desc->payload_offs);
+	if (NSS_INTERFACE_NUM_GET(ncm->interface) == NSS_INTERFACE_WIFILI)
+		nss_wifili_notify(core, ncm, desc->payload_len);
+}
+
 /* Take the switch's CPU port back off the firmware.
  *
  * The firmware programs the queue-to-ring table as part of its own EDMA
@@ -430,6 +457,7 @@ static int nss_poll_n2h(struct napi_struct *napi, int budget)
 		} else if (skb) {
 			dma_unmap_single(core->dev, NSS_SKB_CB(skb)->dma,
 					 NSS_EMPTY_BUFFER_ALLOC, DMA_FROM_DEVICE);
+			nss_notify_recv(core, desc, skb);
 			dev_kfree_skb_any(skb);
 			atomic_dec(&core->buffers_queued);
 			returned++;

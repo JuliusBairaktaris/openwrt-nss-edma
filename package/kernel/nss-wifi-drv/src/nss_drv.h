@@ -329,6 +329,9 @@ struct nss_core {
 	struct net_device __rcu *iface[NSS_INTERFACE_MAX];
 	u64 rx_iface[NSS_INTERFACE_MAX];
 	u64 rx_type[8];
+	u64 notify;
+	u64 link_desc_seen;
+	u64 link_desc_returned;
 	atomic_t buffers_queued;
 	struct completion booted;
 
@@ -348,6 +351,8 @@ bool nss_msg_complete(struct nss_core *core, const struct n2h_descriptor *desc);
 int nss_msg_probe(struct nss_core *core, struct seq_file *s);
 int nss_wifili_probe(struct nss_core *core, struct seq_file *s);
 int nss_wifili_start(struct seq_file *s);
+void nss_wifili_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
+		       u32 len);
 void nss_wifili_bind(struct nss_core *core);
 int nss_log_show_ring(struct nss_core *core, struct seq_file *s);
 void nss_log_dump(struct nss_core *core, const char *why);
