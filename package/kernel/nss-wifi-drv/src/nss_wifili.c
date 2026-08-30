@@ -1115,6 +1115,10 @@ int nss_wifili_tx(struct seq_file *s)
  * hardware, and the start that puts the firmware's workers on the rings -
  * needs rings that exist, and these are them.
  */
+static unsigned int nss_wifili_mem_profile;
+module_param_named(mem_profile, nss_wifili_mem_profile, uint, 0644);
+MODULE_PARM_DESC(mem_profile, "memory profile the firmware sizes its pools from");
+
 int nss_wifili_start(struct seq_file *s)
 {
 	struct nss_wifili_ctx *w;
@@ -1169,6 +1173,15 @@ int nss_wifili_start(struct seq_file *s)
 	m->msg.init.hssm.lmac_rings_start_id = nss_wifili_soc.lmac_ring_start;
 	m->msg.init.num_tcl_data_rings = nss_wifili_soc.num_tcl;
 	m->msg.init.num_reo_dest_rings = nss_wifili_soc.num_reo;
+
+	/* How much memory the firmware sizes its own pools from. Nothing here
+	 * has ever set it, so it has always said zero, and a receive path with
+	 * no buffers of its own to fill a ring with is a receive path that
+	 * reaps an empty ring for ever. The value is a profile rather than a
+	 * size and the header names no constants for it, so it is a parameter
+	 * to be swept rather than a number to be guessed.
+	 */
+	m->msg.init.soc_mem_profile = nss_wifili_mem_profile;
 
 	for (i = 0; i < nss_wifili_soc.num_tcl; i++) {
 		nss_wifili_ring_fill(&m->msg.init.tcl_ring_info[i],
