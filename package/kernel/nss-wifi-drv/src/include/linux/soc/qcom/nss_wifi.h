@@ -18,6 +18,8 @@
 
 #include <linux/types.h>
 
+struct flow_block_offload;
+
 #define NSS_WIFI_MAX_TCL_RINGS	4
 #define NSS_WIFI_MAX_REO_RINGS	4
 
@@ -87,6 +89,7 @@ int nss_wifi_vdev_security(int if_num, u32 cipher);
 int nss_wifi_peer_security(u16 peer_id, bool group, u32 cipher,
 			   const u8 *mic_key);
 int nss_wifi_peer_authorize(u16 peer_id);
+int nss_flow_setup_block(struct net_device *dev, struct flow_block_offload *f);
 #else
 static inline int nss_wifi_soc_register(const struct nss_wifi_soc *soc)
 {
@@ -143,6 +146,12 @@ static inline int nss_wifi_peer_security(u16 peer_id, bool group, u32 cipher,
 static inline int nss_wifi_peer_authorize(u16 peer_id)
 {
 	return -ENODEV;
+}
+
+static inline int nss_flow_setup_block(struct net_device *dev,
+				       struct flow_block_offload *f)
+{
+	return -EOPNOTSUPP;
 }
 #endif
 

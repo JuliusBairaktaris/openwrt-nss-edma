@@ -227,7 +227,18 @@ static void nss_core_release(struct nss_core *core)
 {
 	u32 val;
 
+	/* Start from the state a cold boot starts from, whatever the last
+	 * occupant left: both reset sets asserted and the fetch clamp on. A
+	 * release over half-reset state boots a core whose peripheral block
+	 * is dead, and the firmware then traps on its first access into it.
+	 */
+	writel(1, core->nphys + NSS_CORE_RESET_CTRL);
 	val = readl(core->misc_reset);
+	val |= (NSS_MISC_RESET_FIRST | NSS_MISC_RESET_SECOND) <<
+	       NSS_MISC_RESET_SHIFT(core->id);
+	writel(val, core->misc_reset);
+	usleep_range(10, 20);
+
 	val &= ~(NSS_MISC_RESET_FIRST << NSS_MISC_RESET_SHIFT(core->id));
 	writel(val, core->misc_reset);
 
@@ -284,10 +295,15 @@ static void nss_core_halt(struct nss_core *core)
 	val |= NSS_MISC_RESET_SECOND << NSS_MISC_RESET_SHIFT(core->id);
 	writel(val, core->misc_reset);
 
+	/* The same settle the release path needs between the two sets. */
+	usleep_range(10, 20);
+
 	val |= NSS_MISC_RESET_FIRST << NSS_MISC_RESET_SHIFT(core->id);
 	writel(val, core->misc_reset);
 
 	core->running = false;
+	core->phys_armed = 0;
+	nss_flow_flush();
 
 	nss_log_shadow_stop(core);
 	nss_rings_stop(core);
@@ -326,13 +342,6 @@ static int nss_core_boot(struct nss_core *core)
 	ret = nss_clocks_enable(core);
 	if (ret)
 		return ret;
-
-	/* The core executes out of its instruction memory and reads what it
-	 * finds there, whatever a previous occupant left behind. The window is
-	 * cleared through an uncached mapping, so what the core reads is what
-	 * was written with no cache maintenance to get right.
-	 */
-	memset_io(core->imem, 0, core->imem_size);
 
 	ret = nss_firmware_load(core);
 	if (ret)
@@ -547,6 +556,49 @@ static int nss_fwport_get(void *data, u64 *val)
 DEFINE_DEBUGFS_ATTRIBUTE(nss_fwport_fops, nss_fwport_get, nss_fwport_set,
 			 "%llu\n");
 
+/* Which switch ports the firmware routes through, as a mask of port indices.
+ *
+ * Arming a port is what puts its receive on the firmware's connection engines
+ * instead of on the host, so it is what a pushed rule needs to match anything,
+ * and it is a deliberate act for the same reason starting a core is.
+ */
+static int nss_phys_set(void *data, u64 val)
+{
+	struct nss_core *core = data;
+	int ret;
+
+	/* Outside the core's own lock because the switch driver wants it
+	 * that way round, and arming a port is a call into the switch driver
+	 * as much as into the firmware.
+	 */
+	rtnl_lock();
+	mutex_lock(&core->lock);
+	ret = nss_phys_arm(core, val);
+	mutex_unlock(&core->lock);
+	rtnl_unlock();
+
+	return ret;
+}
+
+static int nss_phys_get(void *data, u64 *val)
+{
+	struct nss_core *core = data;
+
+	guard(mutex)(&core->lock);
+	*val = core->phys_armed;
+
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(nss_phys_fops, nss_phys_get, nss_phys_set, "%#llx\n");
+
+static int nss_flows_show(struct seq_file *s, void *unused)
+{
+	nss_flow_print(s);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(nss_flows);
+
 /* The region the core boots from is described once, on the node the two cores
  * share, and each core's load address points into it.
  */
@@ -657,6 +709,16 @@ static int nss_probe(struct platform_device *pdev)
 	if (IS_ERR(core->imem))
 		return PTR_ERR(core->imem);
 
+	/* Clear the core's on-chip memory once, here, not at every boot. Wiping
+	 * it on a warm boot makes the firmware trap during start-up (thread 6,
+	 * faulting on 0x38000000); cleared once at probe, a re-boot is clean.
+	 * The firmware runs from DDR (the instruction fetch range is
+	 * 0x40000000+, reloaded each boot), and the meminfo allocator zeroes
+	 * each block it hands out, so nothing depends on a per-boot wipe.
+	 */
+	memset_io(core->imem, 0, core->imem_size);
+	wmb();
+
 	ret = nss_clocks_get(core);
 	if (ret)
 		return ret;
@@ -684,6 +746,7 @@ static int nss_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, core);
 	nss_wifili_bind(core);
+	nss_flow_bind(core);
 
 	core->debugfs = debugfs_create_dir(dev_name(dev), NULL);
 	debugfs_create_file("boot", 0600, core->debugfs, core, &nss_boot_fops);
@@ -700,6 +763,10 @@ static int nss_probe(struct platform_device *pdev)
 			    &nss_wifili_tx_fops);
 	debugfs_create_file("cpu_port_to_fw", 0600, core->debugfs, core,
 			    &nss_fwport_fops);
+	debugfs_create_file("fw_ports", 0600, core->debugfs, core,
+			    &nss_phys_fops);
+	debugfs_create_file("flows", 0400, core->debugfs, core,
+			    &nss_flows_fops);
 
 	return 0;
 }
@@ -709,6 +776,7 @@ static void nss_remove(struct platform_device *pdev)
 	struct nss_core *core = platform_get_drvdata(pdev);
 
 	nss_wifili_bind(NULL);
+	nss_flow_bind(NULL);
 	debugfs_remove_recursive(core->debugfs);
 	nss_core_halt(core);
 	nss_clocks_disable(core);
@@ -728,7 +796,32 @@ static struct platform_driver nss_driver = {
 		.of_match_table = nss_of_match,
 	},
 };
-module_platform_driver(nss_driver);
+/* The flow table's own state outlives any one core, and its registrations are
+ * per module rather than per device, so it is set up and torn down here rather
+ * than beside a device.
+ */
+static int __init nss_module_init(void)
+{
+	int ret;
+
+	ret = nss_flow_init();
+	if (ret)
+		return ret;
+
+	ret = platform_driver_register(&nss_driver);
+	if (ret)
+		nss_flow_exit();
+
+	return ret;
+}
+module_init(nss_module_init);
+
+static void __exit nss_module_exit(void)
+{
+	platform_driver_unregister(&nss_driver);
+	nss_flow_exit();
+}
+module_exit(nss_module_exit);
 
 MODULE_DESCRIPTION("NSS firmware host driver for the Wi-Fi data plane");
 MODULE_LICENSE("GPL");

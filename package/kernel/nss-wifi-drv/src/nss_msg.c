@@ -112,7 +112,12 @@ void nss_msg_seen(struct nss_core *core, const struct nss_cmn_msg *ncm,
 	seen->words = words;
 }
 
-int nss_msg_send(struct nss_core *core, void *msg, size_t len)
+/* @len is the message as sent and what the firmware's length check sees;
+ * @room is how much of the answer the caller reads back. They differ only
+ * for a request whose reply carries an array sized by the buffer, like the
+ * connection-statistics sweep.
+ */
+int nss_msg_transact(struct nss_core *core, void *msg, size_t len, size_t room)
 {
 	struct nss_cmn_msg *ncm = msg;
 	struct nss_h2n_ring *ring = &core->h2n[NSS_H2N_RING_COMMAND];
@@ -121,7 +126,8 @@ int nss_msg_send(struct nss_core *core, void *msg, size_t len)
 	u32 next;
 	int ret;
 
-	if (len < sizeof(*ncm) || len > NSS_MSG_BUF_SIZE)
+	if (len < sizeof(*ncm) || len > NSS_MSG_BUF_SIZE ||
+	    room < len || room > NSS_MSG_BUF_SIZE)
 		return -EMSGSIZE;
 
 	if (!core->running)
@@ -186,9 +192,14 @@ int nss_msg_send(struct nss_core *core, void *msg, size_t len)
 		break;
 	}
 
-	memcpy(msg, core->msg.buf, len);
+	memcpy(msg, core->msg.buf, room);
 
 	return ret;
+}
+
+int nss_msg_send(struct nss_core *core, void *msg, size_t len)
+{
+	return nss_msg_transact(core, msg, len, len);
 }
 
 /* Whether the firmware has a node of this kind to give, and what it calls it.
