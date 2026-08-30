@@ -2809,6 +2809,35 @@ int qca_ppe_port_fw_vsi_refresh(struct net_device *netdev)
 }
 EXPORT_SYMBOL_GPL(qca_ppe_port_fw_vsi_refresh);
 
+/*
+ * qca_ppe_port_vsi_restore - put a port's forwarding identity back
+ * @netdev: DSA user netdev whose private VSI the firmware has released
+ *
+ * Assigning a port's private VSI to the firmware rewrites the port's own
+ * binding to point at it, and releasing it clears that binding rather than
+ * restoring what was there: the port is then bound to nothing and forwards
+ * nothing, which looks exactly like a dead link (measured: unicast to a
+ * station behind the port stops, and rejoining the bridge fixes it). The
+ * binding this driver last programmed is the one the bridge state implies,
+ * so it is what goes back. Callers hold rtnl.
+ */
+int qca_ppe_port_vsi_restore(struct net_device *netdev)
+{
+	struct qca_ppe_priv *priv;
+	int port;
+
+	priv = fw_vsi_port_resolve(netdev, &port);
+	if (!priv)
+		return -ENODEV;
+
+	if (priv->port_vsi[port] == PPE_VSI_INVALID)
+		return -ENOENT;
+
+	ppe_port_vsi_set(priv, port, priv->port_vsi[port]);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qca_ppe_port_vsi_restore);
+
 static void ppe_mac_hw_init(struct qca_ppe_priv *priv)
 {
 	const struct ppe_data *d = priv->data;
