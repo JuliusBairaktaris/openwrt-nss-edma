@@ -167,9 +167,12 @@ static void nss_notify_recv(struct nss_core *core,
 
 	ncm = (const void *)(skb->head + desc->payload_offs);
 	nss_msg_seen(core, ncm, desc->payload_len);
+	nss_msg_census(ncm);
 
 	if (NSS_INTERFACE_NUM_GET(ncm->interface) == NSS_INTERFACE_WIFILI)
 		nss_wifili_notify(core, ncm, desc->payload_len);
+	else
+		nss_wifili_vdev_notify(core, ncm, desc->payload_len);
 }
 
 /* Hand a frame down to the firmware to place.
