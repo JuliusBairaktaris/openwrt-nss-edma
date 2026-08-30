@@ -118,7 +118,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  		return;
  	}
  
-@@ -6871,6 +6893,37 @@ static int ath11k_mac_setup_vdev_create_
+@@ -6871,6 +6893,56 @@ static int ath11k_mac_setup_vdev_create_
  	return 0;
  }
  
@@ -130,6 +130,21 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
 + * what the hardware encapsulation and decapsulation this driver has already
 + * been told to use produce.
 + */
++/* The mode the WLAN firmware was given for this direction a moment ago, in
++ * ath11k_mac_op_update_vif_offload(). The NSS firmware has to declare the same
++ * one, and mac80211 grants the encapsulation offload rather than the driver
++ * choosing it, so it is read back here rather than derived from frame_mode.
++ */
++static u8 ath11k_nss_vdev_mode(struct ath11k_base *ab,
++			       struct ieee80211_vif *vif, u32 offload_flag)
++{
++	if (vif->offload_flags & offload_flag)
++		return ATH11K_HW_TXRX_ETHERNET;
++	if (test_bit(ATH11K_FLAG_RAW_MODE, &ab->dev_flags))
++		return ATH11K_HW_TXRX_RAW;
++	return ATH11K_HW_TXRX_NATIVE_WIFI;
++}
++
 +static void ath11k_nss_vdev_register(struct ath11k_vif *arvif,
 +				     struct ieee80211_vif *vif)
 +{
@@ -143,7 +158,11 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
 +
 +	ret = nss_wifi_vdev_register(wdev->netdev, ar->pdev_idx, arvif->vdev_id,
 +				     vif->addr,
-+				     vif->type == NL80211_IFTYPE_AP);
++				     vif->type == NL80211_IFTYPE_AP,
++				     ath11k_nss_vdev_mode(ar->ab, vif,
++							  IEEE80211_OFFLOAD_ENCAP_ENABLED),
++				     ath11k_nss_vdev_mode(ar->ab, vif,
++							  IEEE80211_OFFLOAD_DECAP_ENABLED));
 +	if (ret < 0) {
 +		ath11k_warn(ar->ab, "failed to give vdev %d to the NSS firmware: %d\n",
 +			    arvif->vdev_id, ret);
@@ -156,7 +175,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  static void ath11k_mac_op_update_vif_offload(struct ieee80211_hw *hw,
  					     struct ieee80211_vif *vif)
  {
-@@ -7117,6 +7170,7 @@ static int ath11k_mac_op_add_interface(s
+@@ -7117,6 +7189,7 @@ static int ath11k_mac_op_add_interface(s
  
  	arvif->ar = ar;
  	arvif->vif = vif;
@@ -164,7 +183,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  
  	INIT_LIST_HEAD(&arvif->list);
  	INIT_WORK(&arvif->bcn_tx_work, ath11k_mac_bcn_tx_work);
-@@ -7202,6 +7256,9 @@ static int ath11k_mac_op_add_interface(s
+@@ -7202,6 +7275,9 @@ static int ath11k_mac_op_add_interface(s
  
  	ath11k_mac_op_update_vif_offload(hw, vif);
  
@@ -174,7 +193,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  	nss = get_num_chains(ar->cfg_tx_chainmask) ? : 1;
  	ret = ath11k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id,
  					    WMI_VDEV_PARAM_NSS, nss);
-@@ -7384,6 +7441,17 @@ static void ath11k_mac_op_remove_interfa
+@@ -7384,6 +7460,17 @@ static void ath11k_mac_op_remove_interfa
  				    arvif->vdev_id, ret);
  	}
  
@@ -192,7 +211,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  	ret = ath11k_mac_vdev_delete(ar, arvif);
  	if (ret) {
  		ath11k_warn(ab, "failed to delete vdev %d: %d\n",
-@@ -9459,6 +9527,11 @@ static void ath11k_mac_op_sta_statistics
+@@ -9459,6 +9546,11 @@ static void ath11k_mac_op_sta_statistics
  		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BITRATE);
  	}
  
