@@ -454,9 +454,20 @@ static int nss_rx_show(struct seq_file *s, void *unused)
 			seq_printf(s, "interface %d: %llu\n", i,
 				   core->rx_iface[i]);
 
-	seq_printf(s, "notify: %llu link-desc seen: %llu returned: %llu tx-done: %llu\n",
+	seq_printf(s, "notify: %llu link-desc seen: %llu returned: %llu tx: %llu done: %llu\n",
 		   core->notify, core->link_desc_seen,
-		   core->link_desc_returned, core->tx_done);
+		   core->link_desc_returned, core->tx_posted, core->tx_done);
+
+	for (i = 0; i < core->ext_seen; i++) {
+		const struct nss_ext_seen *e = &core->ext[i];
+		int w;
+
+		seq_printf(s, "ext %d: iface %u type %u len %u offs %u:",
+			   i, e->iface, e->type, e->len, e->offs);
+		for (w = 0; w < ARRAY_SIZE(e->word); w++)
+			seq_printf(s, " %08x", e->word[w]);
+		seq_putc(s, '\n');
+	}
 
 	for (i = 0; i < ARRAY_SIZE(core->seen); i++) {
 		const struct nss_msg_seen *seen = &core->seen[i];
@@ -468,6 +479,9 @@ static int nss_rx_show(struct seq_file *s, void *unused)
 		seq_printf(s, "msg %d: %llu first:", i, seen->count);
 		for (w = 0; w < seen->words; w++)
 			seq_printf(s, " %08x", seen->word[w]);
+		seq_puts(s, "\n     last:");
+		for (w = 0; w < seen->lastwords; w++)
+			seq_printf(s, " %08x", seen->last[w]);
 		seq_putc(s, '\n');
 	}
 
