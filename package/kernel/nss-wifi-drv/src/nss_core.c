@@ -495,6 +495,21 @@ static int nss_wifili_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(nss_wifili);
 
+static int nss_msgs_show(struct seq_file *s, void *unused)
+{
+	nss_msg_census_print(s);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(nss_msgs);
+
+static int nss_wifili_rx_show(struct seq_file *s, void *unused)
+{
+	nss_wifili_stats_print(s);
+	nss_wifili_vdev_stats_print(s);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(nss_wifili_rx);
+
 static int nss_wifili_tx_show(struct seq_file *s, void *unused)
 {
 	return nss_wifili_tx(s);
@@ -678,6 +693,9 @@ static int nss_probe(struct platform_device *pdev)
 	debugfs_create_file("rx", 0400, core->debugfs, core, &nss_rx_fops);
 	debugfs_create_file("wifili_start", 0400, core->debugfs, core,
 			    &nss_wifili_fops);
+	debugfs_create_file("msgs", 0400, core->debugfs, core, &nss_msgs_fops);
+	debugfs_create_file("wifili_rx", 0400, core->debugfs, core,
+			    &nss_wifili_rx_fops);
 	debugfs_create_file("wifili_tx", 0400, core->debugfs, core,
 			    &nss_wifili_tx_fops);
 	debugfs_create_file("cpu_port_to_fw", 0600, core->debugfs, core,
