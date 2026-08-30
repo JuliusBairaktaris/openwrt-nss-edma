@@ -92,10 +92,21 @@ void nss_msg_seen(struct nss_core *core, const struct nss_cmn_msg *ncm,
 		return;
 
 	seen = &core->seen[ncm->type];
+	words = min_t(u32, len / sizeof(u32), ARRAY_SIZE(seen->last));
+
+	/* The first and the latest, because a counter that is pushed
+	 * repeatedly says nothing in its first push: what is being asked of a
+	 * statistics message is whether a number moved.
+	 */
+	for (i = 0; i < words; i++)
+		seen->last[i] = ((const u32 *)ncm)[i];
+
+	seen->lastwords = words;
+
 	if (seen->count++)
 		return;
 
-	words = min_t(u32, len / sizeof(u32), ARRAY_SIZE(seen->word));
+	words = min_t(u32, words, ARRAY_SIZE(seen->word));
 	for (i = 0; i < words; i++)
 		seen->word[i] = ((const u32 *)ncm)[i];
 	seen->words = words;
