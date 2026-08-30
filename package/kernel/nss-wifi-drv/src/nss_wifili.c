@@ -22,6 +22,7 @@
 #include <linux/container_of.h>
 #include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
+#include <linux/ieee80211.h>
 #include <linux/if_ether.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
@@ -125,6 +126,44 @@ void nss_wifili_bind(struct nss_core *core)
 /* Keep what the WLAN driver says; starting the firmware is a separate act,
  * because a running core takes the hardware with it.
  */
+/* What the WLAN driver said its rings are, printed when it says it.
+ *
+ * A ring described wrongly is accepted by the firmware exactly as a ring
+ * described rightly, and the only difference shows up as nothing working. So
+ * the description is printed where it is taken, not where it is used, and a
+ * base of zero or an entry count of zero is visible before anything is built
+ * on it.
+ */
+static void nss_wifili_log_soc(void)
+{
+	int i;
+
+	pr_info("nss-wifi-drv: shadow rd %#x wr %#x lmac from %u dev %#x\n",
+		nss_wifili_soc.shadow_rd, nss_wifili_soc.shadow_wr,
+		nss_wifili_soc.lmac_ring_start, nss_wifili_soc.dev_base);
+
+	for (i = 0; i < nss_wifili_soc.num_tcl; i++)
+		pr_info("nss-wifi-drv: tcl%d id %u base %#x x%u  txcomp id %u base %#x x%u hw %#x/%#x  tclhw %#x/%#x tcle %u\n",
+			i, nss_wifili_soc.tcl[i].id, nss_wifili_soc.tcl[i].base,
+			nss_wifili_soc.tcl[i].num_entries,
+			nss_wifili_soc.txcomp[i].id,
+			nss_wifili_soc.txcomp[i].base,
+			nss_wifili_soc.txcomp[i].num_entries,
+			nss_wifili_soc.txcomp[i].hwreg[0],
+			nss_wifili_soc.txcomp[i].hwreg[1],
+			nss_wifili_soc.tcl[i].hwreg[0],
+			nss_wifili_soc.tcl[i].hwreg[1],
+			nss_wifili_soc.tcl[i].entry_size);
+
+	for (i = 0; i < nss_wifili_soc.num_reo; i++)
+		pr_info("nss-wifi-drv: reo%d id %u base %#x x%u hw %#x/%#x\n",
+			i, nss_wifili_soc.reo_dest[i].id,
+			nss_wifili_soc.reo_dest[i].base,
+			nss_wifili_soc.reo_dest[i].num_entries,
+			nss_wifili_soc.reo_dest[i].hwreg[0],
+			nss_wifili_soc.reo_dest[i].hwreg[1]);
+}
+
 int nss_wifi_soc_register(const struct nss_wifi_soc *soc)
 {
 	guard(mutex)(&nss_wifili_lock);
@@ -136,6 +175,8 @@ int nss_wifi_soc_register(const struct nss_wifi_soc *soc)
 	nss_wifili_soc = *soc;
 	nss_wifili_pdevs = 0;
 	nss_wifili_have_soc = true;
+
+	nss_wifili_log_soc();
 
 	return 0;
 }
@@ -165,6 +206,11 @@ int nss_wifi_pdev_register(const struct nss_wifi_pdev *pdev)
 		return -EINVAL;
 
 	nss_wifili_pdev[nss_wifili_pdevs++] = *pdev;
+
+	pr_info("nss-wifi-drv: radio %u rxdma id %u base %#x x%u hw %#x/%#x swdesc %u\n",
+		pdev->radio_id, pdev->rxdma.id, pdev->rxdma.base,
+		pdev->rxdma.num_entries, pdev->rxdma.hwreg[0],
+		pdev->rxdma.hwreg[1], pdev->num_rx_swdesc);
 
 	return 0;
 }
@@ -440,6 +486,16 @@ static int nss_wifili_radio_alloc(struct nss_core *core,
 #define NSS_WIFI_VDEV_OPMODE_AP		1
 #define NSS_WIFI_VDEV_OPMODE_STA	3
 
+/* The mode an access point's virtual device is configured with. The
+ * configuration message stores it without validating it, so an accepted
+ * configuration says nothing about whether the value is the right one, and
+ * the transmit path branches on it. It is a parameter so the question is
+ * settled by sweeping it on the hardware.
+ */
+static unsigned int nss_wifili_ap_opmode = NSS_WIFI_VDEV_OPMODE_AP;
+module_param_named(ap_opmode, nss_wifili_ap_opmode, uint, 0644);
+MODULE_PARM_DESC(ap_opmode, "operating mode an access point's virtual device is given");
+
 /* One per WLAN interface. Two radios with a handful of access points each is
  * what this hardware is asked for; the limit is here so a leak shows up as a
  * refusal rather than as an interface number nobody owns.
@@ -475,8 +531,18 @@ struct nss_wifili_vdev {
 
 static struct nss_wifili_vdev nss_wifili_vdev_tbl[NSS_WIFILI_VDEV_MAX];
 
+/* Each message carries its own body and its own length.
+ *
+ * Sending one message's length for another is not caught: the firmware reads
+ * the body it expects where it expects it and takes what is there. The enable
+ * message is a MAC address, so an enable sent zeroed at some other message's
+ * length sets the virtual device's own address to zero - after the
+ * configuration that set it correctly - and every message still answers
+ * success. A device with no address of its own matches nothing in either
+ * direction.
+ */
 static int nss_wifili_vdev_msg(struct nss_core *core, int if_num, u32 type,
-			       const struct nss_wifi_vdev_config_msg *cfg)
+			       const void *body, size_t len)
 {
 	struct nss_wifi_vdev_msg *v;
 	int ret;
@@ -487,11 +553,54 @@ static int nss_wifili_vdev_msg(struct nss_core *core, int if_num, u32 type,
 
 	v->cm.interface = if_num;
 	v->cm.type = type;
-	if (cfg)
-		v->msg.vdev_config = *cfg;
+	if (body)
+		memcpy(&v->msg, body, len);
+
+	ret = nss_msg_send(core, v,
+			   offsetof(struct nss_wifi_vdev_msg, msg) + len);
+	if (!ret && v->cm.error)
+		ret = -EIO;
+
+	kfree(v);
+
+	return ret;
+}
+
+/* Send a received frame to the host rather than into the firmware.
+ *
+ * A virtual device forwards what it receives to a next hop, and the one it is
+ * created with is the firmware's own ethernet node - so a frame from a
+ * station is handed to the firmware's wired path, where nothing has been told
+ * about it, and is dropped. Nothing above ever sees it, which looks exactly
+ * like a receive path that never started: a station associates, the
+ * authentication exchange gets no reply, and no counter moves.
+ *
+ * Pointing the next hop at the node that hands frames to the host is what
+ * makes everything arrive by exception, which is what this rung is. A rule
+ * pushed into the firmware later is what takes a flow back off it.
+ */
+static unsigned int nss_wifili_rx_next_hop = NSS_INTERFACE_N2H;
+module_param_named(rx_next_hop, nss_wifili_rx_next_hop, uint, 0644);
+MODULE_PARM_DESC(rx_next_hop, "interface a virtual device forwards receive to, 0 to leave it as created");
+
+static int nss_wifili_vdev_next_hop(struct nss_core *core, int if_num)
+{
+	struct nss_wifi_vdev_msg *v;
+	int ret;
+
+	if (!nss_wifili_rx_next_hop)
+		return 0;
+
+	v = kzalloc(sizeof(*v), GFP_KERNEL);
+	if (!v)
+		return -ENOMEM;
+
+	v->cm.interface = if_num;
+	v->cm.type = NSS_WIFI_VDEV_SET_NEXT_HOP;
+	v->msg.next_hop.ifnumber = nss_wifili_rx_next_hop;
 
 	ret = nss_msg_send(core, v, offsetof(struct nss_wifi_vdev_msg, msg) +
-				    sizeof(v->msg.vdev_config));
+				    sizeof(v->msg.next_hop));
 	if (!ret && v->cm.error)
 		ret = -EIO;
 
@@ -550,13 +659,21 @@ int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
 	ether_addr_copy(cfg.mac_addr, mac);
 	cfg.radio_ifnum = nss_wifili_radio_if[radio];
 	cfg.vdev_id = vdev_id;
-	cfg.opmode = ap ? NSS_WIFI_VDEV_OPMODE_AP : NSS_WIFI_VDEV_OPMODE_STA;
+	cfg.opmode = ap ? nss_wifili_ap_opmode : NSS_WIFI_VDEV_OPMODE_STA;
 
 	ret = nss_wifili_vdev_msg(core, if_num,
-				  NSS_WIFI_VDEV_INTERFACE_CONFIGURE_MSG, &cfg);
+				  NSS_WIFI_VDEV_INTERFACE_CONFIGURE_MSG,
+				  &cfg, sizeof(cfg));
 	if (!ret)
+		ret = nss_wifili_vdev_next_hop(core, if_num);
+	if (!ret) {
+		struct nss_wifi_vdev_enable_msg up = {};
+
+		ether_addr_copy(up.mac_addr, mac);
 		ret = nss_wifili_vdev_msg(core, if_num,
-					  NSS_WIFI_VDEV_INTERFACE_UP_MSG, NULL);
+					  NSS_WIFI_VDEV_INTERFACE_UP_MSG,
+					  &up, sizeof(up));
+	}
 	if (ret) {
 		nss_wifili_vdev_free(core, if_num);
 		return ret;
@@ -615,11 +732,94 @@ void nss_wifi_vdev_unregister(struct net_device *dev)
 		 * it is still up faults the firmware.
 		 */
 		nss_wifili_vdev_msg(core, if_num,
-				    NSS_WIFI_VDEV_INTERFACE_DOWN_MSG, NULL);
+				    NSS_WIFI_VDEV_INTERFACE_DOWN_MSG, NULL,
+				    sizeof(struct nss_wifi_vdev_disable_msg));
 		nss_wifili_vdev_free(core, if_num);
 	}
 }
 EXPORT_SYMBOL_GPL(nss_wifi_vdev_unregister);
+
+/* Tell the firmware how a virtual device's frames are protected.
+ *
+ * The transmit descriptor the firmware builds carries the encryption the
+ * hardware is to apply, and it takes it from the virtual device rather than
+ * from the frame. Left unset it is "none", and every frame after the key is
+ * installed goes out in the clear for a station that will discard it - which
+ * looks like an association that gets as far as authentication and stops.
+ *
+ * The values are the firmware's own, not the subsystem's cipher suites, so
+ * the mapping is here rather than in the WLAN driver.
+ */
+static u32 nss_wifili_sec_type(u32 cipher)
+{
+	switch (cipher) {
+	case WLAN_CIPHER_SUITE_WEP40:
+		return 3;
+	case WLAN_CIPHER_SUITE_WEP104:
+		return 2;
+	case WLAN_CIPHER_SUITE_TKIP:
+		return 4;
+	case WLAN_CIPHER_SUITE_CCMP:
+		return 6;
+	case WLAN_CIPHER_SUITE_CCMP_256:
+		return 8;
+	case WLAN_CIPHER_SUITE_GCMP:
+		return 9;
+	case WLAN_CIPHER_SUITE_GCMP_256:
+		return 10;
+	default:
+		return 0;
+	}
+}
+
+/* The firmware's transmit path reads this from the virtual device, not from
+ * the frame, so one value covers every frame the device sends - including the
+ * authentication exchange of a station that has no key yet. Setting it the
+ * moment the first station installs a pairwise key therefore encrypts the
+ * first frame of the next station's exchange with a key that station does not
+ * have. Switchable, so which of those two failures is real can be measured.
+ */
+static bool nss_wifili_set_security = true;
+module_param_named(set_security, nss_wifili_set_security, bool, 0644);
+MODULE_PARM_DESC(set_security, "tell a virtual device which cipher to apply");
+
+int nss_wifi_vdev_security(int if_num, u32 cipher)
+{
+	struct nss_wifi_vdev_msg *v;
+	struct nss_core *core;
+	int ret;
+
+	guard(mutex)(&nss_wifili_lock);
+
+	core = nss_wifili_core;
+	if (!core || if_num < 0)
+		return -ENODEV;
+
+	if (!nss_wifili_set_security)
+		return 0;
+
+	v = kzalloc(sizeof(*v), GFP_KERNEL);
+	if (!v)
+		return -ENOMEM;
+
+	v->cm.interface = if_num;
+	v->cm.type = NSS_WIFI_VDEV_INTERFACE_CMD_MSG;
+	v->msg.vdev_cmd.cmd = NSS_WIFI_VDEV_SECURITY_TYPE_CMD;
+	v->msg.vdev_cmd.value = nss_wifili_sec_type(cipher);
+
+	ret = nss_msg_send(core, v, offsetof(struct nss_wifi_vdev_msg, msg) +
+				    sizeof(v->msg.vdev_cmd));
+	if (!ret && v->cm.error)
+		ret = -EIO;
+
+	dev_info(core->dev, "interface %d protects frames with %u\n", if_num,
+		 v->msg.vdev_cmd.value);
+
+	kfree(v);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(nss_wifi_vdev_security);
 
 /* Tell the firmware about a station.
  *
@@ -734,6 +934,13 @@ int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
 		return ret;
 	}
 
+	/* What the hardware resolves a unicast frame against. A search index
+	 * or hash of zero is what an unmapped peer looks like, and a frame
+	 * built on one is dropped after the ring rather than at it.
+	 */
+	dev_info(core->dev, "peer %pM: id %u ast_idx %u ast_hash %#x vdev %u\n",
+		 mac, peer_id, hw_ast_idx, tx_ast_hash, vdev_id);
+
 	nss_wifili_peer_tbl[i].peer_id = peer_id;
 	nss_wifili_peer_tbl[i].vdev_id = vdev_id;
 	ether_addr_copy(nss_wifili_peer_tbl[i].mac, mac);
@@ -828,6 +1035,19 @@ EXPORT_SYMBOL_GPL(nss_wifi_vdev_tx);
  * What is being asked is whether the descriptor is consumed and the buffer
  * handed back, which is the whole of the transmit contract minus its purpose.
  */
+/* Which virtual device the probe posts to. A frame this driver builds reaches
+ * the transmit ring on the first one; whether it does on the second is what
+ * separates a frame the firmware will not take from a device it will not send
+ * on.
+ */
+static unsigned int nss_wifili_probe_vdev;
+module_param_named(probe_vdev, nss_wifili_probe_vdev, uint, 0644);
+MODULE_PARM_DESC(probe_vdev, "which virtual device the transmit probe posts to");
+
+static u8 nss_wifili_probe_dst[ETH_ALEN];
+module_param_array_named(probe_dst, nss_wifili_probe_dst, byte, NULL, 0644);
+MODULE_PARM_DESC(probe_dst, "destination for the transmit probe, unset for broadcast");
+
 int nss_wifili_tx(struct seq_file *s)
 {
 	struct nss_core *core = nss_wifili_core;
@@ -838,7 +1058,11 @@ int nss_wifili_tx(struct seq_file *s)
 	if (!core || !core->running)
 		return -ENODEV;
 
-	if_num = nss_wifili_vdev_tbl[0].dev ? nss_wifili_vdev_tbl[0].if_num : -1;
+	if (nss_wifili_probe_vdev >= ARRAY_SIZE(nss_wifili_vdev_tbl))
+		return -EINVAL;
+
+	if_num = nss_wifili_vdev_tbl[nss_wifili_probe_vdev].dev ?
+		 nss_wifili_vdev_tbl[nss_wifili_probe_vdev].if_num : -1;
 	if (if_num < 0) {
 		seq_puts(s, "no virtual device: bring a WLAN interface up first\n");
 		return 0;
@@ -857,6 +1081,12 @@ int nss_wifili_tx(struct seq_file *s)
 		 */
 		memset(skb_put(skb, 60), 0, 60);
 		memset(skb->data, 0xff, ETH_ALEN);
+		/* A destination the firmware has to resolve to a peer, when one
+		 * is named. Broadcast needs no lookup, so the two together say
+		 * whether a lookup is what a frame dies on.
+		 */
+		if (!is_zero_ether_addr(nss_wifili_probe_dst))
+			ether_addr_copy(skb->data, nss_wifili_probe_dst);
 		skb->data[12] = 0x88;
 		skb->data[13] = 0xb5;
 
@@ -998,7 +1228,7 @@ int nss_wifili_start(struct seq_file *s)
 		 nss_wifili_soc.num_reo);
 	for (i = 0; i < nss_wifili_soc.num_tcl; i++)
 		dev_info(core->dev,
-			 "wifili: tcl%d id %u base %#x x%u  txcomp id %u base %#x x%u hw %#x/%#x\n",
+			 "wifili: tcl%d id %u base %#x x%u  txcomp id %u base %#x x%u hw %#x/%#x  tclhw %#x/%#x tcle %u\n",
 			 i, nss_wifili_soc.tcl[i].id,
 			 nss_wifili_soc.tcl[i].base,
 			 nss_wifili_soc.tcl[i].num_entries,
@@ -1006,7 +1236,44 @@ int nss_wifili_start(struct seq_file *s)
 			 nss_wifili_soc.txcomp[i].base,
 			 nss_wifili_soc.txcomp[i].num_entries,
 			 nss_wifili_soc.txcomp[i].hwreg[0],
-			 nss_wifili_soc.txcomp[i].hwreg[1]);
+			 nss_wifili_soc.txcomp[i].hwreg[1],
+			 nss_wifili_soc.tcl[i].hwreg[0],
+			 nss_wifili_soc.tcl[i].hwreg[1],
+			 nss_wifili_soc.tcl[i].entry_size);
+	/* Where the ring pointers really live. A ring's head and tail are not
+	 * all in its registers: the pointer the other side publishes is in one
+	 * of two shared arrays, indexed by the ring's own number in one and by
+	 * its number less the first local-MAC ring in the other. Printing the
+	 * bases is what makes those readable as ordinary memory, which is the
+	 * only safe way to read them.
+	 */
+	dev_info(core->dev,
+		 "wifili: shadow rd %#x wr %#x lmac from %u\n",
+		 nss_wifili_soc.shadow_rd, nss_wifili_soc.shadow_wr,
+		 nss_wifili_soc.lmac_ring_start);
+	/* The receive rings, for the same reason and one more: whether the
+	 * firmware ever puts a buffer in the ring the hardware writes into is
+	 * the difference between a receive path that is misrouted and one
+	 * that never starts, and the two look identical from the host.
+	 */
+	for (i = 0; i < nss_wifili_soc.num_reo; i++)
+		dev_info(core->dev,
+			 "wifili: reo%d id %u base %#x x%u hw %#x/%#x\n",
+			 i, nss_wifili_soc.reo_dest[i].id,
+			 nss_wifili_soc.reo_dest[i].base,
+			 nss_wifili_soc.reo_dest[i].num_entries,
+			 nss_wifili_soc.reo_dest[i].hwreg[0],
+			 nss_wifili_soc.reo_dest[i].hwreg[1]);
+	for (i = 0; i < nss_wifili_pdevs; i++)
+		dev_info(core->dev,
+			 "wifili: radio %u rxdma id %u base %#x x%u hw %#x/%#x swdesc %u\n",
+			 nss_wifili_pdev[i].radio_id,
+			 nss_wifili_pdev[i].rxdma.id,
+			 nss_wifili_pdev[i].rxdma.base,
+			 nss_wifili_pdev[i].rxdma.num_entries,
+			 nss_wifili_pdev[i].rxdma.hwreg[0],
+			 nss_wifili_pdev[i].rxdma.hwreg[1],
+			 nss_wifili_pdev[i].num_rx_swdesc);
 
 	ret = nss_msg_send(core, m, offsetof(struct nss_wifili_msg, msg) +
 				    sizeof(m->msg.init));
@@ -1056,8 +1323,26 @@ int nss_wifili_start(struct seq_file *s)
 	ret = nss_msg_send(core, m, offsetof(struct nss_wifili_msg, msg));
 	seq_printf(s, "%-14s rc %d response %u error %u\n", "start:", ret,
 		   m->cm.response, m->cm.error);
-	if (!ret)
+	if (!ret) {
 		core->wifili_started = true;
+
+		/* Ask for the statistics push. The firmware raises no wifili
+		 * message at all until it is asked, so a receive path that
+		 * never starts and one that starts and drops everything are
+		 * indistinguishable from the host; the counters in that push
+		 * are what tells them apart.
+		 */
+		memset(m, 0, sizeof(*m));
+		m->cm.interface = NSS_INTERFACE_WIFILI;
+		m->cm.type = NSS_WIFILI_STATS_CFG_MSG;
+		m->msg.scm.cfg = 1;
+		ret = nss_msg_send(core, m,
+				   offsetof(struct nss_wifili_msg, msg) +
+				   sizeof(m->msg.scm));
+		seq_printf(s, "%-14s rc %d response %u error %u\n", "stats:",
+			   ret, m->cm.response, m->cm.error);
+		ret = 0;
+	}
 out:
 	kfree(w);
 	kfree(m);
