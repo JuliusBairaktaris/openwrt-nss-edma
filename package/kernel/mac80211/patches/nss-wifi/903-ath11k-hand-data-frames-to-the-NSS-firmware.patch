@@ -95,7 +95,7 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/mac.c
  		return;
  	}
  
-@@ -6551,6 +6572,37 @@ static int ath11k_mac_setup_vdev_create_
+@@ -6551,6 +6572,56 @@ static int ath11k_mac_setup_vdev_create_
  	return 0;
  }
  
@@ -107,6 +107,21 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/mac.c
 + * what the hardware encapsulation and decapsulation this driver has already
 + * been told to use produce.
 + */
++/* The mode the WLAN firmware was given for this direction a moment ago, in
++ * ath11k_mac_op_update_vif_offload(). The NSS firmware has to declare the same
++ * one, and mac80211 grants the encapsulation offload rather than the driver
++ * choosing it, so it is read back here rather than derived from frame_mode.
++ */
++static u8 ath11k_nss_vdev_mode(struct ath11k_base *ab,
++			       struct ieee80211_vif *vif, u32 offload_flag)
++{
++	if (vif->offload_flags & offload_flag)
++		return ATH11K_HW_TXRX_ETHERNET;
++	if (test_bit(ATH11K_FLAG_RAW_MODE, &ab->dev_flags))
++		return ATH11K_HW_TXRX_RAW;
++	return ATH11K_HW_TXRX_NATIVE_WIFI;
++}
++
 +static void ath11k_nss_vdev_register(struct ath11k_vif *arvif,
 +				     struct ieee80211_vif *vif)
 +{
@@ -120,7 +135,11 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/mac.c
 +
 +	ret = nss_wifi_vdev_register(wdev->netdev, ar->pdev_idx, arvif->vdev_id,
 +				     vif->addr,
-+				     vif->type == NL80211_IFTYPE_AP);
++				     vif->type == NL80211_IFTYPE_AP,
++				     ath11k_nss_vdev_mode(ar->ab, vif,
++							  IEEE80211_OFFLOAD_ENCAP_ENABLED),
++				     ath11k_nss_vdev_mode(ar->ab, vif,
++							  IEEE80211_OFFLOAD_DECAP_ENABLED));
 +	if (ret < 0) {
 +		ath11k_warn(ar->ab, "failed to give vdev %d to the NSS firmware: %d\n",
 +			    arvif->vdev_id, ret);
@@ -133,7 +152,7 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/mac.c
  static void ath11k_mac_op_update_vif_offload(struct ieee80211_hw *hw,
  					     struct ieee80211_vif *vif)
  {
-@@ -6797,6 +6849,7 @@ static int ath11k_mac_op_add_interface(s
+@@ -6797,6 +6868,7 @@ static int ath11k_mac_op_add_interface(s
  
  	arvif->ar = ar;
  	arvif->vif = vif;
@@ -141,7 +160,7 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/mac.c
  
  	INIT_LIST_HEAD(&arvif->list);
  	INIT_WORK(&arvif->bcn_tx_work, ath11k_mac_bcn_tx_work);
-@@ -6882,6 +6935,9 @@ static int ath11k_mac_op_add_interface(s
+@@ -6882,6 +6954,9 @@ static int ath11k_mac_op_add_interface(s
  
  	ath11k_mac_op_update_vif_offload(hw, vif);
  
@@ -151,7 +170,7 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/mac.c
  	nss = get_num_chains(ar->cfg_tx_chainmask) ? : 1;
  	ret = ath11k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id,
  					    WMI_VDEV_PARAM_NSS, nss);
-@@ -7064,6 +7120,17 @@ static void ath11k_mac_op_remove_interfa
+@@ -7064,6 +7139,17 @@ static void ath11k_mac_op_remove_interfa
  				    arvif->vdev_id, ret);
  	}
  
@@ -173,7 +192,7 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/core.c
 ===================================================================
 --- backports-6.18.39.orig/drivers/net/wireless/ath/ath11k/core.c
 +++ backports-6.18.39/drivers/net/wireless/ath/ath11k/core.c
-@@ -43,6 +43,10 @@ bool ath11k_nss_offload;
+@@ -43,7 +43,11 @@ bool ath11k_nss_offload;
  module_param_named(nss_offload, ath11k_nss_offload, bool, 0444);
  MODULE_PARM_DESC(nss_offload, "Hand the data-path rings to the NSS firmware");
  
