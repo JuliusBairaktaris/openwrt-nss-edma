@@ -269,3 +269,50 @@ int nss_msg_probe(struct nss_core *core, struct seq_file *s)
 
 	return nss_wifili_probe(core, s);
 }
+
+/* What the firmware sends unasked, by interface and type.
+ *
+ * A message the host does not recognise is indistinguishable from one that was
+ * never sent, and the two want opposite fixes. This counts every notification
+ * by where it came from, so the difference is a readout rather than a guess.
+ */
+#define NSS_MSG_CENSUS_MAX	24
+
+static struct {
+	u32 interface;
+	u32 type;
+	u32 count;
+} nss_msg_census_tbl[NSS_MSG_CENSUS_MAX];
+static DEFINE_SPINLOCK(nss_msg_census_lock);
+
+void nss_msg_census(const struct nss_cmn_msg *ncm)
+{
+	int i;
+
+	guard(spinlock_bh)(&nss_msg_census_lock);
+
+	for (i = 0; i < NSS_MSG_CENSUS_MAX; i++) {
+		if (nss_msg_census_tbl[i].count &&
+		    (nss_msg_census_tbl[i].interface != ncm->interface ||
+		     nss_msg_census_tbl[i].type != ncm->type))
+			continue;
+		nss_msg_census_tbl[i].interface = ncm->interface;
+		nss_msg_census_tbl[i].type = ncm->type;
+		nss_msg_census_tbl[i].count++;
+		return;
+	}
+}
+
+void nss_msg_census_print(struct seq_file *s)
+{
+	int i;
+
+	guard(spinlock_bh)(&nss_msg_census_lock);
+
+	for (i = 0; i < NSS_MSG_CENSUS_MAX; i++)
+		if (nss_msg_census_tbl[i].count)
+			seq_printf(s, "interface %u type %u n %u\n",
+				   nss_msg_census_tbl[i].interface,
+				   nss_msg_census_tbl[i].type,
+				   nss_msg_census_tbl[i].count);
+}
