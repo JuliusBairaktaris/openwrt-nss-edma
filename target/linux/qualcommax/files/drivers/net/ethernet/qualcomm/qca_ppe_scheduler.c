@@ -491,11 +491,12 @@ static void ppe_qm_init(struct qca_ppe_priv *priv)
 
 	for (i = 0; i < PPE_NUM_PORTS; i++) {
 		for (pri = 0; pri < 16; pri++) {
-			/* Two classes per port, one per band. On a user port
-			 * the hash offset is added to the class for every
-			 * packet, so a class must be as wide as the spread or
-			 * the smear crosses into the next; the CPU port is
-			 * given no spread, so its two are adjacent. Either way
+			/* Two bands per port plus, on a user port, the queues
+			 * of the second scheduler node. On a user port the
+			 * hash offset is added to the class for every packet,
+			 * so a class must be as wide as the spread or the
+			 * smear crosses into the next; the CPU port is given
+			 * no spread, so its two are adjacent. Either way
 			 * l0_port0[] and ppe_l0_scheduler_init() have already
 			 * put the second band a strict priority above the
 			 * first, which is what the small-frame classifier in
@@ -503,9 +504,24 @@ static void ppe_qm_init(struct qca_ppe_priv *priv)
 			 * priority shares one queue, and a frame on its way to
 			 * a Wi-Fi client waits behind whatever bulk that queue
 			 * is holding.
+			 *
+			 * Priorities eight and up select the second node's
+			 * queues. No classifier resolves there on its own -
+			 * the DSCP and PCP tables map below eight unless told
+			 * otherwise - so the node carries exactly the traffic
+			 * a rule names into it, and a shaper on the node then
+			 * governs that traffic and nothing else. The CPU port
+			 * has no second node built and folds these priorities
+			 * to best effort.
 			 */
-			u8 cls = pri < PPE_FLOW_SPREAD_QUEUES ? 0 :
-				 i ? PPE_FLOW_SPREAD_QUEUES : 1;
+			u8 cls;
+
+			if (pri < PPE_FLOW_SPREAD_QUEUES)
+				cls = 0;
+			else if (pri < 2 * PPE_FLOW_SPREAD_QUEUES)
+				cls = i ? PPE_FLOW_SPREAD_QUEUES : 1;
+			else
+				cls = i ? 2 * PPE_FLOW_SPREAD_QUEUES : 0;
 
 			if (i) {
 				regmap_write(priv->regmap,
@@ -847,18 +863,19 @@ static void ppe_l0_scheduler_init(struct qca_ppe_priv *priv)
 				int pri = slot % PPE_MAX_SP_PRI;
 				struct l0_cfg c;
 
-				/* The two bands: queues of one band share one
+				/* The three bands: queues of one band share one
 				 * (SP, priority) and therefore one DRR list -
 				 * the same layout the CPU port's RSS spread
 				 * uses - draining round-robin at equal weight,
 				 * so a hash bucket is served at no less than
 				 * its share of the port. Band two sits a
-				 * priority above band one; the mcast slots on
-				 * the second SP are beyond both.
+				 * priority above band one; band three is the
+				 * second node's, under the mcast slots that
+				 * share that node.
 				 */
-				if (!k && slot < 2 * PPE_FLOW_SPREAD_QUEUES)
-					pri = slot < PPE_FLOW_SPREAD_QUEUES ?
-					      0 : PPE_FLOW_SPREAD_QUEUES;
+				if (!k && slot < 3 * PPE_FLOW_SPREAD_QUEUES)
+					pri = slot / PPE_FLOW_SPREAD_QUEUES == 1 ?
+					      PPE_FLOW_SPREAD_QUEUES : 0;
 
 				c = (struct l0_cfg) {
 					.queue = bases[k] + j,
