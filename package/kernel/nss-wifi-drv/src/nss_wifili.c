@@ -579,6 +579,16 @@ static int nss_wifili_vdev_msg(struct nss_core *core, int if_num, u32 type,
  * makes everything arrive by exception, which is what this rung is. A rule
  * pushed into the firmware later is what takes a flow back off it.
  */
+static int nss_wifili_vdev_cmd(struct nss_core *core, int if_num, u32 cmd,
+			       u32 value)
+{
+	struct nss_wifi_vdev_cmd_msg c = { .cmd = cmd, .value = value };
+
+	return nss_wifili_vdev_msg(core, if_num,
+				   NSS_WIFI_VDEV_INTERFACE_CMD_MSG,
+				   &c, sizeof(c));
+}
+
 static unsigned int nss_wifili_rx_next_hop = NSS_INTERFACE_N2H;
 module_param_named(rx_next_hop, nss_wifili_rx_next_hop, uint, 0644);
 MODULE_PARM_DESC(rx_next_hop, "interface a virtual device forwards receive to, 0 to leave it as created");
@@ -618,11 +628,14 @@ static int nss_wifili_vdev_next_hop(struct nss_core *core, int if_num)
  * exceptions a frame naming the interface, and the table the wired ports
  * already use carries it the rest of the way.
  *
- * The frames crossing this are ethernet, so the WLAN interface has to be
- * running the hardware's own encapsulation and decapsulation.
+ * The encapsulation and decapsulation come from the caller because the same
+ * two values have already been given to the WLAN firmware for this virtual
+ * device: encapsulation is what a transmit descriptor declares a frame to be,
+ * and a frame that is not what the WLAN firmware expects is released instead
+ * of transmitted.
  */
 int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
-			   const u8 *mac, bool ap)
+			   const u8 *mac, bool ap, u8 encap, u8 decap)
 {
 	struct nss_wifi_vdev_config_msg cfg = {};
 	struct nss_dynamic_interface_msg d;
@@ -665,6 +678,14 @@ int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
 				  NSS_WIFI_VDEV_INTERFACE_CONFIGURE_MSG,
 				  &cfg, sizeof(cfg));
 	if (!ret)
+		ret = nss_wifili_vdev_cmd(core, if_num,
+					  NSS_WIFI_VDEV_ENCAP_TYPE_CMD,
+					  encap);
+	if (!ret)
+		ret = nss_wifili_vdev_cmd(core, if_num,
+					  NSS_WIFI_VDEV_DECAP_TYPE_CMD,
+					  decap);
+	if (!ret)
 		ret = nss_wifili_vdev_next_hop(core, if_num);
 	if (!ret) {
 		struct nss_wifi_vdev_enable_msg up = {};
@@ -686,8 +707,8 @@ int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
 	dev_hold(dev);
 	rcu_assign_pointer(core->iface[if_num], dev);
 
-	dev_info(core->dev, "vdev %u on radio %u is interface %d\n",
-		 vdev_id, radio, if_num);
+	dev_info(core->dev, "vdev %u on radio %u is interface %d, encap %u decap %u\n",
+		 vdev_id, radio, if_num, encap, decap);
 
 	return if_num;
 }
