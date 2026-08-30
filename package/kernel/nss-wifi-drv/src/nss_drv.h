@@ -52,6 +52,12 @@
 #define NSS_N2H_BUFFER_PACKET	3
 #define NSS_N2H_BUFFER_STATUS	6
 
+/* The hardware fills the named checksum on the way out; without these a
+ * frame the stack left for the device to finish leaves carrying only the
+ * pseudo-header sum.
+ */
+#define NSS_H2N_FLAG_GEN_IP_CHECKSUM	0x0001
+#define NSS_H2N_FLAG_GEN_L4_CHECKSUM	0x0002
 #define NSS_H2N_FLAG_FIRST_SEGMENT	0x0004
 #define NSS_H2N_FLAG_LAST_SEGMENT	0x0008
 /* The buffer may be kept rather than handed straight back. */
@@ -67,6 +73,8 @@
 /* Interface numbers the firmware dispatches on. */
 #define NSS_INTERFACE_N2H	156
 #define NSS_INTERFACE_ETH_RX	158
+#define NSS_INTERFACE_IPV4	161
+#define NSS_INTERFACE_IPV6	163
 #define NSS_INTERFACE_DYNAMIC	176
 #define NSS_INTERFACE_WIFILI	203
 #define NSS_INTERFACE_MAX	228
@@ -340,6 +348,7 @@ struct nss_core {
 	bool wifili_probed;
 	bool wifili_started;
 	bool clocks_on;
+	unsigned long phys_armed;
 	struct mutex lock;
 	struct dentry *debugfs;
 
@@ -368,6 +377,7 @@ struct nss_core {
 	u64 notify;
 	u64 tx_posted;
 	u64 tx_done;
+	u64 rx_desync;
 	u64 link_desc_seen;
 	u64 link_desc_returned;
 	atomic_t buffers_queued;
@@ -387,6 +397,7 @@ int nss_data_send(struct nss_core *core, struct sk_buff *skb, u32 if_num);
 void nss_doorbell(struct nss_core *core, u32 intr);
 int nss_msg_init(struct nss_core *core);
 int nss_msg_send(struct nss_core *core, void *msg, size_t len);
+int nss_msg_transact(struct nss_core *core, void *msg, size_t len, size_t room);
 bool nss_msg_complete(struct nss_core *core, const struct n2h_descriptor *desc);
 int nss_msg_probe(struct nss_core *core, struct seq_file *s);
 void nss_msg_seen(struct nss_core *core, const struct nss_cmn_msg *ncm,
@@ -402,6 +413,12 @@ void nss_wifili_vdev_notify(struct nss_core *core, const struct nss_cmn_msg *ncm
 void nss_wifili_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
 		       u32 len);
 void nss_wifili_bind(struct nss_core *core);
+int nss_phys_arm(struct nss_core *core, unsigned long mask);
+void nss_flow_bind(struct nss_core *core);
+void nss_flow_flush(void);
+void nss_flow_print(struct seq_file *s);
+int nss_flow_init(void);
+void nss_flow_exit(void);
 int nss_log_show_ring(struct nss_core *core, struct seq_file *s);
 void nss_log_dump(struct nss_core *core, const char *why);
 int nss_log_shadow_init(struct nss_core *core);
