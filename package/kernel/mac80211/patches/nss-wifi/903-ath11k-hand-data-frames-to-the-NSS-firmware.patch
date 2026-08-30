@@ -28,7 +28,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/core.h
 ===================================================================
 --- backports-7.2.orig/drivers/net/wireless/ath/ath11k/core.h
 +++ backports-7.2/drivers/net/wireless/ath/ath11k/core.h
-@@ -375,6 +375,9 @@ struct ath11k_vif {
+@@ -378,6 +378,9 @@ struct ath11k_vif {
  	u8 hal_addr_search_flags;
  	u8 search_type;
  
@@ -38,7 +38,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/core.h
  	struct ath11k *ar;
  	struct ieee80211_vif *vif;
  
-@@ -559,6 +562,8 @@ struct ath11k_sta {
+@@ -562,6 +565,8 @@ struct ath11k_sta {
  	struct rate_info txrate;
  	u32 peer_nss;
  	struct rate_info last_txrate;

@@ -22,9 +22,11 @@ associates. No data crosses the air while the offload is on.
 
 Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 ---
---- a/drivers/net/wireless/ath/ath11k/core.c
-+++ b/drivers/net/wireless/ath/ath11k/core.c
-@@ -39,6 +39,10 @@
+Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/core.c
+===================================================================
+--- backports-6.18.39.orig/drivers/net/wireless/ath/ath11k/core.c
++++ backports-6.18.39/drivers/net/wireless/ath/ath11k/core.c
+@@ -39,6 +39,22 @@ bool ath11k_ftm_mode;
  module_param_named(ftm_mode, ath11k_ftm_mode, bool, 0444);
  MODULE_PARM_DESC(ftm_mode, "Boots up in factory test mode");
  
@@ -32,10 +34,22 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +module_param_named(nss_offload, ath11k_nss_offload, bool, 0444);
 +MODULE_PARM_DESC(nss_offload, "Hand the data-path rings to the NSS firmware");
 +
++bool ath11k_nss_keep_mask;
++module_param_named(nss_keep_mask, ath11k_nss_keep_mask, bool, 0444);
++MODULE_PARM_DESC(nss_keep_mask, "Leave the ring mask alone while offloading");
++
++bool ath11k_nss_hash;
++module_param_named(nss_hash, ath11k_nss_hash, bool, 0444);
++MODULE_PARM_DESC(nss_hash, "Keep hash-based receive steering while offloading");
++
++bool ath11k_nss_prefill;
++module_param_named(nss_prefill, ath11k_nss_prefill, bool, 0444);
++MODULE_PARM_DESC(nss_prefill, "Fill the receive-DMA ring from here as well");
++
  static struct ath11k_hw_params ath11k_hw_params[] = {
  	{
  		.hw_rev = ATH11K_HW_IPQ8074,
-@@ -2656,6 +2660,22 @@
+@@ -2656,6 +2672,22 @@ static int ath11k_init_hw_params(struct
  
  	ab->hw_params = *hw_params;
  
@@ -45,7 +59,7 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +	 * carried over, which also leaves a ring type added later owned by
 +	 * whoever asks for it rather than silently serviced here.
 +	 */
-+	if (ath11k_nss_offload) {
++	if (ath11k_nss_offload && !ath11k_nss_keep_mask) {
 +		const struct ath11k_hw_ring_mask *m = ab->hw_params.ring_mask;
 +
 +		memcpy(ab->nss_ring_mask.reo_status, m->reo_status,
@@ -58,17 +72,22 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  	ret = of_property_read_u32(ab->dev->of_node,
  				   "qcom,ath11k-fw-memory-mode",
  				   &fw_mem_mode);
---- a/drivers/net/wireless/ath/ath11k/core.h
-+++ b/drivers/net/wireless/ath/ath11k/core.h
-@@ -62,6 +62,7 @@
+Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/core.h
+===================================================================
+--- backports-6.18.39.orig/drivers/net/wireless/ath/ath11k/core.h
++++ backports-6.18.39/drivers/net/wireless/ath/ath11k/core.h
+@@ -62,6 +62,10 @@
  
  extern unsigned int ath11k_frame_mode;
  extern bool ath11k_ftm_mode;
 +extern bool ath11k_nss_offload;
++extern bool ath11k_nss_prefill;
++extern bool ath11k_nss_hash;
++extern bool ath11k_nss_keep_mask;
  
  #define ATH11K_SCAN_TIMEOUT_HZ (20 * HZ)
  
-@@ -981,6 +982,11 @@
+@@ -981,6 +985,11 @@ struct ath11k_base {
  
  	struct ath11k_hw_params hw_params;
  
@@ -80,27 +99,34 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  	const struct firmware *cal_file;
  
  	/* Below regd's are protected by ab->data_lock */
---- a/drivers/net/wireless/ath/ath11k/dp.c
-+++ b/drivers/net/wireless/ath/ath11k/dp.c
-@@ -57,9 +57,14 @@
+Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/dp.c
+===================================================================
+--- backports-6.18.39.orig/drivers/net/wireless/ath/ath11k/dp.c
++++ backports-6.18.39/drivers/net/wireless/ath/ath11k/dp.c
+@@ -57,9 +57,17 @@ int ath11k_dp_peer_setup(struct ath11k *
  
  	/* NOTE: reo_dest ring id starts from 1 unlike mac_id which starts from 0 */
  	reo_dest = ar->dp.mac_id + 1;
-+	/* The firmware pairs one reorder destination ring with one radio's
-+	 * receive buffer pool, so a peer's frames may not be spread over the
-+	 * four while it owns them.
++	/* Whether a peer's frames may be spread over the four reorder
++	 * destination rings. Pinning them to one was an assumption about how
++	 * the firmware pairs a ring with a radio's buffer pool, not a
++	 * measurement, and it is one of only two changes here that can reach
++	 * receive at all - so it is a parameter until it has been measured
++	 * both ways.
 +	 */
  	ret = ath11k_wmi_set_peer_param(ar, addr, vdev_id,
  					WMI_PEER_SET_DEFAULT_ROUTING,
 -					DP_RX_HASH_ENABLE | (reo_dest << 1));
-+					(ath11k_nss_offload ? 0 :
-+					 DP_RX_HASH_ENABLE) | (reo_dest << 1));
++					((ath11k_nss_offload && !ath11k_nss_hash) ?
++					 0 : DP_RX_HASH_ENABLE) | (reo_dest << 1));
  
  	if (ret) {
  		ath11k_warn(ab, "failed to set default routing %d peer :%pM vdev_id :%d\n",
---- a/drivers/net/wireless/ath/ath11k/dp_rx.c
-+++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
-@@ -499,7 +499,12 @@
+Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/dp_rx.c
+===================================================================
+--- backports-6.18.39.orig/drivers/net/wireless/ath/ath11k/dp_rx.c
++++ backports-6.18.39/drivers/net/wireless/ath/ath11k/dp_rx.c
+@@ -499,7 +499,18 @@ static int ath11k_dp_rxdma_pdev_buf_setu
  	struct dp_rxdma_ring *rx_ring = &dp->rx_refill_buf_ring;
  	int i;
  
@@ -108,15 +134,23 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +	/* The firmware fills this one from its own pool and names a returned
 +	 * buffer by a cookie it minted, so a ring holding both sides' buffers
 +	 * is a ring neither can reap.
++	 *
++	 * nss_prefill fills it from here anyway. It is a measurement, not a
++	 * configuration: if the hardware takes buffers this driver wrote and
++	 * not the ones the firmware wrote, the difference is in the entries
++	 * rather than anywhere else, and that is worth knowing before more is
++	 * built on either.
 +	 */
-+	if (!ath11k_nss_offload)
++	if (!ath11k_nss_offload || ath11k_nss_prefill)
 +		ath11k_dp_rxdma_ring_buf_setup(ar, rx_ring, HAL_RXDMA_BUF);
  
  	if (ar->ab->hw_params.rxdma1_enable) {
  		rx_ring = &dp->rxdma_mon_buf_ring;
---- a/drivers/net/wireless/ath/ath11k/mac.c
-+++ b/drivers/net/wireless/ath/ath11k/mac.c
-@@ -6216,6 +6216,17 @@
+Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/mac.c
+===================================================================
+--- backports-6.18.39.orig/drivers/net/wireless/ath/ath11k/mac.c
++++ backports-6.18.39/drivers/net/wireless/ath/ath11k/mac.c
+@@ -6216,6 +6216,17 @@ static void ath11k_mac_op_tx(struct ieee
  		return;
  	}
  
@@ -133,3 +167,4 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +
  	if (control->sta)
  		arsta = ath11k_sta_to_arsta(control->sta);
+ 
