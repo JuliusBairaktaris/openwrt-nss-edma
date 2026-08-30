@@ -84,6 +84,9 @@ int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
 			 u16 hw_ast_idx, u32 tx_ast_hash);
 void nss_wifi_peer_delete(u32 vdev_id, const u8 *mac, u16 peer_id);
 int nss_wifi_vdev_security(int if_num, u32 cipher);
+int nss_wifi_peer_security(u16 peer_id, bool group, u32 cipher,
+			   const u8 *mic_key);
+int nss_wifi_peer_authorize(u16 peer_id);
 #else
 static inline int nss_wifi_soc_register(const struct nss_wifi_soc *soc)
 {
@@ -127,6 +130,17 @@ static inline void nss_wifi_peer_delete(u32 vdev_id, const u8 *mac,
 }
 
 static inline int nss_wifi_vdev_security(int if_num, u32 cipher)
+{
+	return -ENODEV;
+}
+
+static inline int nss_wifi_peer_security(u16 peer_id, bool group, u32 cipher,
+					 const u8 *mic_key)
+{
+	return -ENODEV;
+}
+
+static inline int nss_wifi_peer_authorize(u16 peer_id)
 {
 	return -ENODEV;
 }
