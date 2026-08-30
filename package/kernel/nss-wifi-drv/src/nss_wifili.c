@@ -1010,6 +1010,58 @@ static void nss_wifili_peer_flush(struct nss_core *core, u32 vdev_id)
 			nss_wifili_peer_release(core, i);
 }
 
+/* What protects a station's frames, told per peer.
+ *
+ * The virtual device's own cipher decides what a transmit descriptor claims;
+ * this is the one the receive path consults when it has to undo the protection
+ * itself, which is every fragment and every message integrity check. Without
+ * it those frames are handled as though they were in the clear.
+ */
+int nss_wifi_peer_security(u16 peer_id, bool group, u32 cipher,
+			   const u8 *mic_key)
+{
+	struct nss_wifili_peer_security_type_msg sm = {};
+	struct nss_core *core;
+
+	guard(mutex)(&nss_wifili_lock);
+
+	core = nss_wifili_core;
+	if (!core || !core->wifili_started)
+		return -EAGAIN;
+
+	sm.peer_id = peer_id;
+	sm.pkt_type = group ? 1 : 0;
+	sm.security_type = nss_wifili_sec_type(cipher);
+	if (mic_key)
+		memcpy(sm.mic_key, mic_key, sizeof(sm.mic_key));
+
+	return nss_wifili_soc_msg(core, NSS_WIFILI_PEER_SECURITY_TYPE_MSG,
+				  &sm, sizeof(sm));
+}
+EXPORT_SYMBOL_GPL(nss_wifi_peer_security);
+
+/* A peer the firmware holds unauthorised has its received frames counted and
+ * dropped rather than delivered.
+ */
+int nss_wifi_peer_authorize(u16 peer_id)
+{
+	struct nss_wifili_peer_update_auth_flag au = {};
+	struct nss_core *core;
+
+	guard(mutex)(&nss_wifili_lock);
+
+	core = nss_wifili_core;
+	if (!core || !core->wifili_started)
+		return -EAGAIN;
+
+	au.peer_id = peer_id;
+	au.auth_flag = 1;
+
+	return nss_wifili_soc_msg(core, NSS_WIFILI_PEER_UPDATE_AUTH_FLAG,
+				  &au, sizeof(au));
+}
+EXPORT_SYMBOL_GPL(nss_wifi_peer_authorize);
+
 void nss_wifi_peer_delete(u32 vdev_id, const u8 *mac, u16 peer_id)
 {
 	struct nss_core *core;
