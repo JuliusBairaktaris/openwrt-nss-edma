@@ -22,7 +22,26 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/mac.c
  #include <net/cfg80211.h>
  #include <linux/etherdevice.h>
  #include <linux/bitfield.h>
-@@ -4518,6 +4519,15 @@ static int ath11k_mac_op_set_key(struct
+@@ -4361,6 +4362,7 @@ static int ath11k_mac_op_set_key(struct
+ 	const u8 *peer_addr;
+ 	int ret = 0;
+ 	u32 flags = 0;
++	u16 nss_peer_id = 0;
+ 
+ 	/* BIP needs to be done in software */
+ 	if (key->cipher == WLAN_CIPHER_SUITE_AES_CMAC ||
+@@ -4477,6 +4479,10 @@ static int ath11k_mac_op_set_key(struct
+ 	spin_lock_bh(&ab->base_lock);
+ 	peer = ath11k_peer_find(ab, arvif->vdev_id, peer_addr);
+ 	if (peer && cmd == SET_KEY) {
++		/* Read here because the firmware names a peer by it and the
++		 * calls that carry it cannot be made under this lock.
++		 */
++		nss_peer_id = peer->peer_id;
+ 		peer->keys[key->keyidx] = key;
+ 		if (key->flags & IEEE80211_KEY_FLAG_PAIRWISE) {
+ 			peer->ucast_keyidx = key->keyidx;
+@@ -4518,7 +4524,37 @@ static int ath11k_mac_op_set_key(struct
  
  	spin_unlock_bh(&ab->base_lock);
  
@@ -30,10 +49,31 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/mac.c
 +	 * hardware is to apply has to reach it. Left unsaid it is none, and a
 +	 * station that has just installed a key discards everything that
 +	 * follows.
++	 *
++	 * The device-wide cipher covers transmit. Receive undoes the
++	 * protection itself wherever the hardware cannot - every fragment and
++	 * every message integrity check - and consults a value held per peer,
++	 * so that one is sent as well, for the pairwise key and the group key
++	 * alike. A peer the firmware holds unauthorised has its received
++	 * frames counted and dropped, so it is authorised in the same breath.
 +	 */
-+	if (ath11k_nss_offload && cmd == SET_KEY &&
-+	    key->flags & IEEE80211_KEY_FLAG_PAIRWISE)
-+		nss_wifi_vdev_security(arvif->nss_ifnum, key->cipher);
++	if (ath11k_nss_offload && cmd == SET_KEY) {
++		bool group = !(key->flags & IEEE80211_KEY_FLAG_PAIRWISE);
++		const u8 *mic = NULL;
++
++		if (key->cipher == WLAN_CIPHER_SUITE_TKIP &&
++		    key->keylen >= NL80211_TKIP_DATA_OFFSET_RX_MIC_KEY + 8)
++			mic = key->key + NL80211_TKIP_DATA_OFFSET_RX_MIC_KEY;
++
++		if (!group)
++			nss_wifi_vdev_security(arvif->nss_ifnum, key->cipher);
++
++		if (nss_peer_id) {
++			nss_wifi_peer_security(nss_peer_id, group, key->cipher,
++					       mic);
++			nss_wifi_peer_authorize(nss_peer_id);
++		}
++	}
 +
  exit:
  	mutex_unlock(&ar->conf_mutex);
