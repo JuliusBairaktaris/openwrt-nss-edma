@@ -62,7 +62,7 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/peer.c
  	int ret, fbret;
  
  	lockdep_assert_held(&ar->conf_mutex);
-@@ -457,9 +478,31 @@ int ath11k_peer_create(struct ath11k *ar
+@@ -457,9 +478,34 @@ int ath11k_peer_create(struct ath11k *ar
  
  	ar->num_peers++;
  
@@ -79,16 +79,19 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/peer.c
 +	 * the delete runs under the mutex this call already holds.
 +	 */
 +	if (ath11k_nss_offload) {
++		/* A firmware that will not take the peer is a peer that is not
++		 * offloaded, not a peer that may not exist. Failing the
++		 * creation here deletes it, and for an access point's own
++		 * address that is the radio itself: the interface never comes
++		 * up and no station can associate, which is a far larger
++		 * failure than the one being reported.
++		 */
 +		ret = nss_wifi_peer_create(param->vdev_id, param->peer_addr,
 +					   peer_id, ast_idx, ast_hash);
-+		if (ret) {
-+			ath11k_warn(ar->ab, "failed to give peer %pM to the NSS firmware: %d\n",
++		if (ret)
++			ath11k_warn(ar->ab, "peer %pM is not offloaded: %d\n",
 +				    param->peer_addr, ret);
-+			spin_lock_bh(&ar->ab->base_lock);
-+			ar->num_peers--;
-+			spin_unlock_bh(&ar->ab->base_lock);
-+			goto cleanup;
-+		}
++		ret = 0;
 +	}
 +
  	return 0;
