@@ -128,7 +128,11 @@ static bool nss_data_recv(struct nss_core *core, struct napi_struct *napi,
 	if (!dev || end > NSS_EMPTY_BUFFER_ALLOC || desc->payload_len < ETH_HLEN)
 		return false;
 
-	dma_unmap_single(core->dev, NSS_SKB_CB(skb)->dma,
+	/* The unmap uses the descriptor's own address, never one cached in the
+	 * buffer: a stale cookie then delivers a wrong frame rather than
+	 * invalidating a wild range from softirq.
+	 */
+	dma_unmap_single(core->dev, desc->buffer,
 			 NSS_EMPTY_BUFFER_ALLOC, DMA_FROM_DEVICE);
 
 	skb_reserve(skb, desc->payload_offs);
@@ -283,6 +287,9 @@ int nss_data_send(struct nss_core *core, struct sk_buff *skb, u32 if_num)
 		desc->bit_flags = NSS_H2N_FLAG_FIRST_SEGMENT |
 				  NSS_H2N_FLAG_LAST_SEGMENT |
 				  (nss_tx_reusable ? NSS_H2N_FLAG_BUFFER_REUSABLE : 0);
+		if (skb->ip_summed == CHECKSUM_PARTIAL)
+			desc->bit_flags |= NSS_H2N_FLAG_GEN_IP_CHECKSUM |
+					   NSS_H2N_FLAG_GEN_L4_CHECKSUM;
 		desc->opaque = (uintptr_t)skb;
 
 		ring->hlos_index = next;
@@ -603,29 +610,48 @@ static int nss_poll_n2h(struct napi_struct *napi, int budget)
 		if (desc->interface_num < NSS_INTERFACE_MAX)
 			core->rx_iface[desc->interface_num]++;
 
-		if (nss_msg_complete(core, desc)) {
-			/* nothing to release */
-		} else if (skb && nss_data_recv(core, napi, desc, skb)) {
-			atomic_dec(&core->buffers_queued);
-			returned++;
-		} else if (skb && NSS_SKB_CB(skb)->tx) {
-			/* A frame handed down, now sent. Nothing replaces it:
-			 * the count this ring keeps is of buffers lent, and
-			 * this was never one.
-			 */
-			dma_unmap_single(core->dev, NSS_SKB_CB(skb)->dma,
-					 skb_end_pointer(skb) - skb->head,
-					 DMA_TO_DEVICE);
-			core->tx_done++;
-			dev_kfree_skb_any(skb);
-		} else if (skb) {
-			nss_ext_take(core, desc, skb);
-			dma_unmap_single(core->dev, NSS_SKB_CB(skb)->dma,
-					 NSS_EMPTY_BUFFER_ALLOC, DMA_FROM_DEVICE);
-			nss_notify_recv(core, desc, skb);
-			dev_kfree_skb_any(skb);
-			atomic_dec(&core->buffers_queued);
-			returned++;
+		/* A returned descriptor is only safe to act on when the cookie
+		 * names an skb this driver lent AND that skb still records the
+		 * DMA address the descriptor carries. The firmware is the other
+		 * side of a trust boundary: a cookie that is a plausible but
+		 * wrong pointer skb_put()s into freed memory, and a DMA address
+		 * that is not the skb's unmaps a wild range - both from softirq,
+		 * both fatal. When the two disagree it cannot be told which is
+		 * the faithful field, so the only safe act is neither: leak the
+		 * one buffer, count it, and step over the slot. A message
+		 * completion carries no donated buffer and is handled first.
+		 */
+		if (!nss_msg_complete(core, desc)) {
+			bool ours = skb && virt_addr_valid((void *)skb) &&
+				    NSS_SKB_CB(skb)->dma == desc->buffer;
+
+			if (!ours) {
+				core->rx_desync++;
+				dev_warn_ratelimited(core->dev,
+						     "n2h: desync cookie %llx buf %x dma %llx type %u q %d - leaked\n",
+						     desc->opaque, desc->buffer,
+						     skb && virt_addr_valid((void *)skb) ?
+						     (u64)NSS_SKB_CB(skb)->dma : 0,
+						     desc->buffer_type, qid);
+			} else if (nss_data_recv(core, napi, desc, skb)) {
+				atomic_dec(&core->buffers_queued);
+				returned++;
+			} else if (NSS_SKB_CB(skb)->tx) {
+				dma_unmap_single(core->dev, NSS_SKB_CB(skb)->dma,
+						 skb_end_pointer(skb) - skb->head,
+						 DMA_TO_DEVICE);
+				core->tx_done++;
+				dev_kfree_skb_any(skb);
+			} else {
+				nss_ext_take(core, desc, skb);
+				dma_unmap_single(core->dev, NSS_SKB_CB(skb)->dma,
+						 NSS_EMPTY_BUFFER_ALLOC,
+						 DMA_FROM_DEVICE);
+				nss_notify_recv(core, desc, skb);
+				dev_kfree_skb_any(skb);
+				atomic_dec(&core->buffers_queued);
+				returned++;
+			}
 		}
 
 		ring->hlos_index = (ring->hlos_index + 1) &
