@@ -1,0 +1,40 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] ath11k: tell the NSS firmware how frames are protected
+
+The firmware builds the transmit descriptor, and the descriptor carries
+the encryption the hardware is to apply. It takes that from the virtual
+device, not from the frame, so nothing tells it until this does: left
+unsaid the encryption is none, and a station that has just installed a
+pairwise key discards every frame that follows. The symptom is an
+association that authenticates and never authorises.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/mac.c
+===================================================================
+--- backports-6.18.39.orig/drivers/net/wireless/ath/ath11k/mac.c
++++ backports-6.18.39/drivers/net/wireless/ath/ath11k/mac.c
+@@ -6,6 +6,7 @@
+ 
+ #include <net/mac80211.h>
+ #include <linux/soc/qcom/nss_wifi.h>
++/* nss_wifi_vdev_security() */
+ #include <net/cfg80211.h>
+ #include <linux/etherdevice.h>
+ #include <linux/bitfield.h>
+@@ -4518,6 +4519,15 @@ static int ath11k_mac_op_set_key(struct
+ 
+ 	spin_unlock_bh(&ab->base_lock);
+ 
++	/* The firmware builds the transmit descriptor, so the cipher the
++	 * hardware is to apply has to reach it. Left unsaid it is none, and a
++	 * station that has just installed a key discards everything that
++	 * follows.
++	 */
++	if (ath11k_nss_offload && cmd == SET_KEY &&
++	    key->flags & IEEE80211_KEY_FLAG_PAIRWISE)
++		nss_wifi_vdev_security(arvif->nss_ifnum, key->cipher);
++
+ exit:
+ 	mutex_unlock(&ar->conf_mutex);
+ 	return ret;
