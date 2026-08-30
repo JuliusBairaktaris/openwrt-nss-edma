@@ -1292,6 +1292,10 @@ static void ppe_acl_small_pkt_apply(struct qca_ppe_priv *priv)
 
 	/* Length 0 disarms by handing the rule an empty source bitmap, which
 	 * keeps its entry so the parameter can be turned back on.
+	 *
+	 * Priority 1, not the floor: a tc filter at the last preference
+	 * lands on priority 0, which is the one place a rule that has to
+	 * lose to this promotion for a small frame can stand.
 	 */
 	for (i = 0; i < ARRAY_SIZE(ppe_small_pkt_group); i++) {
 		struct ppe_acl_group *g = &ppe_small_pkt_group[i];
@@ -1301,7 +1305,7 @@ static void ppe_acl_small_pkt_apply(struct qca_ppe_priv *priv)
 
 		s.key[1] = i ? PPE_ACL_IS_IPV6 : 0;
 		ppe_acl_slice_write(priv, g->index[0], &s, act,
-				    ppe_small_pkt_len ? ports : 0, 0);
+				    ppe_small_pkt_len ? ports : 0, 1);
 	}
 }
 
