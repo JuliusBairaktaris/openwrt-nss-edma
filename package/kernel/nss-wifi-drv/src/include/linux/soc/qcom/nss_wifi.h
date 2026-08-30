@@ -77,7 +77,7 @@ int nss_wifi_soc_register(const struct nss_wifi_soc *soc);
 void nss_wifi_soc_unregister(void);
 int nss_wifi_pdev_register(const struct nss_wifi_pdev *pdev);
 int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
-			   const u8 *mac, bool ap);
+			   const u8 *mac, bool ap, u8 encap, u8 decap);
 void nss_wifi_vdev_unregister(struct net_device *dev);
 int nss_wifi_vdev_tx(int if_num, struct sk_buff *skb);
 int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
@@ -100,7 +100,8 @@ static inline int nss_wifi_pdev_register(const struct nss_wifi_pdev *pdev)
 }
 
 static inline int nss_wifi_vdev_register(struct net_device *dev, u8 radio,
-					 u32 vdev_id, const u8 *mac, bool ap)
+					 u32 vdev_id, const u8 *mac, bool ap,
+					 u8 encap, u8 decap)
 {
 	return -ENODEV;
 }
