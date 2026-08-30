@@ -1322,10 +1322,15 @@ static void ppe_port_queue_limit_set(struct qca_ppe_priv *priv, int port)
 
 		/* A queue given a ceiling of its own is a bottleneck the same
 		 * way a shaped port is, and a tighter one, so the standing
-		 * queue forms there and is sized from that rate instead.
+		 * queue forms there and is sized from that rate instead: ten
+		 * milliseconds of it, as the port the host is behind is
+		 * given, because a millisecond is too shallow to hold one
+		 * flow at the rate.
 		 */
 		if (rate)
-			w = ppe_ac_uni_static(priv, port, rate, 0);
+			w = ppe_ac_uni_static(priv, port, rate,
+					      div_u64(rate * 10,
+						      BITS_PER_BYTE * 1000));
 		else if (sh->rate_bps && i < 2 * PPE_FLOW_SPREAD_QUEUES)
 			/* A band bucket holds a share of the flows and drains
 			 * at no less than its share of the port, so it takes
