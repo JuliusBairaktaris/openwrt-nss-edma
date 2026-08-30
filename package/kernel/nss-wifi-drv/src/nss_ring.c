@@ -80,6 +80,33 @@ void nss_iface_unbind(struct nss_core *core)
 	synchronize_rcu();
 }
 
+/* Keep the first few buffers the firmware hands up that are neither an
+ * ordinary frame nor a message. One of them is how a receive descriptor the
+ * host must give back arrives, and its shape on the running firmware is not
+ * derivable from anything the host has.
+ */
+static void nss_ext_take(struct nss_core *core, const struct n2h_descriptor *desc,
+			 struct sk_buff *skb)
+{
+	struct nss_ext_seen *e;
+	u32 i;
+
+	if (core->ext_seen >= ARRAY_SIZE(core->ext))
+		return;
+
+	if (desc->buffer_type == NSS_N2H_BUFFER_STATUS ||
+	    (u32)desc->payload_offs + desc->payload_len > NSS_EMPTY_BUFFER_ALLOC)
+		return;
+
+	e = &core->ext[core->ext_seen++];
+	e->iface = desc->interface_num;
+	e->type = desc->buffer_type;
+	e->len = desc->payload_len;
+	e->offs = desc->payload_offs;
+	for (i = 0; i < ARRAY_SIZE(e->word) && i * sizeof(u32) < e->len; i++)
+		e->word[i] = ((const u32 *)(skb->head + desc->payload_offs))[i];
+}
+
 /* Hand up a frame the firmware exceptioned.
  *
  * The offset and length come from the other side, so they are checked against
@@ -177,19 +204,47 @@ static void nss_cpu_port_reclaim(struct nss_core *core)
  * chain them and a chain the firmware reads wrongly is a fault rather than a
  * dropped frame.
  */
+/* Whether the firmware may keep the buffer a frame arrives in. A working host
+ * driver of this firmware line offers every frame it hands to a virtual
+ * device this way and this one did not, which is a difference worth being
+ * able to measure rather than to argue about.
+ */
+static bool nss_tx_reusable = true;
+module_param_named(tx_reusable, nss_tx_reusable, bool, 0644);
+MODULE_PARM_DESC(tx_reusable, "offer the firmware the buffer a frame arrives in");
+
 int nss_data_send(struct nss_core *core, struct sk_buff *skb, u32 if_num)
 {
 	struct nss_h2n_ring *ring = &core->h2n[NSS_H2N_RING_DATA];
 	struct nss_if_mem_map *map = core->if_map;
 	struct h2n_descriptor *desc;
 	dma_addr_t dma;
-	u32 next;
+	u32 next, shift;
 
 	if (!core->running)
 		return -ENODEV;
 
 	if (skb_is_nonlinear(skb) && skb_linearize(skb))
 		return -ENOMEM;
+
+	/* The firmware checks that a frame begins on a word boundary within
+	 * the buffer it is given, and drops one that does not before it
+	 * reaches a ring. A frame this driver builds is aligned by
+	 * construction; one converted from 802.11 is not, because the header
+	 * it replaced was not a multiple of four bytes long. Moving it down
+	 * to the next boundary costs a copy of the frame on the paths that
+	 * are not the fast one - the encapsulated frames, which are the bulk,
+	 * arrive aligned and are left alone.
+	 */
+	shift = (skb->data - skb->head) & 3;
+	if (shift) {
+		if (skb_headroom(skb) < shift)
+			return -ENOBUFS;
+
+		memmove(skb->data - shift, skb->data, skb->len);
+		skb->data -= shift;
+		skb_set_tail_pointer(skb, skb->len);
+	}
 
 	dma = dma_map_single(core->dev, skb->head,
 			     skb_end_pointer(skb) - skb->head, DMA_TO_DEVICE);
@@ -223,7 +278,8 @@ int nss_data_send(struct nss_core *core, struct sk_buff *skb, u32 if_num)
 		desc->qos_tag = 0;
 		desc->buffer_type = NSS_H2N_BUFFER_PACKET;
 		desc->bit_flags = NSS_H2N_FLAG_FIRST_SEGMENT |
-				  NSS_H2N_FLAG_LAST_SEGMENT;
+				  NSS_H2N_FLAG_LAST_SEGMENT |
+				  (nss_tx_reusable ? NSS_H2N_FLAG_BUFFER_REUSABLE : 0);
 		desc->opaque = (uintptr_t)skb;
 
 		ring->hlos_index = next;
@@ -231,6 +287,19 @@ int nss_data_send(struct nss_core *core, struct sk_buff *skb, u32 if_num)
 	}
 
 	nss_doorbell(core, NSS_H2N_INTR_DATA_CMD);
+	core->tx_posted++;
+
+	/* The first few descriptors, whatever built them. A frame this driver
+	 * makes reaches the transmit ring and one converted from the WLAN
+	 * subsystem does not, through this same function, so what differs is
+	 * in these numbers.
+	 */
+	if (core->tx_posted <= 12)
+		dev_info(core->dev,
+			 "tx %llu: if %u offs %u len %u buf %u flags %#x head %p data %p\n",
+			 core->tx_posted, if_num, desc->payload_offs,
+			 desc->payload_len, desc->buffer_len, desc->bit_flags,
+			 skb->head, skb->data);
 
 	return 0;
 }
@@ -547,6 +616,7 @@ static int nss_poll_n2h(struct napi_struct *napi, int budget)
 			core->tx_done++;
 			dev_kfree_skb_any(skb);
 		} else if (skb) {
+			nss_ext_take(core, desc, skb);
 			dma_unmap_single(core->dev, NSS_SKB_CB(skb)->dma,
 					 NSS_EMPTY_BUFFER_ALLOC, DMA_FROM_DEVICE);
 			nss_notify_recv(core, desc, skb);
