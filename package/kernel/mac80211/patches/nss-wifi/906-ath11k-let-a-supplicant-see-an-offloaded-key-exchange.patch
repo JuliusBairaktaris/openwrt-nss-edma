@@ -1,0 +1,47 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] ath11k: let a supplicant see an offloaded key exchange
+
+An offloaded frame is delivered on the virtual device's network device and
+never enters mac80211, so the control port mac80211 offers over netlink
+carries nothing once the NSS firmware owns the data path. A supplicant that
+takes the offer stops reading the interface, and the key exchange it is
+waiting for arrives somewhere it is no longer looking: no station reaches
+authorised, whatever the firmware does with the frames.
+
+The capability is a wiphy feature bit and mac80211 sets it for every driver,
+so it is withdrawn here rather than in mac80211, and only while the offload
+is on. A supplicant then falls back to the interface itself, which is where
+the frames are.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/mac.c
+===================================================================
+--- backports-6.18.39.orig/drivers/net/wireless/ath/ath11k/mac.c
++++ backports-6.18.39/drivers/net/wireless/ath/ath11k/mac.c
+@@ -10470,7 +10470,26 @@ static int __ath11k_mac_register(struct
+ 	    ab->hw_params.bios_sar_capa)
+ 		ar->hw->wiphy->sar_capa = ab->hw_params.bios_sar_capa;
+ 
++	/* Before registration, because the capability is read off the wiphy
++	 * once it is published.
++	 */
++	if (ath11k_nss_offload) {
++		static const enum nl80211_ext_feature_index over_nl[] = {
++			NL80211_EXT_FEATURE_CONTROL_PORT_OVER_NL80211,
++			NL80211_EXT_FEATURE_CONTROL_PORT_NO_PREAUTH,
++			NL80211_EXT_FEATURE_CONTROL_PORT_OVER_NL80211_TX_STATUS,
++		};
++		struct wiphy *wiphy = ar->hw->wiphy;
++		int f;
++
++		for (f = 0; f < ARRAY_SIZE(over_nl); f++) {
++			enum nl80211_ext_feature_index ft = over_nl[f];
++
++			wiphy->ext_features[ft / 8] &= ~BIT(ft % 8);
++		}
++	}
++
+ 	ret = ieee80211_register_hw(ar->hw);
+ 	if (ret) {
+ 		ath11k_err(ar->ab, "ieee80211 registration failed: %d\n", ret);
