@@ -225,11 +225,75 @@ EXPORT_SYMBOL_GPL(nss_wifi_pdev_register);
  * rather than only on the path that emptied it - so late is the same as never
  * and this may not be deferred.
  */
+static DEFINE_SPINLOCK(nss_wifili_stats_lock);
+static struct nss_wifili_device_stats nss_wifili_stats;
+static u32 nss_wifili_stats_seen;
+
+
+/* What the firmware says about its own receive path. Empty rings and full
+ * rings that drop look identical from the host, and these are what tell them
+ * apart.
+ */
+void nss_wifili_stats_print(struct seq_file *s)
+{
+	struct nss_wifili_device_stats st;
+	u32 seen;
+	int i;
+
+	spin_lock_bh(&nss_wifili_stats_lock);
+	st = nss_wifili_stats;
+	seen = nss_wifili_stats_seen;
+	spin_unlock_bh(&nss_wifili_stats_lock);
+
+	seq_printf(s, "reports %u\n", seen);
+	if (!seen)
+		return;
+
+	for (i = 0; i < NSS_WIFILI_MAX_PDEV_NUM_MSG; i++)
+		seq_printf(s, "radio%d replenished %u hw_desc_unavailable %u  pool no_pb %u alloc %u alloc_fail %u\n",
+			   i, st.rxdma_stats[i].rx_buf_replenished,
+			   st.rxdma_stats[i].rx_hw_desc_unavailable,
+			   st.rx_sw_pool_stats[i].rx_no_pb,
+			   st.rx_sw_pool_stats[i].desc_alloc,
+			   st.rx_sw_pool_stats[i].desc_alloc_fail);
+
+	for (i = 0; i < NSS_WIFILI_MAX_REO_DATA_RINGS_MSG; i++)
+		seq_printf(s, "reo%d reaped %u error %u invalid_cookie %u defrag %u\n",
+			   i, st.rxreo_stats[i].ring_reaped,
+			   st.rxreo_stats[i].ring_error,
+			   st.rxreo_stats[i].invalid_cookie,
+			   st.rxreo_stats[i].defrag_reaped);
+
+	seq_printf(s, "wbm invalid_buf_mgr %u src_rxdma %u src_reo %u src_invalid %u\n",
+		   st.rxwbm_stats.invalid_buf_mgr,
+		   st.rxwbm_stats.err_src_rxdma,
+		   st.rxwbm_stats.err_src_reo,
+		   st.rxwbm_stats.err_src_invalid);
+}
+
+EXPORT_SYMBOL_GPL(nss_wifili_stats_print);
+
 void nss_wifili_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
 		       u32 len)
 {
 	void (*home)(void *priv, const u32 *buf_addr_info);
 	const struct nss_wifili_msg *m;
+
+	/* The firmware counts its own receive path, and those counters are the
+	 * only place that separates a radio whose buffers were never filled
+	 * from one that fills and drops. They arrive unasked once statistics
+	 * are on, so the newest is kept whole and read out on demand.
+	 */
+	if (ncm->type == NSS_WIFILI_STATS_MSG &&
+	    len >= offsetof(struct nss_wifili_msg, msg) +
+		   sizeof(struct nss_wifili_stats_sync_msg)) {
+		m = container_of_const(ncm, struct nss_wifili_msg, cm);
+		spin_lock_bh(&nss_wifili_stats_lock);
+		nss_wifili_stats = m->msg.wlsoc_stats.stats;
+		nss_wifili_stats_seen++;
+		spin_unlock_bh(&nss_wifili_stats_lock);
+		return;
+	}
 
 	if (ncm->type != NSS_WIFILI_LINK_DESC_INFO_MSG ||
 	    len < offsetof(struct nss_wifili_msg, msg) +
@@ -530,6 +594,83 @@ struct nss_wifili_vdev {
 };
 
 static struct nss_wifili_vdev nss_wifili_vdev_tbl[NSS_WIFILI_VDEV_MAX];
+
+static struct {
+	int if_num;
+	u32 seen;
+	struct nss_wifi_vdev_stats_sync_msg st;
+} nss_wifili_vdev_stats[NSS_WIFILI_VDEV_MAX];
+
+/* The firmware keeps a virtual device's own counters and pushes them without
+ * being asked. They are the only place that says whether its receive path
+ * produced anything for this device, as opposed to producing nothing at all.
+ *
+ * Each message is a delta: the firmware reads the counters and zeroes them in
+ * the same breath, and it does so several times a second, so the newest
+ * message on its own says only what happened since the last one and is almost
+ * always zero. They are summed here to get a total. Every field is a 32-bit
+ * count, so the sum is elementwise over the message.
+ */
+void nss_wifili_vdev_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
+			    u32 len)
+{
+	const struct nss_wifi_vdev_msg *m;
+	int i;
+
+	if (ncm->type != NSS_WIFI_VDEV_STATS_MSG ||
+	    len < offsetof(struct nss_wifi_vdev_msg, msg) +
+		  sizeof(struct nss_wifi_vdev_stats_sync_msg))
+		return;
+
+	m = container_of_const(ncm, struct nss_wifi_vdev_msg, cm);
+
+	guard(spinlock_bh)(&nss_wifili_stats_lock);
+
+	for (i = 0; i < ARRAY_SIZE(nss_wifili_vdev_stats); i++) {
+		if (nss_wifili_vdev_stats[i].seen &&
+		    nss_wifili_vdev_stats[i].if_num != ncm->interface)
+			continue;
+		const u32 *in = (const u32 *)&m->msg.vdev_stats;
+		u32 *acc = (u32 *)&nss_wifili_vdev_stats[i].st;
+		int w;
+
+		nss_wifili_vdev_stats[i].if_num = ncm->interface;
+		for (w = 0; w < sizeof(m->msg.vdev_stats) / sizeof(u32); w++)
+			acc[w] += in[w];
+		nss_wifili_vdev_stats[i].seen++;
+		return;
+	}
+}
+
+void nss_wifili_vdev_stats_print(struct seq_file *s)
+{
+	int i;
+
+	guard(spinlock_bh)(&nss_wifili_stats_lock);
+
+	for (i = 0; i < ARRAY_SIZE(nss_wifili_vdev_stats); i++) {
+		const struct nss_wifi_vdev_stats_sync_msg *v;
+
+		if (!nss_wifili_vdev_stats[i].seen)
+			continue;
+		v = &nss_wifili_vdev_stats[i].st;
+		seq_printf(s, "vdev if %d reports %u\n",
+			   nss_wifili_vdev_stats[i].if_num,
+			   nss_wifili_vdev_stats[i].seen);
+		seq_printf(s, "  rx enqueue %u fail %u except %u except_fail %u bytes %u mcast %u\n",
+			   v->rx_enqueue_cnt, v->rx_enqueue_fail_cnt,
+			   v->rx_except_enqueue_cnt,
+			   v->rx_except_enqueue_fail_cnt,
+			   v->rx_enqueue_bytes, v->rx_mcast_cnt);
+		seq_printf(s, "  rx decrypt_err %u mic_err %u\n",
+			   v->rx_decrypt_err, v->rx_mic_err);
+		seq_printf(s, "  tx rcvd %u enqueue %u fail %u hw_ring_full %u desc_fail %u dropped %u\n",
+			   v->tx_rcvd, v->tx_enqueue_cnt,
+			   v->tx_enqueue_fail_cnt, v->tx_hw_ring_full,
+			   v->tx_desc_alloc_fail, v->dropped);
+	}
+}
+EXPORT_SYMBOL_GPL(nss_wifili_vdev_stats_print);
 
 /* Each message carries its own body and its own length.
  *
