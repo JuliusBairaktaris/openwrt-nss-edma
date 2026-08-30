@@ -54,6 +54,8 @@
 
 #define NSS_H2N_FLAG_FIRST_SEGMENT	0x0004
 #define NSS_H2N_FLAG_LAST_SEGMENT	0x0008
+/* The buffer may be kept rather than handed straight back. */
+#define NSS_H2N_FLAG_BUFFER_REUSABLE	0x8000
 
 /* The firmware chooses its own offset inside a receive buffer, so the buffer
  * it is given is the head of the allocation and it reports where the payload
@@ -290,16 +292,31 @@ struct nss_clk_cfg {
 };
 
 /* One unsolicited message type: how many arrived, and what the first one
- * said. Eight words reaches past the common header into the body, which is
- * where a request the host must answer carries its numbers, and the first
- * word is the interface the message came from.
+ * said. The body is kept, not just the header, because what a message is
+ * worth reading for is the numbers in it - a request the host must answer
+ * carries them there, and so does a statistics push. The first word is the
+ * interface the message came from.
  */
 #define NSS_MSG_SEEN_MAX	64
+
+/* A data buffer the firmware handed up that is not an ordinary frame. What
+ * it carries is a metadata area whose shape is not derivable from the header
+ * the host has, so the first few are kept whole and read off the device.
+ */
+struct nss_ext_seen {
+	u32 iface;
+	u32 type;
+	u32 len;
+	u32 offs;
+	u32 word[16];
+};
 
 struct nss_msg_seen {
 	u64 count;
 	u32 words;
-	u32 word[8];
+	u32 lastwords;
+	u32 word[64];
+	u32 last[256];
 };
 
 struct nss_core {
@@ -345,8 +362,11 @@ struct nss_core {
 	struct net_device __rcu *iface[NSS_INTERFACE_MAX];
 	u64 rx_iface[NSS_INTERFACE_MAX];
 	struct nss_msg_seen seen[NSS_MSG_SEEN_MAX];
+	struct nss_ext_seen ext[4];
+	u8 ext_seen;
 	u64 rx_type[8];
 	u64 notify;
+	u64 tx_posted;
 	u64 tx_done;
 	u64 link_desc_seen;
 	u64 link_desc_returned;
