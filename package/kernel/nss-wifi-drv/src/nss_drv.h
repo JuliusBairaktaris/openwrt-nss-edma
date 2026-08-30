@@ -394,6 +394,11 @@ void nss_msg_seen(struct nss_core *core, const struct nss_cmn_msg *ncm,
 int nss_wifili_probe(struct nss_core *core, struct seq_file *s);
 int nss_wifili_start(struct seq_file *s);
 int nss_wifili_tx(struct seq_file *s);
+void nss_msg_census(const struct nss_cmn_msg *ncm);
+void nss_msg_census_print(struct seq_file *s);
+void nss_wifili_stats_print(struct seq_file *s);
+void nss_wifili_vdev_stats_print(struct seq_file *s);
+void nss_wifili_vdev_notify(struct nss_core *core, const struct nss_cmn_msg *ncm, u32 len);
 void nss_wifili_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
 		       u32 len);
 void nss_wifili_bind(struct nss_core *core);
