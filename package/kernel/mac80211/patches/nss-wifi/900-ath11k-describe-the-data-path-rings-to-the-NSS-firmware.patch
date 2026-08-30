@@ -17,9 +17,10 @@ physical base added.
 
 Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 ---
---- a/drivers/net/wireless/ath/ath11k/dp.c
---- a/drivers/net/wireless/ath/ath11k/dp.c
-+++ b/drivers/net/wireless/ath/ath11k/dp.c
+Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/dp.c
+===================================================================
+--- backports-6.18.39.orig/drivers/net/wireless/ath/ath11k/dp.c
++++ backports-6.18.39/drivers/net/wireless/ath/ath11k/dp.c
 @@ -15,6 +15,11 @@
  #include "dp_rx.h"
  #include "peer.h"
@@ -32,7 +33,7 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  static void ath11k_dp_htt_htc_tx_complete(struct ath11k_base *ab,
  					  struct sk_buff *skb)
  {
-@@ -872,6 +877,119 @@
+@@ -872,6 +877,142 @@ done:
  }
  EXPORT_SYMBOL(ath11k_dp_service_srng);
  
@@ -51,6 +52,10 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 + * added, which is the one thing here that has to be converted rather than
 + * copied.
 + */
++/* The buffer manager the firmware names in a receive buffer it fills, as a
++ * release ring number. Read off the entries it writes, not assumed.
++ */
++
 +static void ath11k_nss_wifi_ring(struct nss_wifi_ring *r,
 +				 struct ath11k_base *ab, u32 ring_id,
 +				 u32 reg_base)
@@ -115,6 +120,15 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +
 +	ath11k_nss_wifi_ring(&soc->reo_reinject, ab,
 +			     dp->reo_reinject_ring.ring_id, reg_base);
++	/* Not the release ring this driver reaps. The firmware fills the
++	 * receive-DMA ring from its own pool and names those buffers with its
++	 * own buffer manager, and the buffer manager is what decides which
++	 * release ring the hardware hands a buffer back on. Handing over the
++	 * ring the buffers name is the one the driver already owns: the value
++	 * the firmware writes into a receive entry is a buffer-manager id, and
++	 * a manager id is the release ring's number plus the first software
++	 * manager, not the number itself.
++	 */
 +	ath11k_nss_wifi_ring(&soc->rx_rel, ab, dp->rx_rel_ring.ring_id,
 +			     reg_base);
 +	ath11k_nss_wifi_ring(&soc->reo_exception, ab,
@@ -142,8 +156,18 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +			     ar->dp.rx_refill_buf_ring.refill_buf_ring.ring_id,
 +			     res->start);
 +	pdev.radio_id = id;
-+	pdev.lmac_id = ar->pdev_idx;
-+	pdev.num_rx_swdesc = DP_RXDMA_BUF_RING_SIZE;
++	/* The hardware MAC this radio's address-search table belongs to. The
++	 * transmit command carries it, and the search for a frame's peer runs
++	 * against that table alone, so a radio whose index is not its own
++	 * hardware MAC finds nothing and every frame is released unsent.
++	 */
++	pdev.lmac_id = ar->lmac_id;
++	/* The firmware holds a software descriptor for every buffer in flight,
++	 * so a pool the size of the ring cannot keep the ring full. It accepts
++	 * up to three ring depths.
++	 */
++	pdev.num_rx_swdesc = 3 * DP_RXDMA_BUF_RING_SIZE;
++	pdev.target_pdev_id = ar->pdev->pdev_id;
 +
 +	if (nss_wifi_pdev_register(&pdev))
 +		ath11k_warn(ab, "NSS firmware would not take radio %d\n", id);
@@ -152,7 +176,24 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  void ath11k_dp_pdev_free(struct ath11k_base *ab)
  {
  	struct ath11k *ar;
-@@ -932,6 +1050,8 @@
+@@ -917,6 +1058,16 @@ int ath11k_dp_pdev_alloc(struct ath11k_b
+ 	int ret;
+ 	int i;
+ 
++	/* Not from where the rest of the SoC's rings are allocated: the
++	 * reorder destination rings are set up later than that, and a
++	 * description taken there carries them as an address of zero with no
++	 * entries. The firmware accepts it, finds no receive ring to reap, and
++	 * with no reorder ring a group reaps its transmit completions either -
++	 * so every message answers success and nothing moves in either
++	 * direction.
++	 */
++	ath11k_nss_wifi_describe(ab);
++
+ 	/* TODO:Per-pdev rx ring unlike tx ring which is mapped to different AC's */
+ 	for (i = 0; i < ab->num_radios; i++) {
+ 		ar = ab->pdevs[i].ar;
+@@ -932,6 +1083,8 @@ int ath11k_dp_pdev_alloc(struct ath11k_b
  				    i);
  			goto err;
  		}
@@ -161,7 +202,7 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  	}
  
  	return 0;
-@@ -1025,6 +1145,8 @@
+@@ -1025,6 +1178,8 @@ static int ath11k_dp_tx_pending_cleanup(
  
  void ath11k_dp_free(struct ath11k_base *ab)
  {
@@ -170,12 +211,3 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  	struct ath11k_dp *dp = &ab->dp;
  	int i;
  
-@@ -1106,6 +1228,8 @@
- 
- 	/* Init any SOC level resource for DP */
- 
-+	ath11k_nss_wifi_describe(ab);
-+
- 	return 0;
- 
- fail_cmn_srng_cleanup:
