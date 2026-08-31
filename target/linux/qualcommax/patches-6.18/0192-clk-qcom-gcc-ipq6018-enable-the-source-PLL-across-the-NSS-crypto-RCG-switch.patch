@@ -1,0 +1,40 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Date: Mon, 31 Aug 2026 12:00:00 +0200
+Subject: [PATCH] clk: qcom: gcc-ipq6018: enable the PLL across the crypto
+ RCG switch
+
+nss_crypto_clk_src selects between the reference oscillator and the
+crypto PLL. A root clock generator latches a new source only while that
+source is running: the hardware copies the source select on CMD_UPDATE
+and reports completion by clearing the bit, which never happens if the
+incoming clock is not toggling.
+
+A device tree that assigns this clock a rate served by the PLL performs
+the switch from of_clk_set_defaults(), which runs at provider
+registration, long before any consumer prepares the branch and with it
+the PLL. The update then never completes and the clock stays on the
+reference oscillator.
+
+Set CLK_OPS_PARENT_ENABLE so the framework holds the incoming parent
+enabled for the duration of the switch, which is what the flag exists
+for and what the other qcom generators in this situation carry.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+Index: linux-6.18.44/drivers/clk/qcom/gcc-ipq6018.c
+===================================================================
+--- linux-6.18.44.orig/drivers/clk/qcom/gcc-ipq6018.c
++++ linux-6.18.44/drivers/clk/qcom/gcc-ipq6018.c
+@@ -971,6 +971,12 @@ static struct clk_rcg2 nss_crypto_clk_sr
+ 		.name = "nss_crypto_clk_src",
+ 		.parent_data = gcc_xo_nss_crypto_pll_gpll0,
+ 		.num_parents = 3,
++		/*
++		 * A device tree assigned rate switches this to the crypto
++		 * PLL from of_clk_set_defaults(), before any consumer has
++		 * enabled the branch and with it the PLL.
++		 */
++		.flags = CLK_OPS_PARENT_ENABLE,
+ 		.ops = &clk_rcg2_ops,
+ 	},
+ };
