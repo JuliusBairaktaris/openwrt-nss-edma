@@ -149,9 +149,14 @@
 			      "port4_rx", "port4_tx",
 			      "port5_rx", "port5_tx",
 			      "gcc_snoc_nssnoc_clk";
+		/*
+		 * nss_crypto_clk_src offers the 24 MHz reference and
+		 * 300 MHz from the crypto PLL, and a request above the
+		 * table is clamped to its fastest entry.
+		 */
 		assigned-clocks = <&gcc GCC_NSS_PPE_CLK>,
 				  <&gcc GCC_NSS_CRYPTO_CLK>;
-		assigned-clock-rates = <300000000>, <600000000>;
+		assigned-clock-rates = <300000000>, <300000000>;
 		resets = <&gcc GCC_PPE_FULL_RESET>,
 			 <&gcc GCC_NSSPORT1_RESET>,
 			 <&gcc GCC_NSSPORT2_RESET>,
