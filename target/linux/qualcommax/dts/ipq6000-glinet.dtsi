@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later OR MIT
 
 #include "ipq6018-512m.dtsi"
+#include "ipq6018-nss.dtsi"
 #include "ipq6018-ess.dtsi"
 
 #include <dt-bindings/gpio/gpio.h>
