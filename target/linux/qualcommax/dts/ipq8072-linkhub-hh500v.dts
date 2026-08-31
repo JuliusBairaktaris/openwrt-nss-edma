@@ -375,6 +375,14 @@
 	};
 };
 
+&nss1 {
+	/*
+	 * The cellular WAN of this board reaches the firmware through the
+	 * rmnet_rx nodes, which the core 1 image carries.
+	 */
+	status = "okay";
+};
+
 &edma {
 	status = "okay";
 };
