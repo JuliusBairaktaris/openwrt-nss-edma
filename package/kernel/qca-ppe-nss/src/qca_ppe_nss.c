@@ -53,7 +53,6 @@
  * Lock order everywhere: rtnl -> ppe_nss_lock.
  */
 
-#include <dt-bindings/clock/qcom,gcc-ipq8074.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/debugfs.h>
@@ -1006,69 +1005,54 @@ static int ppe_nss_status_show(struct seq_file *m, void *v)
 DEFINE_SHOW_ATTRIBUTE(ppe_nss_status);
 
 /*
- * NSS-block clocks the firmware needs at runtime that no host driver
- * enables on the qca_edma/qca_ppe stack. In the old stack these were
- * enabled by qca-ssdk / qca-nss-crypto. The firmware accesses these
- * blocks (NSS core 1 boots with crypto/ipsec/tls features) and a
- * gated clock turns that access into a silent NoC stall — observed as
- * a hard SoC hang right after "NSS core 1 booted successfully".
+ * Clocks the NSS block requires while the firmware runs and that no host
+ * driver on the qca_edma/qca_ppe stack enables. In the old stack these were enabled by
+ * qca-ssdk / qca-nss-crypto. The firmware accesses these blocks (NSS core 1
+ * boots with crypto/ipsec/tls features) and a gated clock turns that access
+ * into a silent NoC stall - observed as a hard SoC hang right after "NSS
+ * core 1 booted successfully".
+ *
+ * Which clocks those are differs per SoC, so the list is the one the
+ * nss-common node carries rather than a table here.
  */
-static const struct {
-	unsigned int id;
-	const char *name;
-} ppe_nss_aux_clks[] = {
-	{ GCC_NSSNOC_CRYPTO_CLK, "gcc_nssnoc_crypto_clk" },
-	{ GCC_CRYPTO_PPE_CLK, "gcc_crypto_ppe_clk" },
-	/*
-	 * The old qca-ssdk enabled all three uniphy domains
-	 * unconditionally; the new uniphy PCS driver only enables the
-	 * domains with active ports (uniphy0 on AX3600). Firmware PPE
-	 * init may iterate all 6 ports.
-	 */
-	{ GCC_UNIPHY1_AHB_CLK, "gcc_uniphy1_ahb_clk" },
-	{ GCC_UNIPHY1_SYS_CLK, "gcc_uniphy1_sys_clk" },
-	{ GCC_UNIPHY2_AHB_CLK, "gcc_uniphy2_ahb_clk" },
-	{ GCC_UNIPHY2_SYS_CLK, "gcc_uniphy2_sys_clk" },
-	{ GCC_UNIPHY1_PORT5_RX_CLK, "gcc_uniphy1_port5_rx_clk" },
-	{ GCC_UNIPHY1_PORT5_TX_CLK, "gcc_uniphy1_port5_tx_clk" },
-	{ GCC_UNIPHY2_PORT6_RX_CLK, "gcc_uniphy2_port6_rx_clk" },
-	{ GCC_UNIPHY2_PORT6_TX_CLK, "gcc_uniphy2_port6_tx_clk" },
-};
-
 static void ppe_nss_enable_aux_clks(void)
 {
-	struct device_node *gcc;
-	int i;
+	struct device_node *np;
+	int count, i;
 
-	gcc = of_find_compatible_node(NULL, NULL, "qcom,gcc-ipq8074");
-	if (!gcc) {
-		pr_warn("qca-ppe-nss: gcc node not found, aux clocks not enabled\n");
+	np = of_find_compatible_node(NULL, NULL, "qcom,nss-common");
+	if (!np) {
+		pr_warn("qca-ppe-nss: nss-common node not found, aux clocks not enabled\n");
 		return;
 	}
 
-	for (i = 0; i < ARRAY_SIZE(ppe_nss_aux_clks); i++) {
-		struct of_phandle_args args = {
-			.np = gcc,
-			.args_count = 1,
-			.args = { ppe_nss_aux_clks[i].id },
-		};
-		struct clk *clk = of_clk_get_from_provider(&args);
+	count = of_property_count_strings(np, "clock-names");
+	for (i = 0; i < count; i++) {
+		const char *name = NULL;
+		struct clk *clk;
 
+		of_property_read_string_index(np, "clock-names", i, &name);
+
+		clk = of_clk_get(np, i);
 		if (IS_ERR(clk)) {
 			pr_warn("qca-ppe-nss: %s lookup failed (%ld)\n",
-				ppe_nss_aux_clks[i].name, PTR_ERR(clk));
+				name, PTR_ERR(clk));
 			continue;
 		}
+
+		/*
+		 * Held for the lifetime of the firmware, so never put back.
+		 */
 		if (clk_prepare_enable(clk)) {
-			pr_warn("qca-ppe-nss: %s enable failed\n",
-				ppe_nss_aux_clks[i].name);
+			pr_warn("qca-ppe-nss: %s enable failed\n", name);
 			clk_put(clk);
 			continue;
 		}
-		pr_info("qca-ppe-nss: enabled %s for NSS fw\n",
-			ppe_nss_aux_clks[i].name);
+
+		pr_info("qca-ppe-nss: enabled %s for NSS fw\n", name);
 	}
-	of_node_put(gcc);
+
+	of_node_put(np);
 }
 
 static int __init qca_ppe_nss_init(void)
