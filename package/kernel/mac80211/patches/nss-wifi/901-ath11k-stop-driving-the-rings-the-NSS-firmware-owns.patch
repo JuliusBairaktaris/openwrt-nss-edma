@@ -11,8 +11,8 @@ back under a cookie the firmware never minted.
 nss_offload, off by default, is read once at probe. Interrupt registration,
 the data-path service loop and the MSI group lookup are all driven from
 hw_params.ring_mask, which is a pointer inside a per-device copy of the
-hardware table, so pointing it at a copy carrying only the reorder-status and
-monitor-status masks is the whole of the handover for the six it drops. The
+hardware table, so pointing it at a copy carrying only the reorder-status mask
+is the whole of the handover for the seven it drops. The
 receive-DMA pre-fill is skipped, hash-based receive steering is off because
 the firmware pairs one reorder-destination ring with one radio's buffer pool,
 and transmit is refused at the single site that produces an entry.
@@ -49,23 +49,27 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/core.c
  static struct ath11k_hw_params ath11k_hw_params[] = {
  	{
  		.hw_rev = ATH11K_HW_IPQ8074,
-@@ -2656,6 +2672,22 @@ static int ath11k_init_hw_params(struct
+@@ -2656,6 +2672,26 @@ static int ath11k_init_hw_params(struct
  
  	ab->hw_params = *hw_params;
  
 +	/* Interrupt registration, the service loop and the MSI group lookup
 +	 * are driven from this mask alone, so an all-zero entry is the whole
-+	 * of the handover for a ring type. Only the two the host keeps are
-+	 * carried over, which also leaves a ring type added later owned by
-+	 * whoever asks for it rather than silently serviced here.
++	 * of the handover for a ring type. Only reorder status is carried
++	 * over, which also leaves a ring type added later owned by whoever
++	 * asks for it rather than silently serviced here.
++	 *
++	 * Monitor status goes with the rest. It is an LMAC ring, and the
++	 * firmware takes the LMAC ring space when its data plane starts, so
++	 * a host that keeps servicing it reads a head pointer that was never
++	 * programmed. Radiotap and the per-station rates derived from that
++	 * ring go with it; the firmware reports its own peer statistics.
 +	 */
 +	if (ath11k_nss_offload && !ath11k_nss_keep_mask) {
 +		const struct ath11k_hw_ring_mask *m = ab->hw_params.ring_mask;
 +
 +		memcpy(ab->nss_ring_mask.reo_status, m->reo_status,
 +		       sizeof(m->reo_status));
-+		memcpy(ab->nss_ring_mask.rx_mon_status, m->rx_mon_status,
-+		       sizeof(m->rx_mon_status));
 +		ab->hw_params.ring_mask = &ab->nss_ring_mask;
 +	}
 +

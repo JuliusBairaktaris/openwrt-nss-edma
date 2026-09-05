@@ -102,7 +102,7 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/dp.c
 +	soc->target_type = ATH11K_NSS_TARGET_IPQ8074;
 +	soc->tlv_size = ab->hw_params.hal_desc_sz;
 +	soc->rx_buf_len = DP_RX_BUFFER_SIZE;
-+	soc->num_tcl = ab->hw_params.max_tx_ring;
++	soc->num_tcl = ab->hw_params.hal_params->num_tx_rings;
 +	soc->num_reo = DP_REO_DST_RING_MAX;
 +
 +	for (i = 0; i < soc->num_tcl; i++) {

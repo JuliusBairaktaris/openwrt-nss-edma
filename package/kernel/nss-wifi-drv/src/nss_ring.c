@@ -485,6 +485,9 @@ static int nss_refill(struct nss_core *core, int budget)
 
 	while (filled < budget) {
 		u32 next = (ring->hlos_index + 1) & (NSS_RING_ENTRIES - 1);
+
+		if (atomic_read(&core->buffers_queued) + filled >= nss_pool_size)
+			break;
 		struct h2n_descriptor *desc;
 		struct sk_buff *skb;
 		dma_addr_t dma;
@@ -560,7 +563,11 @@ static int nss_poll_sos(struct napi_struct *napi, int budget)
 	struct nss_core *core = ctx->core;
 
 	nss_check_booted(core);
-	nss_refill(core, min(budget, NSS_REFILL_BATCH));
+	/* Every free slot rather than a poll-sized batch. The firmware asks
+	 * when its own pool is low and takes what it needs, so a partial
+	 * answer leaves it short and it has to ask again.
+	 */
+	nss_refill(core, NSS_RING_ENTRIES);
 
 	napi_complete(napi);
 	enable_irq(ctx->irq);
@@ -633,15 +640,24 @@ static int nss_poll_n2h(struct napi_struct *napi, int budget)
 						     skb && virt_addr_valid((void *)skb) ?
 						     (u64)NSS_SKB_CB(skb)->dma : 0,
 						     desc->buffer_type, qid);
-			} else if (nss_data_recv(core, napi, desc, skb)) {
-				atomic_dec(&core->buffers_queued);
-				returned++;
+			/* A buffer this driver transmitted comes back on the
+			 * same ring, and its descriptor still carries the
+			 * offset and length of the frame that was sent. Read
+			 * as a receive it is reserved and put a second time
+			 * over data already there, which walks the tail off
+			 * the end of the allocation. What the host sent is a
+			 * completion and nothing else, so it is claimed here
+			 * before any of it is believed.
+			 */
 			} else if (NSS_SKB_CB(skb)->tx) {
 				dma_unmap_single(core->dev, NSS_SKB_CB(skb)->dma,
 						 skb_end_pointer(skb) - skb->head,
 						 DMA_TO_DEVICE);
 				core->tx_done++;
 				dev_kfree_skb_any(skb);
+			} else if (nss_data_recv(core, napi, desc, skb)) {
+				atomic_dec(&core->buffers_queued);
+				returned++;
 			} else {
 				nss_ext_take(core, desc, skb);
 				dma_unmap_single(core->dev, NSS_SKB_CB(skb)->dma,
@@ -666,8 +682,14 @@ static int nss_poll_n2h(struct napi_struct *napi, int budget)
 	if (returned && qid != NSS_N2H_RING_EMPTY_BUF)
 		nss_cpu_port_reclaim(core);
 
-	/* Whatever came back leaves the firmware that much shorter. */
-	nss_refill(core, returned);
+	/* Top the ring up rather than replacing only what came back. The
+	 * firmware holds one buffer per connection it accelerates, for the
+	 * sync message that connection will send, so a pool kept level with
+	 * returns settles at a ring's worth and every create rule after that
+	 * is refused for want of a buffer. The ceiling is the host's, not the
+	 * firmware's, which takes whatever it is offered.
+	 */
+	nss_refill(core, NSS_RING_ENTRIES);
 
 	if (done < budget) {
 		napi_complete(napi);
