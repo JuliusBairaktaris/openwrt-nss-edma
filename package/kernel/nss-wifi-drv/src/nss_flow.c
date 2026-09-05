@@ -31,6 +31,7 @@
 #include <net/flow_offload.h>
 #include <net/netfilter/nf_conntrack.h>
 #include <net/netfilter/nf_flow_table.h>
+#include <net/dsa.h>
 #include <net/pkt_cls.h>
 
 #include "nss_drv.h"
@@ -107,9 +108,43 @@ static const char *const nss_flow_reject_name[] = {
 static u32 nss_flow_pushed, nss_flow_bound, nss_flow_reject[NSS_FLOW_REJECT_MAX];
 static int nss_flow_last_ifindex;
 
-static int nss_flow_reject_at(enum nss_flow_reject why, int ret)
+/* The last few connections that were not taken, with the tuple of each.
+ * The counters say how often a reason fires but not for which connection,
+ * and a box carrying ordinary traffic fires most of them for flows nobody
+ * asked about - so a reason on its own cannot answer why one particular
+ * flow stayed in software.
+ */
+struct nss_flow_reject_rec {
+	__be32 sip, dip;
+	__be16 sport, dport;
+	u8 proto, dir, why;
+	u32 detail;
+};
+
+static struct nss_flow_reject_rec nss_flow_rej[8];
+static u32 nss_flow_rej_seen;
+
+static int nss_flow_reject_at(enum nss_flow_reject why, int ret,
+			      struct flow_cls_offload *f, u32 detail)
 {
+	struct nss_flow_reject_rec *r;
+	struct flow_offload_tuple *t;
+
 	nss_flow_reject[why]++;
+
+	if (!f)
+		return ret;
+
+	t = (struct flow_offload_tuple *)f->cookie;
+	r = &nss_flow_rej[nss_flow_rej_seen++ % ARRAY_SIZE(nss_flow_rej)];
+	r->why = why;
+	r->dir = t->dir;
+	r->proto = t->l4proto;
+	r->sip = t->src_v4.s_addr;
+	r->dip = t->dst_v4.s_addr;
+	r->sport = t->src_port;
+	r->dport = t->dst_port;
+	r->detail = detail;
 
 	return ret;
 }
@@ -161,6 +196,14 @@ static int nss_flow_ifnum(struct nss_core *core, int ifindex, u32 *mtu)
 
 		if (!dev || dev->ifindex != ifindex)
 			continue;
+		/* A switch port has an interface number so the firmware can
+		 * hand it an exception, which says nothing about whether the
+		 * firmware may transmit there. Only an armed port belongs in a
+		 * rule: the firmware accepts one naming an unarmed port and
+		 * then injects into a fabric path the host still owns.
+		 */
+		if (dsa_user_dev_check(dev) && !(core->phys_armed & BIT(i)))
+			return -EPERM;
 		*mtu = dev->mtu;
 		return i;
 	}
@@ -194,13 +237,14 @@ static int nss_flow_take_dir(struct nss_core *core, struct nss_flow_entry *e,
 	int i;
 
 	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META))
-		return nss_flow_reject_at(NSS_FLOW_REJECT_KEY, -EOPNOTSUPP);
+		return nss_flow_reject_at(NSS_FLOW_REJECT_KEY, -EOPNOTSUPP, f, 0);
 
 	flow_rule_match_meta(rule, &meta);
 	d->ifnum = nss_flow_ifnum(core, meta.key->ingress_ifindex, &d->mtu);
 	if (d->ifnum < 0) {
 		nss_flow_last_ifindex = meta.key->ingress_ifindex;
-		return nss_flow_reject_at(NSS_FLOW_REJECT_INTERFACE, d->ifnum);
+		return nss_flow_reject_at(NSS_FLOW_REJECT_INTERFACE, d->ifnum, f,
+					  meta.key->ingress_ifindex);
 	}
 
 	flow_action_for_each(i, act, &rule->action) {
@@ -214,7 +258,8 @@ static int nss_flow_take_dir(struct nss_core *core, struct nss_flow_entry *e,
 			 */
 			if (act->mangle.offset > sizeof(eth) - sizeof(u32))
 				return nss_flow_reject_at(NSS_FLOW_REJECT_ACTION,
-							  -EOPNOTSUPP);
+							  -EOPNOTSUPP, f,
+							  act->id);
 			*(u32 *)((u8 *)&eth + act->mangle.offset) =
 				(*(u32 *)((u8 *)&eth + act->mangle.offset) &
 				 ~act->mangle.mask) | act->mangle.val;
@@ -236,12 +281,12 @@ static int nss_flow_take_dir(struct nss_core *core, struct nss_flow_entry *e,
 					     act->id,
 					     meta.key->ingress_ifindex);
 			return nss_flow_reject_at(NSS_FLOW_REJECT_ACTION,
-						  -EOPNOTSUPP);
+						  -EOPNOTSUPP, f, act->id);
 		}
 	}
 
 	if (!is_valid_ether_addr(eth.h_dest))
-		return nss_flow_reject_at(NSS_FLOW_REJECT_NO_MAC, -EOPNOTSUPP);
+		return nss_flow_reject_at(NSS_FLOW_REJECT_NO_MAC, -EOPNOTSUPP, f, 0);
 
 	/* The address this direction delivers to is the one the firmware
 	 * needs for the connection's other half.
@@ -258,7 +303,7 @@ static void nss_flow_mac(u16 out[3], const u8 *mac)
 }
 
 static int nss_flow_send_v4(struct nss_core *core, struct nss_flow_entry *e,
-			    struct nf_conn *ct)
+			    struct nf_conn *ct, u32 *fw_err)
 {
 	const struct nf_conntrack_tuple *o, *r;
 	struct nss_ipv4_rule_create_msg *c;
@@ -346,13 +391,15 @@ static int nss_flow_send_v4(struct nss_core *core, struct nss_flow_entry *e,
 	m->cm.type = NSS_IPV4_TX_CREATE_RULE_MSG;
 	ret = nss_msg_send(core, m, offsetof(struct nss_ipv4_msg, msg) +
 				    sizeof(*c));
-	if (!ret && m->cm.error) {
+	if (m->cm.error) {
+		*fw_err = m->cm.error;
 		dev_warn_ratelimited(core->dev,
 				     "v4 rule refused: error %u proto %u if %d->%d\n",
 				     m->cm.error, e->protocol,
 				     c->conn_rule.flow_interface_num,
 				     c->conn_rule.return_interface_num);
-		ret = -EIO;
+		if (!ret)
+			ret = -EIO;
 	}
 
 	return ret;
@@ -371,7 +418,7 @@ static void nss_flow_addr6(u32 out[4], const union nf_inet_addr *in)
 }
 
 static int nss_flow_send_v6(struct nss_core *core, struct nss_flow_entry *e,
-			    struct nf_conn *ct)
+			    struct nf_conn *ct, u32 *fw_err)
 {
 	const struct nf_conntrack_tuple *o;
 	struct nss_ipv6_rule_create_msg *c;
@@ -440,13 +487,15 @@ static int nss_flow_send_v6(struct nss_core *core, struct nss_flow_entry *e,
 	m->cm.type = NSS_IPV6_TX_CREATE_RULE_MSG;
 	ret = nss_msg_send(core, m, offsetof(struct nss_ipv6_msg, msg) +
 				    sizeof(*c));
-	if (!ret && m->cm.error) {
+	if (m->cm.error) {
+		*fw_err = m->cm.error;
 		dev_warn_ratelimited(core->dev,
 				     "v6 rule refused: error %u proto %u if %d->%d\n",
 				     m->cm.error, e->protocol,
 				     c->conn_rule.flow_interface_num,
 				     c->conn_rule.return_interface_num);
-		ret = -EIO;
+		if (!ret)
+			ret = -EIO;
 	}
 
 	return ret;
@@ -500,11 +549,12 @@ static int nss_flow_replace(struct nss_core *core, struct flow_cls_offload *f)
 	struct flow_match_meta meta;
 	struct flow_match_basic basic;
 	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
+	u32 fw_err = 0;
 	int ret;
 
 	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META) ||
 	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC))
-		return nss_flow_reject_at(NSS_FLOW_REJECT_KEY, -EOPNOTSUPP);
+		return nss_flow_reject_at(NSS_FLOW_REJECT_KEY, -EOPNOTSUPP, f, 0);
 
 	e = rhashtable_lookup_fast(&nss_flow_table, &key, nss_flow_ht_params);
 	if (!e) {
@@ -523,7 +573,8 @@ static int nss_flow_replace(struct nss_core *core, struct flow_cls_offload *f)
 					     meta.key->ingress_ifindex,
 					     flow->tuplehash[!dir].tuple.iifidx);
 			return nss_flow_reject_at(NSS_FLOW_REJECT_NOT_WIRELESS,
-						  -EOPNOTSUPP);
+						  -EOPNOTSUPP, f,
+						  meta.key->ingress_ifindex);
 		}
 
 		e = kzalloc(sizeof(*e), GFP_KERNEL);
@@ -559,14 +610,17 @@ static int nss_flow_replace(struct nss_core *core, struct flow_cls_offload *f)
 		return 0;
 
 	if (!flow->ct) {
-		ret = nss_flow_reject_at(NSS_FLOW_REJECT_NO_CT, -EOPNOTSUPP);
+		ret = nss_flow_reject_at(NSS_FLOW_REJECT_NO_CT, -EOPNOTSUPP, f, 0);
 		goto drop;
 	}
 
-	ret = e->v6 ? nss_flow_send_v6(core, e, flow->ct) :
-		      nss_flow_send_v4(core, e, flow->ct);
+	ret = e->v6 ? nss_flow_send_v6(core, e, flow->ct, &fw_err) :
+		      nss_flow_send_v4(core, e, flow->ct, &fw_err);
 	if (ret) {
-		nss_flow_reject_at(NSS_FLOW_REJECT_FIRMWARE, ret);
+		/* The firmware's code where it gave one, the transport's
+		 * otherwise: a create that never reached it has no other. */
+		nss_flow_reject_at(NSS_FLOW_REJECT_FIRMWARE, ret, f,
+				   fw_err ? fw_err : -ret);
 		goto drop;
 	}
 
@@ -854,6 +908,15 @@ void nss_flow_print(struct seq_file *s)
 		seq_printf(s, " %s %u", nss_flow_reject_name[i],
 			   nss_flow_reject[i]);
 	seq_putc(s, '\n');
+
+	for (i = 0; i < ARRAY_SIZE(nss_flow_rej) && i < nss_flow_rej_seen; i++) {
+		const struct nss_flow_reject_rec *r = &nss_flow_rej[i];
+
+		seq_printf(s, "reject %s dir %u proto %u %pI4:%u -> %pI4:%u detail %u\n",
+			   nss_flow_reject_name[r->why], r->dir, r->proto,
+			   &r->sip, ntohs(r->sport), &r->dip, ntohs(r->dport),
+			   r->detail);
+	}
 
 	rhashtable_walk_enter(&nss_flow_table, &iter);
 	rhashtable_walk_start(&iter);
