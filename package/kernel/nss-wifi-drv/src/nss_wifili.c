@@ -49,11 +49,20 @@
  */
 #define NSS_WIFILI_TX_DESC		512
 
-/* One page for the descriptors and one for the extension descriptors: the two
- * kinds are carved at different strides out of whichever page each starts on,
- * so a shared page leaves one of the pools without one.
+/* The firmware carves both kinds out of the memory given here, at a stride
+ * of its own for each, and it addresses a descriptor arithmetically from a
+ * page and an index rather than from a free list. A block sized for fewer
+ * descriptors than were declared is therefore written past rather than
+ * refused, which the core answers with a range trap. The size follows the
+ * count: every pool's descriptors plus one spare per pool.
  */
-#define NSS_WIFILI_TX_DESC_MEM		SZ_64K
+#define NSS_WIFILI_TX_PROCESSQ		1024
+
+#define NSS_WIFILI_TX_DESC_STRIDE	80
+#define NSS_WIFILI_TX_DESC_EXT_STRIDE	160
+
+#define NSS_WIFILI_TX_DESC_MEM(pools, stride) \
+	PAGE_ALIGN(((NSS_WIFILI_TX_DESC + 1) * (pools)) * (stride))
 
 /* The receive buffer the hardware would be programmed with, and the tag block
  * in front of it. Both are bounds-checked by the firmware, which is why they
@@ -432,7 +441,8 @@ static int nss_wifili_alloc(struct nss_core *core, struct nss_wifili_ctx *w)
 	if (ret)
 		return ret;
 
-	return nss_wifili_mem_get(core, &w->txdesc, NSS_WIFILI_TX_DESC_MEM);
+	return nss_wifili_mem_get(core, &w->txdesc,
+				  NSS_WIFILI_TX_DESC_MEM(1, NSS_WIFILI_TX_DESC_STRIDE));
 }
 
 static void nss_wifili_arm(struct nss_core *core, struct seq_file *s,
@@ -734,7 +744,14 @@ static unsigned int nss_wifili_rx_next_hop = NSS_INTERFACE_N2H;
 module_param_named(rx_next_hop, nss_wifili_rx_next_hop, uint, 0644);
 MODULE_PARM_DESC(rx_next_hop, "interface a virtual device forwards receive to, 0 to leave it as created");
 
-static int nss_wifili_vdev_next_hop(struct nss_core *core, int if_num)
+/* Where a virtual device sends what it receives.
+ *
+ * The firmware keeps this on the base virtual-device node, not on the node a
+ * device was allocated: addressed to an allocated one it is answered without
+ * an error and the core traps seconds later. It is therefore sent once, after
+ * the data plane starts, rather than per device.
+ */
+static int nss_wifili_vdev_next_hop(struct nss_core *core)
 {
 	struct nss_wifi_vdev_msg *v;
 	int ret;
@@ -746,7 +763,7 @@ static int nss_wifili_vdev_next_hop(struct nss_core *core, int if_num)
 	if (!v)
 		return -ENOMEM;
 
-	v->cm.interface = if_num;
+	v->cm.interface = NSS_INTERFACE_VAP_BASE;
 	v->cm.type = NSS_WIFI_VDEV_SET_NEXT_HOP;
 	v->msg.next_hop.ifnumber = nss_wifili_rx_next_hop;
 
@@ -826,8 +843,6 @@ int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
 		ret = nss_wifili_vdev_cmd(core, if_num,
 					  NSS_WIFI_VDEV_DECAP_TYPE_CMD,
 					  decap);
-	if (!ret)
-		ret = nss_wifili_vdev_next_hop(core, if_num);
 	if (!ret) {
 		struct nss_wifi_vdev_enable_msg up = {};
 
@@ -987,17 +1002,33 @@ EXPORT_SYMBOL_GPL(nss_wifi_vdev_security);
  *
  * The firmware keeps its own record of a peer, in memory the host owns and
  * hands over by address, so a create is an allocation as much as a message.
- * How large that record is differs between firmware lines and the host writes
- * into it blind, so a whole page is given and the whole page is declared: a
- * firmware that checks the size is satisfied, and one that does not cannot
- * run past what was allocated.
+ * The firmware clears the whole record on create, so a block smaller than the
+ * record is written past rather than refused, and how large the record is
+ * differs between firmware lines. The size is therefore a parameter: it is
+ * both what is allocated and what is declared, and the two cannot disagree.
  *
  * The address-search index and hash come from the WLAN firmware by way of the
  * peer map, so this runs after the driver has waited for that - which is what
  * makes every one of these sends an ordinary sleeping one and needs no
  * machinery for posting from a context that cannot sleep.
  */
-#define NSS_WIFILI_PEER_MEM	PAGE_SIZE
+/* Whether a station is registered with the firmware at all. Off, the data
+ * plane comes up with virtual devices and no peers, which is what separates a
+ * fault in the peer path from one in everything around it.
+ */
+static bool nss_wifili_peers = true;
+module_param_named(peers, nss_wifili_peers, bool, 0644);
+MODULE_PARM_DESC(peers, "register stations with the firmware");
+
+static bool nss_wifili_stats_push = true;
+module_param_named(stats_push, nss_wifili_stats_push, bool, 0644);
+MODULE_PARM_DESC(stats_push, "ask the firmware for its periodic statistics push");
+
+static unsigned int nss_wifili_peer_mem = 2 * PAGE_SIZE;
+module_param_named(peer_mem, nss_wifili_peer_mem, uint, 0644);
+MODULE_PARM_DESC(peer_mem, "bytes given to the firmware for each peer record");
+
+#define NSS_WIFILI_PEER_MEM	nss_wifili_peer_mem
 
 struct nss_wifili_peer {
 	u16 peer_id;
@@ -1055,6 +1086,9 @@ int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
 	int ret, i;
 
 	guard(mutex)(&nss_wifili_lock);
+
+	if (!nss_wifili_peers)
+		return 0;
 
 	core = nss_wifili_core;
 	if (!core || !core->wifili_started)
@@ -1371,11 +1405,15 @@ int nss_wifili_start(struct seq_file *s)
 	 * host's to provide, so they are not part of what the WLAN driver
 	 * describes.
 	 */
-	ret = nss_wifili_mem_get(core, &w->txdesc, NSS_WIFILI_TX_DESC_MEM);
+	ret = nss_wifili_mem_get(core, &w->txdesc,
+				 NSS_WIFILI_TX_DESC_MEM(nss_wifili_pdevs,
+							NSS_WIFILI_TX_DESC_STRIDE));
 	if (ret)
 		goto out;
 
-	ret = nss_wifili_mem_get(core, &w->txdescext, NSS_WIFILI_TX_DESC_MEM);
+	ret = nss_wifili_mem_get(core, &w->txdescext,
+				 NSS_WIFILI_TX_DESC_MEM(nss_wifili_pdevs,
+							NSS_WIFILI_TX_DESC_EXT_STRIDE));
 	if (ret)
 		goto out;
 
@@ -1439,6 +1477,12 @@ int nss_wifili_start(struct seq_file *s)
 	m->msg.init.wtdim.ext_desc_page_num = 1;
 	m->msg.init.wtdim.num_tx_device_limit = NSS_WIFILI_TX_DESC *
 						nss_wifili_pdevs;
+
+	/* The queue the firmware hands transmit work between its own threads
+	 * on. Left at zero it is sized to nothing and written into anyway,
+	 * which the core answers with a range trap seconds after it starts.
+	 */
+	m->msg.init.tx_sw_internode_queue_size = NSS_WIFILI_TX_PROCESSQ;
 
 	m->msg.init.target_type = nss_wifili_soc.target_type;
 	m->msg.init.wrip.tlv_size = nss_wifili_soc.tlv_size;
@@ -1530,6 +1574,12 @@ int nss_wifili_start(struct seq_file *s)
 		m->cm.type = NSS_WIFILI_PDEV_INIT_MSG;
 		nss_wifili_ring_fill(&m->msg.pdevmsg.rxdma_ring,
 				     &nss_wifili_pdev[i].rxdma);
+		/* The scheme names the firmware worker thread group the radio
+		 * runs on. It is the host's to hand out and it has to be
+		 * distinct per radio: left at its zero default every radio
+		 * claims the same one, and a worker thread then traps.
+		 */
+		m->msg.pdevmsg.scheme_id = i;
 		m->msg.pdevmsg.radio_id = nss_wifili_pdev[i].radio_id;
 		m->msg.pdevmsg.lmac_id = nss_wifili_pdev[i].lmac_id;
 		m->msg.pdevmsg.target_pdev_id = nss_wifili_pdev[i].target_pdev_id;
@@ -1553,12 +1603,20 @@ int nss_wifili_start(struct seq_file *s)
 	if (!ret) {
 		core->wifili_started = true;
 
+		ret = nss_wifili_vdev_next_hop(core);
+		seq_printf(s, "%-14s rc %d\n", "next hop:", ret);
+
 		/* Ask for the statistics push. The firmware raises no wifili
 		 * message at all until it is asked, so a receive path that
 		 * never starts and one that starts and drops everything are
 		 * indistinguishable from the host; the counters in that push
-		 * are what tells them apart.
+		 * are what tells them apart. It is a diagnostic and nothing
+		 * on the data path depends on it, so it can be left off while
+		 * what the firmware does when asked is still in question.
 		 */
+		if (!nss_wifili_stats_push)
+			goto out;
+
 		memset(m, 0, sizeof(*m));
 		m->cm.interface = NSS_INTERFACE_WIFILI;
 		m->cm.type = NSS_WIFILI_STATS_CFG_MSG;
