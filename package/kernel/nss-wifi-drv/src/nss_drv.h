@@ -356,6 +356,11 @@ struct nss_core {
 	bool wifili_started;
 	bool clocks_on;
 	unsigned long phys_armed;
+	/* Buffers the host lends this core, and the firmware's high-water
+	 * mark: the two are kept equal because the firmware hands back
+	 * whatever it holds above its mark.
+	 */
+	u32 pool_size;
 	struct mutex lock;
 	struct dentry *debugfs;
 
@@ -395,6 +400,8 @@ struct nss_core {
 
 int nss_meminfo_init(struct nss_core *core);
 void nss_mem_free_all(struct nss_core *core);
+int nss_pool_fund(struct nss_core *core, u32 payloads);
+void nss_core_stop(struct nss_core *core);
 int nss_rings_start(struct nss_core *core);
 void nss_iface_bind(struct nss_core *core);
 void nss_iface_unbind(struct nss_core *core);
