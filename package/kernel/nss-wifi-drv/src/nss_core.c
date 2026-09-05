@@ -330,6 +330,92 @@ static void nss_core_halt(struct nss_core *core)
 	core->cpu_port_taken = false;
 }
 
+/* How many empty buffers the firmware may hold.
+ *
+ * It takes one for every connection it accelerates, to carry that
+ * connection's statistics back, so a pool sized for the exception path alone
+ * stops the flow engines accepting rules once it is spent - the refusal is a
+ * buffer allocation failure and says nothing about the rule. Zero leaves the
+ * firmware on its own default, which is what a host that never asks gets.
+ *
+ * The count is byte-swapped, as the other control-plane scalars in this
+ * interface are; the addresses beside them are not.
+ */
+/* Both what the firmware is told its pool may reach and the ceiling the refill
+ * stops at. An unconfigured pool is unbounded: the firmware accepted 82242
+ * buffers, 329 MB of slab on a 411 MB box, within ten seconds of the core
+ * booting. The WLAN payload budget is carved from this pool and is refused
+ * above it, so this also sets what nss_wifi_pool_size may ask for.
+ */
+unsigned int nss_pool_size = 16384;
+module_param_named(pool_size, nss_pool_size, uint, 0644);
+MODULE_PARM_DESC(pool_size, "empty buffers the host will lend the firmware");
+
+#define NSS_N2H_EMPTY_POOL_BUF_CFG	2
+#define NSS_N2H_WIFI_POOL_BUF_CFG	8
+
+/* The WLAN receive pool is carved from the firmware's payloads, and a pool it
+ * was given no budget for stays empty: with nothing to fill a receive
+ * descriptor with, the firmware fills none, and a frame arriving against a
+ * descriptor the host filled instead resolves to a pool entry that was never
+ * populated. A core carrying WLAN traffic reports 4095 receive descriptors in
+ * use, which is what this budget buys on a 512 MB board.
+ */
+unsigned int nss_wifi_pool_size = 8192;
+module_param_named(wifi_pool_size, nss_wifi_pool_size, uint, 0644);
+MODULE_PARM_DESC(wifi_pool_size, "payloads the firmware may carve for WLAN");
+
+struct nss_n2h_pool_cfg {
+	struct nss_cmn_msg cm;
+	__be32 pool_size;
+};
+
+#define NSS_N2H_GET_WATER_MARK		7
+
+struct nss_n2h_payload_info {
+	struct nss_cmn_msg cm;
+	__be32 pool_size;
+	__be32 low_water;
+	__be32 high_water;
+};
+
+static void nss_pool_configure(struct nss_core *core)
+{
+	struct nss_n2h_pool_cfg m = {};
+	struct nss_n2h_payload_info p = {};
+	int ret;
+
+	if (nss_pool_size < NSS_RING_ENTRIES)
+		nss_pool_size = NSS_RING_ENTRIES;
+
+	m.cm.interface = NSS_INTERFACE_N2H;
+	m.cm.type = NSS_N2H_EMPTY_POOL_BUF_CFG;
+	m.pool_size = cpu_to_be32(nss_pool_size);
+
+	ret = nss_msg_send(core, &m, sizeof(m));
+	dev_info(core->dev, "empty buffer pool set to %u: %d\n",
+		 nss_pool_size, ret);
+
+	/* What the firmware carves the WLAN budget out of, asked for rather
+	 * than assumed: a budget above what the pool leaves is refused whole.
+	 */
+	p.cm.interface = NSS_INTERFACE_N2H;
+	p.cm.type = NSS_N2H_GET_WATER_MARK;
+	ret = nss_msg_send(core, &p, sizeof(p));
+	dev_info(core->dev, "payload pool %u low %u high %u: %d\n",
+		 be32_to_cpu(p.pool_size), be32_to_cpu(p.low_water),
+		 be32_to_cpu(p.high_water), ret);
+
+	m = (struct nss_n2h_pool_cfg){};
+	m.cm.interface = NSS_INTERFACE_N2H;
+	m.cm.type = NSS_N2H_WIFI_POOL_BUF_CFG;
+	m.pool_size = cpu_to_be32(nss_wifi_pool_size);
+
+	ret = nss_msg_send(core, &m, sizeof(m));
+	dev_info(core->dev, "wifi payload pool set to %u: %d\n",
+		 nss_wifi_pool_size, ret);
+}
+
 static int nss_core_boot(struct nss_core *core)
 {
 	int ret;
@@ -386,6 +472,8 @@ static int nss_core_boot(struct nss_core *core)
 		nss_core_halt(core);
 		return -ETIMEDOUT;
 	}
+
+	nss_pool_configure(core);
 
 	return 0;
 
@@ -466,6 +554,13 @@ static int nss_rx_show(struct seq_file *s, void *unused)
 	seq_printf(s, "notify: %llu link-desc seen: %llu returned: %llu tx: %llu done: %llu\n",
 		   core->notify, core->link_desc_seen,
 		   core->link_desc_returned, core->tx_posted, core->tx_done);
+
+	/* How many buffers the firmware is holding. It takes one per
+	 * accelerated connection, so a create rule refused for want of a
+	 * buffer is read here rather than inferred.
+	 */
+	seq_printf(s, "buffers in firmware custody: %d  desync: %llu\n",
+		   atomic_read(&core->buffers_queued), core->rx_desync);
 
 	for (i = 0; i < core->ext_seen; i++) {
 		const struct nss_ext_seen *e = &core->ext[i];
