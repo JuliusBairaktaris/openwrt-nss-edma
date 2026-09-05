@@ -143,6 +143,13 @@ int nss_msg_transact(struct nss_core *core, void *msg, size_t len, size_t room)
 	ncm->len = len - sizeof(*ncm);
 	memcpy(core->msg.buf, msg, len);
 
+	/* Before the descriptor is published, not after: the firmware drains
+	 * this ring by its index and needs no doorbell to find one, so an
+	 * answer that arrives between publishing and arming is an answer this
+	 * would otherwise throw away and then wait out.
+	 */
+	reinit_completion(&core->msg.done);
+
 	scoped_guard(spinlock_bh, &ring->lock) {
 		next = (ring->hlos_index + 1) & (NSS_RING_ENTRIES - 1);
 		if (next == READ_ONCE(map->h2n_nss_index[NSS_H2N_RING_COMMAND]))
@@ -165,7 +172,6 @@ int nss_msg_transact(struct nss_core *core, void *msg, size_t len, size_t room)
 		WRITE_ONCE(map->h2n_hlos_index[NSS_H2N_RING_COMMAND], next);
 	}
 
-	reinit_completion(&core->msg.done);
 	nss_doorbell(core, NSS_H2N_INTR_DATA_CMD);
 
 	if (!wait_for_completion_timeout(&core->msg.done,
