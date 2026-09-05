@@ -330,47 +330,30 @@ static void nss_core_halt(struct nss_core *core)
 	core->cpu_port_taken = false;
 }
 
-/* How many empty buffers the firmware may hold.
+/* How many empty buffers the firmware may hold, and the ceiling the host's own
+ * refill stops at; the two are one number because they cannot disagree.
  *
- * It takes one for every connection it accelerates, to carry that
- * connection's statistics back, so a pool sized for the exception path alone
- * stops the flow engines accepting rules once it is spent - the refusal is a
- * buffer allocation failure and says nothing about the rule. Zero leaves the
- * firmware on its own default, which is what a host that never asks gets.
- *
- * The count is byte-swapped, as the other control-plane scalars in this
- * interface are; the addresses beside them are not.
- */
-/* Both what the firmware is told its pool may reach and the ceiling the refill
- * stops at. An unconfigured pool is unbounded: the firmware accepted 82242
+ * The firmware takes one buffer for every connection it accelerates, to carry
+ * that connection's statistics back, so a pool sized for the exception path
+ * alone stops the flow engines accepting rules once it is spent - the refusal
+ * is a buffer allocation failure and says nothing about the rule. An
+ * unconfigured pool is unbounded the other way: the firmware accepted 82242
  * buffers, 329 MB of slab on a 411 MB box, within ten seconds of the core
- * booting. The WLAN payload budget is carved from this pool and is refused
- * above it, so this also sets what nss_wifi_pool_size may ask for.
+ * booting. What a consumer needs on top of this is lent through
+ * nss_pool_fund().
  */
-unsigned int nss_pool_size = 16384;
+unsigned int nss_pool_size = 2048;
 module_param_named(pool_size, nss_pool_size, uint, 0644);
 MODULE_PARM_DESC(pool_size, "empty buffers the host will lend the firmware");
 
-#define NSS_N2H_EMPTY_POOL_BUF_CFG	2
-#define NSS_N2H_WIFI_POOL_BUF_CFG	8
-
-/* The WLAN receive pool is carved from the firmware's payloads, and a pool it
- * was given no budget for stays empty: with nothing to fill a receive
- * descriptor with, the firmware fills none, and a frame arriving against a
- * descriptor the host filled instead resolves to a pool entry that was never
- * populated. A core carrying WLAN traffic reports 4095 receive descriptors in
- * use, which is what this budget buys on a 512 MB board.
- */
-unsigned int nss_wifi_pool_size = 8192;
-module_param_named(wifi_pool_size, nss_wifi_pool_size, uint, 0644);
-MODULE_PARM_DESC(wifi_pool_size, "payloads the firmware may carve for WLAN");
-
-struct nss_n2h_pool_cfg {
-	struct nss_cmn_msg cm;
-	__be32 pool_size;
-};
-
+#define NSS_N2H_SET_WATER_MARK		6
 #define NSS_N2H_GET_WATER_MARK		7
+
+struct nss_n2h_water_mark {
+	struct nss_cmn_msg cm;
+	__be32 low_water;
+	__be32 high_water;
+};
 
 struct nss_n2h_payload_info {
 	struct nss_cmn_msg cm;
@@ -379,41 +362,75 @@ struct nss_n2h_payload_info {
 	__be32 high_water;
 };
 
+/* Say what the pool may reach, and stop the refill at the same number.
+ *
+ * The firmware drains whatever it holds above its high-water mark straight
+ * back, so the mark is what a pool settles at: set below what the host is
+ * willing to lend it empties as fast as it is filled and a receive ring never
+ * fills, set above it the host stops first and the mark is never reached. The
+ * low mark is a ring's worth, the point at which a top-up is worth an
+ * interrupt. The counts are byte-swapped, as the other control-plane scalars
+ * on this interface are; the addresses beside them are not.
+ */
+static int nss_pool_set(struct nss_core *core, u32 payloads)
+{
+	struct nss_n2h_water_mark wm = {};
+	int ret;
+
+	wm.cm.interface = NSS_INTERFACE_N2H;
+	wm.cm.type = NSS_N2H_SET_WATER_MARK;
+	wm.low_water = cpu_to_be32(NSS_RING_ENTRIES);
+	wm.high_water = cpu_to_be32(payloads);
+
+	ret = nss_msg_send(core, &wm, sizeof(wm));
+	if (ret)
+		return ret;
+
+	core->pool_size = payloads;
+
+	return 0;
+}
+
 static void nss_pool_configure(struct nss_core *core)
 {
-	struct nss_n2h_pool_cfg m = {};
 	struct nss_n2h_payload_info p = {};
 	int ret;
 
-	if (nss_pool_size < NSS_RING_ENTRIES)
-		nss_pool_size = NSS_RING_ENTRIES;
-
-	m.cm.interface = NSS_INTERFACE_N2H;
-	m.cm.type = NSS_N2H_EMPTY_POOL_BUF_CFG;
-	m.pool_size = cpu_to_be32(nss_pool_size);
-
-	ret = nss_msg_send(core, &m, sizeof(m));
-	dev_info(core->dev, "empty buffer pool set to %u: %d\n",
-		 nss_pool_size, ret);
-
-	/* What the firmware carves the WLAN budget out of, asked for rather
-	 * than assumed: a budget above what the pool leaves is refused whole.
+	/* The firmware refuses a span narrower than the ring it is topped up
+	 * through.
 	 */
+	if (nss_pool_size < 2 * NSS_RING_ENTRIES)
+		nss_pool_size = 2 * NSS_RING_ENTRIES;
+
+	ret = nss_pool_set(core, nss_pool_size);
+	dev_info(core->dev, "payload pool set to %u: %d\n", nss_pool_size, ret);
+
 	p.cm.interface = NSS_INTERFACE_N2H;
 	p.cm.type = NSS_N2H_GET_WATER_MARK;
 	ret = nss_msg_send(core, &p, sizeof(p));
 	dev_info(core->dev, "payload pool %u low %u high %u: %d\n",
 		 be32_to_cpu(p.pool_size), be32_to_cpu(p.low_water),
 		 be32_to_cpu(p.high_water), ret);
+}
 
-	m = (struct nss_n2h_pool_cfg){};
-	m.cm.interface = NSS_INTERFACE_N2H;
-	m.cm.type = NSS_N2H_WIFI_POOL_BUF_CFG;
-	m.pool_size = cpu_to_be32(nss_wifi_pool_size);
+/* Raise the ceiling for a consumer that parks payloads in hardware rings.
+ *
+ * The firmware's own per-buffer bookkeeping is not extended alongside it: a
+ * page hand-over on this interface traps the core outright, so the mark alone
+ * is raised and a shortage shows as a starved pool rather than as a fault.
+ */
+int nss_pool_fund(struct nss_core *core, u32 payloads)
+{
+	u32 high = core->pool_size + payloads;
+	int ret;
 
-	ret = nss_msg_send(core, &m, sizeof(m));
-	dev_info(core->dev, "wifi payload pool set to %u: %d\n",
-		 nss_wifi_pool_size, ret);
+	ret = nss_pool_set(core, high);
+	if (ret)
+		return ret;
+
+	dev_info(core->dev, "payload pool raised to %u\n", high);
+
+	return 0;
 }
 
 static int nss_core_boot(struct nss_core *core)
@@ -484,6 +501,15 @@ free:
 	clk_bulk_disable_unprepare(NSS_CLK_OWN, &core->clks[NSS_CLK_FABRIC]);
 
 	return ret;
+}
+
+/* For the WLAN driver, whose rings the firmware reaps: they are about to go,
+ * and the firmware has no way to be told that short of stopping.
+ */
+void nss_core_stop(struct nss_core *core)
+{
+	guard(mutex)(&core->lock);
+	nss_core_halt(core);
 }
 
 static int nss_boot_set(void *data, u64 val)
