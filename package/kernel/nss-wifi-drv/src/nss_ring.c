@@ -211,12 +211,12 @@ static void nss_cpu_port_reclaim(struct nss_core *core)
  * chain them and a chain the firmware reads wrongly is a fault rather than a
  * dropped frame.
  */
-/* Whether the firmware may keep the buffer a frame arrives in. A working host
- * driver of this firmware line offers every frame it hands to a virtual
- * device this way and this one did not, which is a difference worth being
- * able to measure rather than to argue about.
+/* Whether the firmware may keep the buffer a frame arrives in. A kept buffer
+ * counts against the firmware's high-water mark, which this driver holds
+ * equal to what it lends, and it comes back later under the same cookie
+ * carrying a received frame, which the completion path below frees unread.
  */
-static bool nss_tx_reusable = true;
+static bool nss_tx_reusable;
 module_param_named(tx_reusable, nss_tx_reusable, bool, 0644);
 MODULE_PARM_DESC(tx_reusable, "offer the firmware the buffer a frame arrives in");
 
@@ -486,7 +486,7 @@ static int nss_refill(struct nss_core *core, int budget)
 	while (filled < budget) {
 		u32 next = (ring->hlos_index + 1) & (NSS_RING_ENTRIES - 1);
 
-		if (atomic_read(&core->buffers_queued) + filled >= nss_pool_size)
+		if (atomic_read(&core->buffers_queued) + filled >= core->pool_size)
 			break;
 		struct h2n_descriptor *desc;
 		struct sk_buff *skb;
