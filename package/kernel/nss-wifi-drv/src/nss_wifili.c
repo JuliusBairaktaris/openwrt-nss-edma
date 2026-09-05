@@ -200,9 +200,18 @@ void nss_wifi_soc_unregister(void)
 	/* The WLAN driver is about to free the rings this reaches into, and a
 	 * receive poll that read the callback a moment ago is still holding
 	 * it, so the withdrawal is not complete until that poll has ended.
+	 *
+	 * A firmware started on those rings keeps reaping them after they are
+	 * freed and after they are allocated again for the next WLAN
+	 * instance, whose entries it then resolves against descriptors it
+	 * never issued. It is stopped with them.
 	 */
 	WRITE_ONCE(nss_wifili_soc.link_desc_return, NULL);
-	if (nss_wifili_core)
+	if (!nss_wifili_core)
+		return;
+	if (nss_wifili_core->wifili_started)
+		nss_core_stop(nss_wifili_core);
+	else
 		nss_rings_quiesce(nss_wifili_core);
 }
 EXPORT_SYMBOL_GPL(nss_wifi_soc_unregister);
@@ -717,19 +726,6 @@ static int nss_wifili_vdev_msg(struct nss_core *core, int if_num, u32 type,
 	return ret;
 }
 
-/* Send a received frame to the host rather than into the firmware.
- *
- * A virtual device forwards what it receives to a next hop, and the one it is
- * created with is the firmware's own ethernet node - so a frame from a
- * station is handed to the firmware's wired path, where nothing has been told
- * about it, and is dropped. Nothing above ever sees it, which looks exactly
- * like a receive path that never started: a station associates, the
- * authentication exchange gets no reply, and no counter moves.
- *
- * Pointing the next hop at the node that hands frames to the host is what
- * makes everything arrive by exception, which is what this rung is. A rule
- * pushed into the firmware later is what takes a flow back off it.
- */
 static int nss_wifili_vdev_cmd(struct nss_core *core, int if_num, u32 cmd,
 			       u32 value)
 {
@@ -740,11 +736,17 @@ static int nss_wifili_vdev_cmd(struct nss_core *core, int if_num, u32 cmd,
 				   &c, sizeof(c));
 }
 
-static unsigned int nss_wifili_rx_next_hop = NSS_INTERFACE_N2H;
+static unsigned int nss_wifili_rx_next_hop = NSS_INTERFACE_ETH_RX;
 module_param_named(rx_next_hop, nss_wifili_rx_next_hop, uint, 0644);
-MODULE_PARM_DESC(rx_next_hop, "interface a virtual device forwards receive to, 0 to leave it as created");
+MODULE_PARM_DESC(rx_next_hop, "interface a virtual device forwards receive to, 156 for the host alone");
 
 /* Where a virtual device sends what it receives.
+ *
+ * The firmware's own ethernet node is what feeds its connection engines, so
+ * it is the only next hop a pushed rule can match on; a frame no rule claims
+ * leaves it for the host as an exception. The node that hands everything to
+ * the host is the exception path alone, kept selectable because it separates
+ * a receive path that does not start from a rule that does not match.
  *
  * The firmware keeps this on the base virtual-device node, not on the node a
  * device was allocated: addressed to an allocated one it is answered without
@@ -1367,11 +1369,51 @@ static unsigned int nss_wifili_mem_profile;
 module_param_named(mem_profile, nss_wifili_mem_profile, uint, 0644);
 MODULE_PARM_DESC(mem_profile, "memory profile the firmware sizes its pools from");
 
+/* How many payloads a radio may carve for its own receive.
+ *
+ * Without this the firmware leaves the radio on the budget it starts with and
+ * fills no receive descriptor, so the ring the WLAN firmware needs full is
+ * filled by nobody - and a ring the host fills instead carries cookies the
+ * firmware cannot resolve. The count is asked for across all four peer-count
+ * ranges, because which one applies is the firmware's choice and a range left
+ * unset is a station count that silently loses the budget again.
+ */
+#define NSS_WIFILI_BUF_RANGES	4
+
+static int nss_wifili_radio_buf_cfg(struct nss_core *core, int if_num,
+				    u32 bufs)
+{
+	struct nss_wifili_msg *m __free(kfree) = kzalloc(sizeof(*m), GFP_KERNEL);
+	u32 range;
+	int ret;
+
+	if (!m)
+		return -ENOMEM;
+
+	for (range = 0; range < NSS_WIFILI_BUF_RANGES; range++) {
+		memset(m, 0, sizeof(*m));
+		m->cm.interface = NSS_INTERFACE_WIFILI;
+		m->cm.type = NSS_WIFILI_RADIO_BUF_CFG;
+		m->msg.radiocfgmsg.radio_if_num = if_num;
+		m->msg.radiocfgmsg.radiomsg.radiobufcfgmsg.buf_cnt = bufs;
+		m->msg.radiocfgmsg.radiomsg.radiobufcfgmsg.range = range;
+
+		ret = nss_msg_send(core, m,
+				   offsetof(struct nss_wifili_msg, msg) +
+				   sizeof(m->msg.radiocfgmsg));
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 int nss_wifili_start(struct seq_file *s)
 {
 	struct nss_wifili_ctx *w;
 	struct nss_wifili_msg *m;
 	struct nss_core *core;
+	u32 need;
 	int i, ret;
 
 	guard(mutex)(&nss_wifili_lock);
@@ -1553,6 +1595,20 @@ int nss_wifili_start(struct seq_file *s)
 	if (ret)
 		goto out;
 
+	/* The receive rings are filled from what the host lends, one payload
+	 * per entry for as long as the radio is up, and a radio's transmit
+	 * queue holds up to its descriptor count on top. Funded before the
+	 * radios are initialised, because the first fill runs when they are.
+	 */
+	need = NSS_WIFILI_TX_DESC * nss_wifili_pdevs;
+	for (i = 0; i < nss_wifili_pdevs; i++)
+		need += nss_wifili_pdev[i].rxdma.num_entries;
+
+	ret = nss_pool_fund(core, need);
+	seq_printf(s, "%-14s rc %d (%u payloads)\n", "payload pool:", ret, need);
+	if (ret)
+		goto out;
+
 	for (i = 0; i < nss_wifili_pdevs; i++) {
 		int if_num;
 
@@ -1574,12 +1630,6 @@ int nss_wifili_start(struct seq_file *s)
 		m->cm.type = NSS_WIFILI_PDEV_INIT_MSG;
 		nss_wifili_ring_fill(&m->msg.pdevmsg.rxdma_ring,
 				     &nss_wifili_pdev[i].rxdma);
-		/* The scheme names the firmware worker thread group the radio
-		 * runs on. It is the host's to hand out and it has to be
-		 * distinct per radio: left at its zero default every radio
-		 * claims the same one, and a worker thread then traps.
-		 */
-		m->msg.pdevmsg.scheme_id = i;
 		m->msg.pdevmsg.radio_id = nss_wifili_pdev[i].radio_id;
 		m->msg.pdevmsg.lmac_id = nss_wifili_pdev[i].lmac_id;
 		m->msg.pdevmsg.target_pdev_id = nss_wifili_pdev[i].target_pdev_id;
@@ -1590,6 +1640,14 @@ int nss_wifili_start(struct seq_file *s)
 		seq_printf(s, "radio %u init:  rc %d response %u error %u\n",
 			   nss_wifili_pdev[i].radio_id, ret, m->cm.response,
 			   m->cm.error);
+		if (ret)
+			goto out;
+
+		ret = nss_wifili_radio_buf_cfg(core, if_num,
+					       nss_wifili_pdev[i].rxdma.num_entries);
+		seq_printf(s, "radio %u bufs:  rc %d (%u per range)\n",
+			   nss_wifili_pdev[i].radio_id, ret,
+			   nss_wifili_pdev[i].rxdma.num_entries);
 		if (ret)
 			goto out;
 	}
