@@ -42,7 +42,7 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/core.c
 +module_param_named(nss_hash, ath11k_nss_hash, bool, 0444);
 +MODULE_PARM_DESC(nss_hash, "Keep hash-based receive steering while offloading");
 +
-+bool ath11k_nss_prefill;
++bool ath11k_nss_prefill = true;
 +module_param_named(nss_prefill, ath11k_nss_prefill, bool, 0444);
 +MODULE_PARM_DESC(nss_prefill, "Fill the receive-DMA ring from here as well");
 +
@@ -137,13 +137,13 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/dp_rx.c
 -	ath11k_dp_rxdma_ring_buf_setup(ar, rx_ring, HAL_RXDMA_BUF);
 +	/* The firmware fills this one from its own pool and names a returned
 +	 * buffer by a cookie it minted, so a ring holding both sides' buffers
-+	 * is a ring neither can reap.
-+	 *
-+	 * nss_prefill fills it from here anyway. It is a measurement, not a
-+	 * configuration: if the hardware takes buffers this driver wrote and
-+	 * not the ones the firmware wrote, the difference is in the entries
-+	 * rather than anywhere else, and that is worth knowing before more is
-+	 * built on either.
++	 * is a ring neither can reap. Both sides abandoning it is worse: the
++	 * firmware needs somewhere to put a received frame from the moment it
++	 * starts, and takes a fatal error when there is none - once every
++	 * nineteen seconds, for as long as the radio is up. So the ring is
++	 * filled from here as well, and clearing nss_prefill is what takes
++	 * that away again for the measurement that settles which side's
++	 * entries the hardware consumes.
 +	 */
 +	if (!ath11k_nss_offload || ath11k_nss_prefill)
 +		ath11k_dp_rxdma_ring_buf_setup(ar, rx_ring, HAL_RXDMA_BUF);
