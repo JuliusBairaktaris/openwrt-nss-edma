@@ -67,6 +67,8 @@
  * it is given is the head of the allocation and it reports where the payload
  * landed.
  */
+extern unsigned int nss_pool_size;
+
 #define NSS_EMPTY_BUFFER_SIZE	1984
 #define NSS_EMPTY_BUFFER_ALLOC	(NSS_EMPTY_BUFFER_SIZE + NET_SKB_PAD)
 
@@ -76,6 +78,11 @@
 #define NSS_INTERFACE_IPV4	161
 #define NSS_INTERFACE_IPV6	163
 #define NSS_INTERFACE_DYNAMIC	176
+/* The base virtual-device node, where the firmware keeps settings that
+ * belong to every virtual device rather than to one of them.
+ */
+#define NSS_INTERFACE_VAP_BASE	200
+
 #define NSS_INTERFACE_WIFILI	203
 #define NSS_INTERFACE_MAX	228
 

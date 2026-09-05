@@ -39,7 +39,7 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  	struct ath11k_dp *dp = &ab->dp;
 @@ -945,6 +960,8 @@
  	soc->rx_buf_len = DP_RX_BUFFER_SIZE;
- 	soc->num_tcl = ab->hw_params.max_tx_ring;
+ 	soc->num_tcl = ab->hw_params.hal_params->num_tx_rings;
  	soc->num_reo = DP_REO_DST_RING_MAX;
 +	soc->priv = ab;
 +	soc->link_desc_return = ath11k_nss_link_desc_return;
