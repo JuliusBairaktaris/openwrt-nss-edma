@@ -312,6 +312,10 @@ MAKE_OPTS:= \
 # must travel via CFLAGS.
 ifdef CONFIG_ATH11K_NSS_SUPPORT
   MAKE_OPTS += CFLAGS="-I$(STAGING_DIR)/usr/include/qca-nss-drv"
+  # The kernel is built with CONFIG_WERROR on this base and the vendor-derived
+  # NSS sources are not warning-clean. Demote for this module build alone
+  # rather than turning the kernel's own strictness off.
+  MAKE_OPTS += CFLAGS_MODULE="-Wno-error"
 endif
 
 define ConfigVars
