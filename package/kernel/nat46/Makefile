@@ -39,10 +39,18 @@ define Build/InstallDev
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/nat46/modules/*.h  $(STAGING_DIR)/usr/include/nat46/
 endef
 
+# The MAP-T fast path marks its netdev with dev->priv_flags_ext =
+# IFF_EXT_MAPT. Both the field and the flag come from the QCA ECM kernel
+# patch (qca-nss-ecm-support-CORE), which only the NSS targets carry, so
+# probe the kernel headers rather than assume them: without the patch the
+# module still builds, it just does not set the flag nothing reads.
+# Lazily assigned - LINUX_DIR only holds a prepared kernel at build time.
+NAT46_PRIV_FLAGS_EXT = $(shell grep -qs 'priv_flags_ext' $(LINUX_DIR)/include/linux/netdevice.h && echo -DNAT46_HAVE_PRIV_FLAGS_EXT)
+
 define Build/Compile
 	+$(KERNEL_MAKE) M="$(PKG_BUILD_DIR)/nat46/modules" \
 		MODFLAGS="-DMODULE -mlong-calls" \
-		EXTRA_CFLAGS="-DNAT46_VERSION=\\\"$(PKG_SOURCE_VERSION)\\\"" \
+		EXTRA_CFLAGS="-DNAT46_VERSION=\\\"$(PKG_SOURCE_VERSION)\\\" $(NAT46_PRIV_FLAGS_EXT)" \
 		modules
 endef
 

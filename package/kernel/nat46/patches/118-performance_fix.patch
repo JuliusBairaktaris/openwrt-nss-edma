@@ -415,11 +415,13 @@ Date: Fri Dec 17 13:37:15 2021 -0800
  		ret = nat46_ipv6_input(skb);
  	}
  	if(0 == ret) {
-@@ -188,6 +187,7 @@ static void nat46_netdev_setup(struct ne
+@@ -188,6 +187,9 @@ static void nat46_netdev_setup(struct ne
  	dev->netns_immutable = true;
  #endif
  	dev->flags = IFF_NOARP | IFF_POINTOPOINT;
++#ifdef NAT46_HAVE_PRIV_FLAGS_EXT
 +	dev->priv_flags_ext = IFF_EXT_MAPT;
++#endif
  }
  
  static int nat46_netdev_create(struct net *net, char *basename, struct net_device **dev)
