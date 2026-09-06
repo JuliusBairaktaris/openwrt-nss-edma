@@ -484,7 +484,6 @@ define KernelPackage/ath11k-pci
   URL:=https://wireless.wiki.kernel.org/en/users/drivers/ath11k
   DEPENDS+= @PCI_SUPPORT +kmod-qrtr-mhi +kmod-ath11k
   FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath11k/ath11k_pci.ko
-  AUTOLOAD:=$(call AutoProbe,ath11k_pci)
 endef
 
 define KernelPackage/ath11k-pci/description
