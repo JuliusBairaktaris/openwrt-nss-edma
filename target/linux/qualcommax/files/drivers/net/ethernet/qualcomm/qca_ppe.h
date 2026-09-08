@@ -786,6 +786,7 @@
  */
 #define   PPE_AC_FORCE_AC_EN		BIT(2)
 #define   PPE_AC_GRP_ID			GENMASK(5, 4)
+#define PPE_AC_GROUPS			4
 #define   PPE_AC_SHARED_DYNAMIC		BIT(17)
 #define   PPE_AC_SHARED_WEIGHT		GENMASK(20, 18)
 #define   PPE_AC_SHARED_CEILING		GENMASK(31, 21)
@@ -1003,6 +1004,8 @@ struct qca_ppe_priv {
 	u16 mirror_ref;
 	u8 mirror_dir_ref[QCA_PPE_MAX_PORTS][2];
 	struct ppe_port_shaper shaper[QCA_PPE_MAX_PORTS];
+	/* Owner of each egress admission group: port * 2 + kind + 1, or 0. */
+	u8 ac_grp_owner[PPE_AC_GROUPS];
 	struct dentry *debugfs;
 	DECLARE_BITMAP(vsi_bitmap, PPE_VSI_MAX);
 	DECLARE_BITMAP(xlt_bitmap, PPE_XLT_TBL_NUM);
