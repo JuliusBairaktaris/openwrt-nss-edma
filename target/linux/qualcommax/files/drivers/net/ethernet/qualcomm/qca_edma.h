@@ -164,7 +164,14 @@
 #define EDMA_TX_PREHDR_SIZE (sizeof(struct edma_tx_preheader))
 #define EDMA_TX_RING_SIZE 128
 #define EDMA_RX_RING_SIZE 2048
-#define EDMA_TX_RING_THRESH 16
+/* The engine reads one frame from up to this many descriptors, and every
+ * buffer but the last has to be at least this long. The queue stops with room
+ * for a frame that takes all of them, or it would restart on space that the
+ * next frame still could not use.
+ */
+#define EDMA_TX_MAX_SEGS 32
+#define EDMA_TX_MIN_SEG 16
+#define EDMA_TX_RING_THRESH (EDMA_TX_MAX_SEGS + 1)
 /* A ring index wraps by masking, so a ring is a power of two. The size
  * registers are sixteen bits wide, but a fill ring pins a page per entry and
  * the ceiling below is that, not the field.
@@ -180,6 +187,7 @@
 #define EDMA_TXCMPL_DESC(R, i) EDMA_GET_DESC(R, i, struct edma_txcmpl)
 
 /* TX descriptor fields */
+#define EDMA_TXDESC_MORE BIT(30)
 #define EDMA_TXDESC_PREHEADER_SHIFT 29
 #define EDMA_TXDESC_DATA_OFFSET_SHIFT 16
 #define EDMA_TXDESC_DATA_OFFSET_MASK 0xff
