@@ -74,6 +74,10 @@
 #define EDMA_TXCMPL_PROD_IDX_MASK 0xffff
 #define EDMA_TXCMPL_CONS_IDX_MASK 0xffff
 #define EDMA_TXCMPL_RETMODE_OPAQUE 0x0
+/* The engine returns one completion per descriptor: the more bit marks every
+ * completion of a frame but its last.
+ */
+#define EDMA_TXCMPL_MORE BIT(30)
 
 /* TX interrupt registers */
 #define EDMA_REG_TX_INT_STAT(b, n)  ((b) + (0x1000 * (n)))
@@ -194,6 +198,7 @@
 #define EDMA_TXDESC_MORE BIT(30)
 #define EDMA_TXDESC_TSO_EN BIT(28)
 #define EDMA_TXDESC_PREHEADER_SHIFT 29
+#define EDMA_TXDESC_PREHEADER BIT(EDMA_TXDESC_PREHEADER_SHIFT)
 #define EDMA_TXDESC_DATA_OFFSET_SHIFT 16
 #define EDMA_TXDESC_DATA_OFFSET_MASK 0xff
 #define EDMA_TXDESC_DATA_LENGTH_MASK 0xffff
@@ -289,6 +294,13 @@ struct edma_priv {
 	u8 rx_page_order;
 	u16 tx_ring_size;
 	u16 rx_ring_size;
+
+	/* The frame a run of completions belongs to, named by the first of
+	 * them and released on the last.
+	 */
+	struct sk_buff *txcmpl_skb;
+	u32 txcmpl_idx;
+	bool txcmpl_run;
 
 	struct edma_ring txdesc_ring;
 	struct edma_ring txcmpl_ring;

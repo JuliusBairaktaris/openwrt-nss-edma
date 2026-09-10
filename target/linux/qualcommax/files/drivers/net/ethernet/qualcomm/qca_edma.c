@@ -208,14 +208,22 @@ static void edma_ring_free(struct edma_priv *priv, struct edma_ring *ring,
 	}
 }
 
+static u32 edma_tx_release(struct edma_priv *priv, u32 idx, struct sk_buff *skb,
+			   int napi_budget);
+
 static void edma_tx_ring_free(struct edma_priv *priv, struct edma_ring *ring,
 			      int desc_size)
 {
 	int i;
 
 	if (ring->skb_store) {
-		for (i = 0; i < ring->count; i++)
-			dev_kfree_skb_any(ring->skb_store[i]);
+		for (i = 0; i < ring->count; i++) {
+			struct edma_txdesc *txdesc = EDMA_TXDESC_DESC(ring, i);
+			struct sk_buff *skb = ring->skb_store[i];
+
+			if (skb && (txdesc->word1 & EDMA_TXDESC_PREHEADER))
+				edma_tx_release(priv, i, skb, 0);
+		}
 		kfree(ring->skb_store);
 		ring->skb_store = NULL;
 	}
@@ -336,18 +344,58 @@ static u16 edma_txdesc_free(struct edma_priv *priv)
  * is not a poll: the skb cache napi_consume_skb() recycles into is per-CPU and
  * is only safe to touch from softirq context.
  */
+/* Unmaps every descriptor the frame was written from and releases the slots
+ * that named them, returning the bytes the frame carried. A slot goes back
+ * only once its descriptor has been read, so that a transmit taking the slot
+ * cannot place a frame over what this walk has yet to reach.
+ */
+static u32 edma_tx_release(struct edma_priv *priv, u32 idx, struct sk_buff *skb,
+			   int napi_budget)
+{
+	struct edma_ring *ring = &priv->txdesc_ring;
+	struct device *dev = &priv->pdev->dev;
+	struct edma_txdesc *txdesc;
+	u32 bytes, len;
+
+	txdesc = EDMA_TXDESC_DESC(ring, idx);
+	len = skb_headlen(skb);
+
+	dma_unmap_single(dev, le32_to_cpu(txdesc->buffer_addr), len,
+			 DMA_TO_DEVICE);
+	bytes = len - EDMA_TX_PREHDR_SIZE;
+	ring->skb_store[idx] = NULL;
+
+	idx = (idx + 1) & (ring->count - 1);
+	while (ring->skb_store[idx] == skb) {
+		txdesc = EDMA_TXDESC_DESC(ring, idx);
+		len = txdesc->word1 & EDMA_TXDESC_DATA_LENGTH_MASK;
+
+		dma_unmap_page(dev, le32_to_cpu(txdesc->buffer_addr), len,
+			       DMA_TO_DEVICE);
+		bytes += len;
+		ring->skb_store[idx] = NULL;
+		idx = (idx + 1) & (ring->count - 1);
+	}
+
+	napi_consume_skb(skb, napi_budget);
+
+	return bytes;
+}
+
+/* @napi_budget is the NAPI budget the poll was given, or zero when the caller
+ * is not a poll: the skb cache napi_consume_skb() recycles into is per-CPU and
+ * is only safe to touch from softirq context.
+ */
 static u32 edma_clean_tx(struct edma_priv *priv, struct edma_ring *txcmpl_ring,
 			 int budget, int napi_budget)
 {
 	const struct edma_soc_data *soc = priv->soc;
 	struct platform_device *pdev = priv->pdev;
+	u32 cleaned = 0, pkts = 0, bytes = 0;
 	struct edma_txcmpl *txcmpl;
-	struct edma_txdesc *txdesc;
-	u32 cleaned = 0, bytes = 0;
-	u16 prod, cons;
 	struct sk_buff *skb;
-	u32 val, len;
-	int idx;
+	u16 prod, cons;
+	u32 val;
 
 	regmap_read(priv->regmap,
 		    EDMA_REG_TXCMPL_PROD_IDX(soc->txcmpl_base,
@@ -364,45 +412,41 @@ static u32 edma_clean_tx(struct edma_priv *priv, struct edma_ring *txcmpl_ring,
 	while (cons != prod && cleaned < budget) {
 		txcmpl = EDMA_TXCMPL_DESC(txcmpl_ring, cons);
 
-		idx = txcmpl->buffer_addr;
-		skb = priv->txdesc_ring.skb_store[idx];
-		priv->txdesc_ring.skb_store[idx] = NULL;
-
-		if (unlikely(!skb)) {
-			dev_warn(&pdev->dev,
-				 "invalid skb: cons:%u prod:%u status %x\n",
-				 cons, prod, txcmpl->status);
-			goto next;
-		}
-
-		/* The frame runs on until the descriptor without the more
-		 * bit. Each one holds the address and the length that were
-		 * mapped for it, and the store slot that keeps a later frame
-		 * off it until the frame it belongs to is done.
+		/* A frame is named by the first completion of its run and
+		 * released on the one that clears the more bit; the opaque of
+		 * the completions in between is not written.
 		 */
-		txdesc = EDMA_TXDESC_DESC(&priv->txdesc_ring, idx);
-		len = skb_headlen(skb);
-
-		dma_unmap_single(&pdev->dev,
-				 le32_to_cpu(txdesc->buffer_addr),
-				 len, DMA_TO_DEVICE);
-		bytes += len - EDMA_TX_PREHDR_SIZE;
-
-		while (txdesc->word1 & EDMA_TXDESC_MORE) {
-			idx = (idx + 1) & (priv->txdesc_ring.count - 1);
-			priv->txdesc_ring.skb_store[idx] = NULL;
-			txdesc = EDMA_TXDESC_DESC(&priv->txdesc_ring, idx);
-			len = txdesc->word1 & EDMA_TXDESC_DATA_LENGTH_MASK;
-
-			dma_unmap_page(&pdev->dev,
-				       le32_to_cpu(txdesc->buffer_addr),
-				       len, DMA_TO_DEVICE);
-			bytes += len;
+		/* The opaque is only written for the descriptor that carried
+		 * the preheader, so it is read once per run and not again if
+		 * the run turns out to name no frame: a later completion of
+		 * the same run would otherwise hand back whatever its field
+		 * held and name a frame the engine still owns.
+		 */
+		if (!priv->txcmpl_run) {
+			priv->txcmpl_run = true;
+			priv->txcmpl_idx = txcmpl->buffer_addr;
+			if (priv->txcmpl_idx < priv->txdesc_ring.count)
+				priv->txcmpl_skb =
+					priv->txdesc_ring.skb_store[priv->txcmpl_idx];
 		}
 
-		napi_consume_skb(skb, napi_budget);
+		if (!(txcmpl->status & EDMA_TXCMPL_MORE)) {
+			skb = priv->txcmpl_skb;
+			priv->txcmpl_skb = NULL;
+			priv->txcmpl_run = false;
 
-next:
+			if (unlikely(!skb)) {
+				dev_warn(&pdev->dev,
+					 "invalid skb: cons:%u prod:%u status %x\n",
+					 cons, prod, txcmpl->status);
+			} else {
+				bytes += edma_tx_release(priv,
+							 priv->txcmpl_idx, skb,
+							 napi_budget);
+				pkts++;
+			}
+		}
+
 		if (++cons == txcmpl_ring->count)
 			cons = 0;
 
@@ -416,7 +460,7 @@ next:
 	 * to be freed, so only a poll may wake it.
 	 */
 	__netif_txq_completed_wake(netdev_get_tx_queue(priv->netdev, 0),
-				   cleaned, bytes, edma_txdesc_free(priv),
+				   pkts, bytes, edma_txdesc_free(priv),
 				   EDMA_TX_RING_THRESH, !napi_budget);
 
 	/* Ensure all TX completions are processed before updating cons idx */
@@ -833,11 +877,9 @@ static void edma_rx_ring_free(struct edma_priv *priv, struct edma_ring *ring,
 static void edma_txdesc_drain(struct edma_priv *priv, struct edma_ring *txdesc_ring)
 {
 	const struct edma_soc_data *soc = priv->soc;
-	struct platform_device *pdev = priv->pdev;
 	struct edma_txdesc *txdesc;
 	struct sk_buff *skb;
 	u16 prod, cons;
-	size_t buf_len;
 	u32 val;
 
 	regmap_read(priv->regmap,
@@ -850,23 +892,19 @@ static void edma_txdesc_drain(struct edma_priv *priv, struct edma_ring *txdesc_r
 		    &val);
 	cons = val & EDMA_TXDESC_CONS_IDX_MASK;
 
+	/* A frame holds a slot per descriptor it was written from, so it is
+	 * released from the one that carried its preheader and the release
+	 * clears the rest.
+	 */
 	while (cons != prod) {
 		txdesc = EDMA_TXDESC_DESC(txdesc_ring, cons);
-
 		skb = txdesc_ring->skb_store[cons];
-		txdesc_ring->skb_store[cons] = NULL;
 
-		if (!skb)
-			goto next;
+		if (skb && (txdesc->word1 & EDMA_TXDESC_PREHEADER))
+			edma_tx_release(priv, cons, skb, 0);
+		else
+			txdesc_ring->skb_store[cons] = NULL;
 
-		buf_len = txdesc->word1 & EDMA_TXDESC_DATA_LENGTH_MASK;
-
-		dma_unmap_single(&pdev->dev,
-				 le32_to_cpu(txdesc->buffer_addr),
-				 buf_len + EDMA_TX_PREHDR_SIZE, DMA_TO_DEVICE);
-
-		dev_kfree_skb_any(skb);
-next:
 		if (++cons == txdesc_ring->count)
 			cons = 0;
 	}
@@ -912,6 +950,8 @@ static void edma_rings_drain(struct edma_priv *priv)
 {
 	edma_txdesc_drain(priv, &priv->txdesc_ring);
 	edma_clean_tx(priv, &priv->txcmpl_ring, INT_MAX, 0);
+	priv->txcmpl_skb = NULL;
+	priv->txcmpl_run = false;
 
 	edma_tx_ring_free(priv, &priv->txdesc_ring, sizeof(struct edma_txdesc));
 	edma_ring_free(priv, &priv->txcmpl_ring, sizeof(struct edma_txcmpl));
