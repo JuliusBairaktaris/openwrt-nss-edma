@@ -1,0 +1,110 @@
+#!/bin/sh /etc/rc.common
+# START and USE_PROCD are read by /etc/rc.common, not by this file.
+# shellcheck disable=SC2034
+# Wi-Fi data-path decision, made once before netifd builds the topology.
+#
+# The radios bind their data path at probe and never rebind, so which path
+# they take is a module parameter and not a runtime switch: it has to be
+# decided before the WLAN driver loads. That is the whole reason this service
+# exists, and it is why the bus module carries no autoload - unloading and
+# reloading the WLAN driver to change the decision is what wedges the board.
+#
+# The decision is on by default and turned off with:
+#   uci set nss-wifi.general.offload='0'; uci commit nss-wifi
+# Anything else, and any failure below, loads the driver exactly as an image
+# without this package would. Wired networking never depends on either path.
+
+START=19
+USE_PROCD=1
+
+wifi_load_host() {
+	modprobe ath11k 2>/dev/null
+	modprobe ath11k_ahb 2>/dev/null
+	modprobe ath11k_pci 2>/dev/null
+}
+
+start_service() {
+	local dir i
+
+	[ "$(uci -q get nss-wifi.general.offload)" = "1" ] || {
+		wifi_load_host
+		return 0
+	}
+
+	# Disarmed before anything is tried, and armed again only once the
+	# firmware has taken the data plane. A bring-up that hangs the board
+	# therefore costs one boot, not every boot after it.
+	uci -q set nss-wifi.general.offload=0
+	uci -q commit nss-wifi
+	sync
+
+	# The parameters are read when a radio probes, and the bus module is
+	# what probes one, so they are written between loading the WLAN driver
+	# and loading the bus module rather than passed to either. modprobe on
+	# this image carries no module parameters at all.
+	modprobe nss-wifi-drv 2>/dev/null
+
+	# Parameters are read when the plane is brought up below, and modprobe
+	# on this image carries none, so anything to be varied between boots is
+	# written here:
+	#   uci add_list nss-wifi.general.param='payloads=32768'
+	for param in $(uci -q get nss-wifi.general.param); do
+		echo "${param#*=}" > "/sys/module/nss_wifi_drv/parameters/${param%%=*}" 2>/dev/null &&
+			logger -t nss-wifi "$param"
+	done
+
+	modprobe ath11k 2>/dev/null
+	if ! echo 1 > /sys/module/ath11k/parameters/nss_offload 2>/dev/null; then
+		logger -t nss-wifi "ath11k has no offload parameter, staying on the host path"
+		wifi_load_host
+		return 0
+	fi
+	echo 2 > /sys/module/ath11k/parameters/frame_mode 2>/dev/null
+	modprobe ath11k_ahb 2>/dev/null
+
+	# A radio describes its rings from its own probe, which loading the
+	# bus module only begins, so the bring-up waits for that rather than
+	# racing it. Reading wifili_start is what sends the sequence.
+	#
+	# A radio logs its rings as it hands them over, and that line is the
+	# only thing that says the description is complete: the phy appears
+	# early in the probe, well before it. Releasing the core while a radio
+	# is still probing hangs the board.
+	i=0
+	while [ $i -lt 60 ]; do
+		[ "$(dmesg | grep -c 'nss-wifi-drv: radio')" -gt 0 ] && break
+		sleep 1
+		i=$((i + 1))
+	done
+	sleep 3
+
+	dir=$(ls -d /sys/kernel/debug/*.nss 2>/dev/null | head -1)
+	[ -n "$dir" ] || {
+		logger -t nss-wifi "no NSS core to boot"
+		return 0
+	}
+	echo 1 > "$dir/boot" || {
+		logger -t nss-wifi "the NSS core would not boot"
+		return 0
+	}
+	cat "$dir/wifili_start" | logger -t nss-wifi
+
+	[ "$(cat "$dir/boot")" = "1" ] || {
+		logger -t nss-wifi "the core did not stay up; the offload stays disarmed"
+		return 0
+	}
+
+	# Armed again only once the board has been up long enough to have
+	# survived the bring-up, not when the core reports itself started: a
+	# hang arrives after that, and re-arming before it turns one bad boot
+	# into every boot.
+	(sleep 120
+	 uci -q set nss-wifi.general.offload=1
+	 uci -q commit nss-wifi
+	 sync
+	 logger -t nss-wifi "offload armed again for the next boot") &
+}
+
+stop_service() {
+	echo "The Wi-Fi data path is chosen at probe; reboot to change it."
+}

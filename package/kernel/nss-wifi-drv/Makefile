@@ -16,6 +16,10 @@ define KernelPackage/nss-wifi-drv
   FILES:=$(PKG_BUILD_DIR)/nss-wifi-drv.ko
 endef
 
+define KernelPackage/nss-wifi-drv/conffiles
+/etc/config/nss-wifi
+endef
+
 define KernelPackage/nss-wifi-drv/description
   Boots the NSS firmware and speaks its message protocol, so the Wi-Fi
   data plane runs on the NSS cores instead of the host. Carries only what
@@ -40,6 +44,12 @@ define Build/InstallDev
 	$(INSTALL_DIR) $(1)/usr/include/nss-wifi-drv/linux/soc/qcom
 	$(CP) ./src/include/linux/soc/qcom/nss_wifi.h \
 		$(1)/usr/include/nss-wifi-drv/linux/soc/qcom/
+endef
+
+define KernelPackage/nss-wifi-drv/install
+	$(INSTALL_DIR) $(1)/etc/config $(1)/etc/init.d
+	$(INSTALL_CONF) ./files/nss-wifi.config $(1)/etc/config/nss-wifi
+	$(INSTALL_BIN) ./files/nss-wifi.init $(1)/etc/init.d/nss-wifi
 endef
 
 $(eval $(call KernelPackage,nss-wifi-drv))
