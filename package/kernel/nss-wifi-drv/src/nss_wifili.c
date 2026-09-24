@@ -46,11 +46,16 @@
  */
 #define NSS_WIFILI_TX_DESC		512
 
-/* One page for the descriptors and one for the extension descriptors: the two
- * kinds are carved at different strides out of whichever page each starts on,
- * so a shared page leaves one of the pools without one.
+/* The firmware carves both kinds out of the memory given here, at a stride
+ * of its own for each, and a block smaller than the declared count leads to
+ * a range trap. The size follows the count: every pool's descriptors plus one
+ * spare per pool.
  */
-#define NSS_WIFILI_TX_DESC_MEM		SZ_64K
+#define NSS_WIFILI_TX_DESC_STRIDE	80
+#define NSS_WIFILI_TX_DESC_EXT_STRIDE	160
+
+#define NSS_WIFILI_TX_DESC_MEM(pools, stride) \
+	PAGE_ALIGN(((NSS_WIFILI_TX_DESC + 1) * (pools)) * (stride))
 
 /* The receive buffer the hardware would be programmed with, and the tag block
  * in front of it. Both are bounds-checked by the firmware, which is why they
@@ -472,7 +477,8 @@ static int nss_wifili_alloc(struct nss_core *core, struct nss_wifili_ctx *w)
 	if (ret)
 		return ret;
 
-	return nss_wifili_mem_get(core, &w->txdesc, NSS_WIFILI_TX_DESC_MEM);
+	return nss_wifili_mem_get(core, &w->txdesc,
+				  NSS_WIFILI_TX_DESC_MEM(1, NSS_WIFILI_TX_DESC_STRIDE));
 }
 
 static void nss_wifili_arm(struct nss_core *core, struct seq_file *s,
@@ -1485,11 +1491,15 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 	 * host's to provide, so they are not part of what the WLAN driver
 	 * describes.
 	 */
-	ret = nss_wifili_mem_get(core, &w->txdesc, NSS_WIFILI_TX_DESC_MEM);
+	ret = nss_wifili_mem_get(core, &w->txdesc,
+				 NSS_WIFILI_TX_DESC_MEM(nss_wifili_pdevs,
+							NSS_WIFILI_TX_DESC_STRIDE));
 	if (ret)
 		goto out;
 
-	ret = nss_wifili_mem_get(core, &w->txdescext, NSS_WIFILI_TX_DESC_MEM);
+	ret = nss_wifili_mem_get(core, &w->txdescext,
+				 NSS_WIFILI_TX_DESC_MEM(nss_wifili_pdevs,
+							NSS_WIFILI_TX_DESC_EXT_STRIDE));
 	if (ret)
 		goto out;
 
