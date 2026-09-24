@@ -994,17 +994,21 @@ EXPORT_SYMBOL_GPL(nss_wifi_vdev_security);
  *
  * The firmware keeps its own record of a peer, in memory the host owns and
  * hands over by address, so a create is an allocation as much as a message.
- * How large that record is differs between firmware lines and the host writes
- * into it blind, so a whole page is given and the whole page is declared: a
- * firmware that checks the size is satisfied, and one that does not cannot
- * run past what was allocated.
+ * A peer block smaller than the record traps the core, and how large the
+ * record is differs between firmware lines. The block is therefore a
+ * parameter, and it is allocated generously: what is declared to the
+ * firmware is nothing.
  *
  * The address-search index and hash come from the WLAN firmware by way of the
  * peer map, so this runs after the driver has waited for that - which is what
  * makes every one of these sends an ordinary sleeping one and needs no
  * machinery for posting from a context that cannot sleep.
  */
-#define NSS_WIFILI_PEER_MEM	PAGE_SIZE
+static unsigned int nss_wifili_peer_mem = 2 * PAGE_SIZE;
+module_param_named(peer_mem, nss_wifili_peer_mem, uint, 0644);
+MODULE_PARM_DESC(peer_mem, "bytes given to the firmware for each peer record");
+
+#define NSS_WIFILI_PEER_MEM	nss_wifili_peer_mem
 
 struct nss_wifili_peer {
 	u16 peer_id;
@@ -1012,6 +1016,7 @@ struct nss_wifili_peer {
 	u8 mac[ETH_ALEN];
 	void *mem;
 	dma_addr_t dma;
+	size_t size;		/* what was allocated, not what is asked for now */
 };
 
 static struct nss_wifili_peer nss_wifili_peer_tbl[NSS_WIFILI_PEER_MAX];
@@ -1058,6 +1063,7 @@ int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
 	struct nss_wifili_peer_msg pm = {};
 	struct nss_core *core;
 	dma_addr_t dma;
+	size_t size;
 	void *mem;
 	int ret, i;
 
@@ -1085,8 +1091,8 @@ int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
 	if (i == ARRAY_SIZE(nss_wifili_peer_tbl))
 		return -ENOSPC;
 
-	mem = dma_alloc_coherent(core->dev, NSS_WIFILI_PEER_MEM, &dma,
-				 GFP_KERNEL);
+	size = NSS_WIFILI_PEER_MEM;
+	mem = dma_alloc_coherent(core->dev, size, &dma, GFP_KERNEL);
 	if (!mem)
 		return -ENOMEM;
 
@@ -1096,11 +1102,15 @@ int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
 	pm.hw_ast_idx = hw_ast_idx;
 	pm.tx_ast_hash = tx_ast_hash;
 	pm.nss_peer_mem = dma;
-	pm.peer_memory_size = NSS_WIFILI_PEER_MEM;
+
+	/* The working stack sends a size of 0. With a size declared, most
+	 * frames queued to the peer are dropped.
+	 */
+	pm.peer_memory_size = 0;
 
 	ret = nss_wifili_peer_msg(core, NSS_WIFILI_PEER_CREATE_MSG, &pm);
 	if (ret) {
-		dma_free_coherent(core->dev, NSS_WIFILI_PEER_MEM, mem, dma);
+		dma_free_coherent(core->dev, size, mem, dma);
 		return ret;
 	}
 
@@ -1116,6 +1126,7 @@ int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
 	ether_addr_copy(nss_wifili_peer_tbl[i].mac, mac);
 	nss_wifili_peer_tbl[i].mem = mem;
 	nss_wifili_peer_tbl[i].dma = dma;
+	nss_wifili_peer_tbl[i].size = size;
 
 	return 0;
 }
@@ -1145,7 +1156,7 @@ static void nss_wifili_peer_release(struct nss_core *core, int i)
 		 nss_wifili_peer_tbl[i].mac, nss_wifili_peer_tbl[i].peer_id,
 		 nss_wifili_peer_tbl[i].vdev_id);
 
-	dma_free_coherent(core->dev, NSS_WIFILI_PEER_MEM,
+	dma_free_coherent(core->dev, nss_wifili_peer_tbl[i].size,
 			  nss_wifili_peer_tbl[i].mem,
 			  nss_wifili_peer_tbl[i].dma);
 	nss_wifili_peer_tbl[i].mem = NULL;
@@ -1430,7 +1441,7 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 		struct nss_wifili_peer *p = &nss_wifili_peer_tbl[i];
 
 		if (p->mem)
-			dma_free_coherent(core->dev, NSS_WIFILI_PEER_MEM, p->mem, p->dma);
+			dma_free_coherent(core->dev, p->size, p->mem, p->dma);
 		p->mem = NULL;
 	}
 	for (i = 0; i < ARRAY_SIZE(nss_wifili_vdev_tbl); i++)
