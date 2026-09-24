@@ -55,6 +55,8 @@ struct nss_wifi_soc {
 	u16 rx_buf_len;
 	u8 num_tcl;
 	u8 num_reo;
+	/* Radios that follow with nss_wifi_pdev_register(). */
+	u8 num_pdevs;
 	struct nss_wifi_ring tcl[NSS_WIFI_MAX_TCL_RINGS];
 	struct nss_wifi_ring txcomp[NSS_WIFI_MAX_TCL_RINGS];
 	struct nss_wifi_ring reo_dest[NSS_WIFI_MAX_REO_RINGS];
@@ -70,6 +72,13 @@ struct nss_wifi_soc {
 	 */
 	void *priv;
 	void (*link_desc_return)(void *priv, const u32 *buf_addr_info);
+
+	/*
+	 * Stop and restart the WLAN hardware, unregistering and describing
+	 * the rings again on the way. The firmware's buffers sit in those
+	 * rings, so a firmware that stops is freed only behind this.
+	 */
+	void (*reset)(void *priv);
 };
 
 #if IS_REACHABLE(CONFIG_NSS_WIFI_DRV)

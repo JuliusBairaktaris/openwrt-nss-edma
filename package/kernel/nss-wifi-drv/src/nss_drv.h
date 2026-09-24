@@ -18,6 +18,7 @@
 #include <linux/skbuff.h>
 #include <linux/seq_file.h>
 #include <linux/types.h>
+#include <linux/workqueue.h>
 
 #include "nss_arch.h"
 #include "nss_def.h"
@@ -265,6 +266,8 @@ struct nss_msg {
 	dma_addr_t dma;
 	struct mutex lock;
 	struct completion done;
+	/* A timed-out request still owns the buffer. */
+	bool lost;
 };
 
 struct nss_core;
@@ -338,6 +341,16 @@ struct nss_core {
 	bool wifili_probed;
 	bool wifili_started;
 	bool clocks_on;
+	/* Asked to run: set and cleared through debugfs, cleared by faults. */
+	bool up;
+	/* Wi-Fi was started on this core, so a restart starts it again. */
+	bool wifi_on;
+	bool faulted;
+	u32 faults;
+	unsigned long fault_window;
+	struct work_struct restart;
+	/* Completed once no restart is pending; WLAN interfaces wait on it. */
+	struct completion resumed;
 	struct mutex lock;
 	struct dentry *debugfs;
 
@@ -381,6 +394,9 @@ int nss_meminfo_init(struct nss_core *core);
 void *nss_mem_alloc(struct nss_core *core, size_t size, u32 align,
 		    u32 *addr_out);
 void nss_mem_free_all(struct nss_core *core);
+void nss_core_stop(struct nss_core *core);
+void nss_core_fault(struct nss_core *core);
+void nss_core_resume(struct nss_core *core);
 int nss_rings_start(struct nss_core *core);
 void nss_iface_bind(struct nss_core *core);
 void nss_iface_unbind(struct nss_core *core);
@@ -396,6 +412,8 @@ void nss_msg_seen(struct nss_core *core, const struct nss_cmn_msg *ncm,
 		  u32 len);
 int nss_wifili_probe(struct nss_core *core, struct seq_file *s);
 int nss_wifili_start(struct seq_file *s);
+void nss_wifili_resume(struct nss_core *core);
+bool nss_wifili_reset(struct nss_core *core, bool started);
 int nss_wifili_tx(struct seq_file *s);
 void nss_msg_census(const struct nss_cmn_msg *ncm);
 void nss_msg_census_print(struct seq_file *s);

@@ -19,7 +19,6 @@
 #include <net/dsa.h>
 #include <linux/platform_device.h>
 #include <linux/seq_file.h>
-#include <linux/soc/qcom/qca_edma.h>
 #include <linux/spinlock.h>
 
 #include "nss_drv.h"
@@ -625,24 +624,16 @@ static int nss_poll_n2h(struct napi_struct *napi, int budget)
 
 /* A core that has dumped is finished. Stock brings the whole box down here,
  * on the argument that the data plane is gone either way; this driver keeps
- * the box up, because the host stack is still perfectly able to route and the
- * firmware log is worth more read than lost to a panic.
+ * the box routing on the host, reads the firmware log, and restarts the core.
  */
 static int nss_poll_coredump(struct napi_struct *napi, int budget)
 {
 	struct nss_irq_ctx *ctx = container_of(napi, struct nss_irq_ctx, napi);
 	struct nss_core *core = ctx->core;
 
-	core->running = false;
-	dev_err(core->dev, "core %u has crashed; leaving it stopped\n",
-		core->id);
+	dev_err(core->dev, "core %u has crashed\n", core->id);
 	nss_log_dump(core, "coredump");
-
-	/* The dead core no longer services the CPU-port queues it took. The
-	 * host takes them back here rather than at detach: keeping the box
-	 * routing through a firmware fault is why this driver does not panic.
-	 */
-	qca_edma_cpu_queues_to_host(core->conduit);
+	nss_core_fault(core);
 
 	napi_complete(napi);
 
@@ -696,6 +687,7 @@ int nss_rings_start(struct nss_core *core)
 	core->ndev = alloc_netdev_dummy(0);
 	if (!core->ndev)
 		return -ENOMEM;
+
 
 	for (i = 0; i < NSS_CAUSE_MAX; i++) {
 		struct nss_irq_ctx *ctx = &core->irq[i];

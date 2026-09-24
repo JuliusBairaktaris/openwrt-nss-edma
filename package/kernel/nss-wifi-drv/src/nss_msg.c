@@ -115,6 +115,7 @@ int nss_msg_send(struct nss_core *core, void *msg, size_t len)
 	struct nss_cmn_msg *ncm = msg;
 	struct nss_h2n_ring *ring = &core->h2n[NSS_H2N_RING_COMMAND];
 	struct nss_if_mem_map *map = core->if_map;
+	unsigned long timeout = msecs_to_jiffies(NSS_MSG_TIMEOUT_MS);
 	struct h2n_descriptor *desc;
 	u32 next;
 	int ret;
@@ -122,10 +123,16 @@ int nss_msg_send(struct nss_core *core, void *msg, size_t len)
 	if (len < sizeof(*ncm) || len > NSS_MSG_BUF_SIZE)
 		return -EMSGSIZE;
 
+	guard(mutex)(&core->msg.lock);
+
 	if (!core->running)
 		return -ENODEV;
 
-	guard(mutex)(&core->msg.lock);
+	if (core->msg.lost) {
+		if (!wait_for_completion_timeout(&core->msg.done, timeout))
+			return -ETIMEDOUT;
+		core->msg.lost = false;
+	}
 
 	/* The header is the layer's to fill: the length the firmware checks
 	 * excludes it, and getting that wrong is answered with a rejection
@@ -166,10 +173,10 @@ int nss_msg_send(struct nss_core *core, void *msg, size_t len)
 
 	nss_doorbell(core, NSS_H2N_INTR_DATA_CMD);
 
-	if (!wait_for_completion_timeout(&core->msg.done,
-					 msecs_to_jiffies(NSS_MSG_TIMEOUT_MS))) {
+	if (!wait_for_completion_timeout(&core->msg.done, timeout)) {
 		dev_err(core->dev, "interface %u type %u: no answer in %u ms\n",
 			ncm->interface, ncm->type, NSS_MSG_TIMEOUT_MS);
+		core->msg.lost = true;
 		return -ETIMEDOUT;
 	}
 
