@@ -242,6 +242,7 @@ static_assert(offsetof(struct nss_cmn_msg, cb) == 24);
 struct nss_skb_cb {
 	dma_addr_t dma;
 	bool tx;	/* a frame handed down, not a buffer handed over */
+	u32 slot;	/* where the lent-buffer table holds this one */
 };
 
 #define NSS_SKB_CB(skb) ((struct nss_skb_cb *)(skb)->cb)
@@ -398,9 +399,23 @@ struct nss_core {
 	u64 notify;
 	u64 tx_posted;
 	u64 tx_done;
+	u64 rx_desync;
 	u64 link_desc_seen;
 	u64 link_desc_returned;
 	atomic_t buffers_queued;
+	u64 tx_dup;		/* transmitted buffers the firmware returned again */
+
+	/* Every buffer lent to the firmware, so that halting the core can
+	 * take them back. The descriptor that lent one cannot be used for
+	 * that: the firmware holds far more buffers than a ring has entries,
+	 * so by the time it holds a poolful the descriptors that handed the
+	 * first ones over have been written many times since.
+	 */
+	struct sk_buff **lent;
+	u32 *lent_free;
+	u32 lent_free_n;
+	u32 lent_size;
+	spinlock_t lent_lock;
 	struct completion booted;
 
 	struct clk_bulk_data clks[];

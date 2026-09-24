@@ -852,6 +852,14 @@ static int nss_rx_show(struct seq_file *s, void *unused)
 		   core->notify, core->link_desc_seen,
 		   core->link_desc_returned, core->tx_posted, core->tx_done);
 
+	/* How many buffers the firmware is holding. It takes one per
+	 * accelerated connection, so a create rule refused for want of a
+	 * buffer is read here rather than inferred.
+	 */
+	seq_printf(s, "buffers in firmware custody: %d  desync: %llu\n",
+		   atomic_read(&core->buffers_queued), core->rx_desync);
+	seq_printf(s, "tx returned twice: %llu\n", core->tx_dup);
+
 	for (i = 0; i < core->ext_seen; i++) {
 		const struct nss_ext_seen *e = &core->ext[i];
 		int w;
