@@ -362,6 +362,7 @@ static void nss_core_halt(struct nss_core *core)
 	}
 	synchronize_net();
 	core->phys_armed = 0;
+	nss_flow_flush();
 
 	nss_log_shadow_stop(core);
 	nss_rings_stop(core);
@@ -1015,6 +1016,13 @@ static int nss_phys_get(void *data, u64 *val)
 
 DEFINE_DEBUGFS_ATTRIBUTE(nss_phys_fops, nss_phys_get, nss_phys_set, "%#llx\n");
 
+static int nss_flows_show(struct seq_file *s, void *unused)
+{
+	nss_flow_print(s);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(nss_flows);
+
 static void nss_aux_clocks_put(void *data)
 {
 	struct nss_core *core = data;
@@ -1201,6 +1209,7 @@ static int nss_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, core);
 	nss_wifili_bind(core);
+	nss_flow_bind(core);
 
 	core->debugfs = debugfs_create_dir(dev_name(dev), NULL);
 	debugfs_create_file("boot", 0600, core->debugfs, core, &nss_boot_fops);
@@ -1218,6 +1227,8 @@ static int nss_probe(struct platform_device *pdev)
 			    &nss_wifili_tx_fops);
 	debugfs_create_file("fw_ports", 0600, core->debugfs, core,
 			    &nss_phys_fops);
+	debugfs_create_file("flows", 0400, core->debugfs, core,
+			    &nss_flows_fops);
 
 	return 0;
 }
@@ -1227,6 +1238,7 @@ static void nss_remove(struct platform_device *pdev)
 	struct nss_core *core = platform_get_drvdata(pdev);
 
 	nss_wifili_bind(NULL);
+	nss_flow_bind(NULL);
 	debugfs_remove_recursive(core->debugfs);
 	WRITE_ONCE(core->up, false);
 	scoped_guard(mutex, &core->lock)
@@ -1253,7 +1265,33 @@ static struct platform_driver nss_driver = {
 		.of_match_table = nss_of_match,
 	},
 };
-module_platform_driver(nss_driver);
+
+/* The flow table's own state outlives any one core, and its registrations are
+ * per module rather than per device, so it is set up and torn down here rather
+ * than beside a device.
+ */
+static int __init nss_module_init(void)
+{
+	int ret;
+
+	ret = nss_flow_init();
+	if (ret)
+		return ret;
+
+	ret = platform_driver_register(&nss_driver);
+	if (ret)
+		nss_flow_exit();
+
+	return ret;
+}
+module_init(nss_module_init);
+
+static void __exit nss_module_exit(void)
+{
+	platform_driver_unregister(&nss_driver);
+	nss_flow_exit();
+}
+module_exit(nss_module_exit);
 
 MODULE_DESCRIPTION("NSS firmware host driver for the Wi-Fi data plane");
 MODULE_LICENSE("GPL");
