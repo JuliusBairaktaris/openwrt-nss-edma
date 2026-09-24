@@ -1626,6 +1626,25 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 		if (ret)
 			goto out;
 
+		/* Per-packet statistics, which the firmware raises as one
+		 * status message per frame and the host reads nowhere. Left
+		 * on they are the whole of the receive path's budget: fifteen
+		 * thousand of them a second arrive on the message ring beside
+		 * two thousand frames. The working stack turns them off here,
+		 * between initialising a radio and starting it.
+		 */
+		memset(m, 0, sizeof(*m));
+		m->cm.interface = NSS_INTERFACE_WIFILI;
+		m->cm.type = NSS_WIFILI_STATS_V2_CFG_MSG;
+		m->msg.scm.cfg = 0;
+		ret = nss_msg_send(core, m,
+				   offsetof(struct nss_wifili_msg, msg) +
+				   sizeof(m->msg.scm));
+		seq_printf(s, "radio %u v2stats: rc %d\n",
+			   nss_wifili_pdev[i].radio_id, ret);
+		if (ret)
+			goto out;
+
 		ret = nss_wifili_radio_buf_cfg(core, if_num,
 					       nss_wifili_radio_bufs);
 		seq_printf(s, "radio %u bufs:  rc %d (%u per range)\n",
