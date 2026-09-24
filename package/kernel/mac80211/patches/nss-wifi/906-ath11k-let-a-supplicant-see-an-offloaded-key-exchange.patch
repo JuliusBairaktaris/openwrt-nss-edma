@@ -19,7 +19,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
 ===================================================================
 --- backports-7.2.orig/drivers/net/wireless/ath/ath11k/mac.c
 +++ backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
-@@ -10793,6 +10793,25 @@ static int __ath11k_mac_register(struct
+@@ -10816,6 +10816,25 @@ static int __ath11k_mac_register(struct
  	    ab->hw_params.bios_sar_capa)
  		ar->hw->wiphy->sar_capa = ab->hw_params.bios_sar_capa;
  
