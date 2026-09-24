@@ -351,7 +351,6 @@ struct nss_core {
 	u32 id;
 	bool loaded;
 	bool running;
-	bool cpu_port_to_fw;
 	bool wifili_probed;
 	bool wifili_started;
 	bool clocks_on;
@@ -365,6 +364,10 @@ struct nss_core {
 	struct work_struct restart;
 	/* Completed once no restart is pending; WLAN interfaces wait on it. */
 	struct completion resumed;
+	unsigned long phys_armed;
+	/* Ports a halt left bound to the firmware's switch identities. */
+	unsigned long phys_stale;
+	struct work_struct arm;
 	/* Buffers the host lends this core, and the firmware's high-water
 	 * mark: the two are kept equal because the firmware hands back
 	 * whatever it holds above its mark.
@@ -461,6 +464,10 @@ void nss_wifili_vdev_notify(struct nss_core *core, const struct nss_cmn_msg *ncm
 void nss_wifili_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
 		       u32 len);
 void nss_wifili_bind(struct nss_core *core);
+int nss_phys_arm(struct nss_core *core, unsigned long mask);
+int nss_phys_msg(struct nss_core *core, int if_num, u32 type,
+		 const void *body, size_t len);
+void nss_phys_arm_ports(struct nss_core *core);
 int nss_log_show_ring(struct nss_core *core, struct seq_file *s);
 void nss_log_dump(struct nss_core *core, const char *why);
 int nss_log_shadow_init(struct nss_core *core);

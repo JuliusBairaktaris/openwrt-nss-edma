@@ -345,6 +345,7 @@ static void nss_core_halt(struct nss_core *core)
 		core->msg.lost = false;
 	}
 	synchronize_net();
+	core->phys_armed = 0;
 
 	nss_log_shadow_stop(core);
 	nss_rings_stop(core);
@@ -781,6 +782,13 @@ static void nss_core_restart(struct work_struct *work)
 	else if (!ret)
 		nss_wifili_resume(core);
 	complete_all(&core->resumed);
+
+	nss_phys_arm_ports(core);
+}
+
+static void nss_phys_work(struct work_struct *work)
+{
+	nss_phys_arm_ports(container_of(work, struct nss_core, arm));
 }
 
 static int nss_boot_set(void *data, u64 val)
@@ -808,6 +816,7 @@ static int nss_boot_set(void *data, u64 val)
 	if (ret)
 		return ret;
 
+	nss_phys_arm_ports(core);
 	/* The radios' interfaces registered with the last instance. */
 	nss_wifili_reset(core, false);
 
@@ -954,36 +963,41 @@ static int nss_wifili_tx_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(nss_wifili_tx);
 
-/* Leave the switch CPU port with the firmware instead of taking it back.
+/* Which switch ports the firmware routes through, as a mask of port indices.
  *
- * The two data planes share the block and which of them owns the port is a
- * runtime property, so it is one the host can set. Written before a core
- * boots, this leaves wired traffic arriving on the firmware's data queues,
- * which is the only way to exercise the exception path before there is a
- * radio to exception from.
+ * Arming a port is what puts its receive on the firmware's connection engines
+ * instead of on the host, so it is what a pushed rule needs to match anything,
+ * and it is a deliberate act for the same reason starting a core is.
  */
-static int nss_fwport_set(void *data, u64 val)
+static int nss_phys_set(void *data, u64 val)
+{
+	struct nss_core *core = data;
+	int ret;
+
+	/* Outside the core's own lock because the switch driver wants it
+	 * that way round, and arming a port is a call into the switch driver
+	 * as much as into the firmware.
+	 */
+	rtnl_lock();
+	mutex_lock(&core->lock);
+	ret = nss_phys_arm(core, val);
+	mutex_unlock(&core->lock);
+	rtnl_unlock();
+
+	return ret;
+}
+
+static int nss_phys_get(void *data, u64 *val)
 {
 	struct nss_core *core = data;
 
 	guard(mutex)(&core->lock);
-	core->cpu_port_to_fw = val;
+	*val = core->phys_armed;
 
 	return 0;
 }
 
-static int nss_fwport_get(void *data, u64 *val)
-{
-	struct nss_core *core = data;
-
-	guard(mutex)(&core->lock);
-	*val = core->cpu_port_to_fw;
-
-	return 0;
-}
-
-DEFINE_DEBUGFS_ATTRIBUTE(nss_fwport_fops, nss_fwport_get, nss_fwport_set,
-			 "%llu\n");
+DEFINE_DEBUGFS_ATTRIBUTE(nss_phys_fops, nss_phys_get, nss_phys_set, "%#llx\n");
 
 /* The region the core boots from is described once, on the node the two cores
  * share, and each core's load address points into it.
@@ -1047,6 +1061,7 @@ static int nss_probe(struct platform_device *pdev)
 	init_completion(&core->resumed);
 	complete_all(&core->resumed);
 	INIT_WORK(&core->restart, nss_core_restart);
+	INIT_WORK(&core->arm, nss_phys_work);
 	INIT_WORK(&core->edma_reset, nss_edma_reset_work);
 
 	ret = devm_mutex_init(dev, &core->lock);
@@ -1147,8 +1162,8 @@ static int nss_probe(struct platform_device *pdev)
 			    &nss_wifili_rx_fops);
 	debugfs_create_file("wifili_tx", 0400, core->debugfs, core,
 			    &nss_wifili_tx_fops);
-	debugfs_create_file("cpu_port_to_fw", 0600, core->debugfs, core,
-			    &nss_fwport_fops);
+	debugfs_create_file("fw_ports", 0600, core->debugfs, core,
+			    &nss_phys_fops);
 
 	return 0;
 }
@@ -1164,6 +1179,7 @@ static void nss_remove(struct platform_device *pdev)
 		nss_core_halt(core);
 	cancel_work_sync(&core->restart);
 	complete_all(&core->resumed);
+	flush_work(&core->arm);
 	flush_work(&core->edma_reset);
 	dev_put(core->conduit);
 	nss_clocks_disable(core);
