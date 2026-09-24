@@ -77,6 +77,11 @@ unsigned int nss_pool_ceiling(void);
 #define NSS_INTERFACE_N2H	156
 #define NSS_INTERFACE_ETH_RX	158
 #define NSS_INTERFACE_DYNAMIC	176
+/* The base virtual-device node, where the firmware keeps settings that
+ * belong to every virtual device rather than to one of them.
+ */
+#define NSS_INTERFACE_VAP_BASE	200
+
 #define NSS_INTERFACE_WIFILI	203
 #define NSS_INTERFACE_MAX	228
 

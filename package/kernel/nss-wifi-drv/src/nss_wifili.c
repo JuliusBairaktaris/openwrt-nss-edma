@@ -710,19 +710,6 @@ static int nss_wifili_vdev_msg(struct nss_core *core, int if_num, u32 type,
 	return ret;
 }
 
-/* Send a received frame to the host rather than into the firmware.
- *
- * A virtual device forwards what it receives to a next hop, and the one it is
- * created with is the firmware's own ethernet node - so a frame from a
- * station is handed to the firmware's wired path, where nothing has been told
- * about it, and is dropped. Nothing above ever sees it, which looks exactly
- * like a receive path that never started: a station associates, the
- * authentication exchange gets no reply, and no counter moves.
- *
- * Pointing the next hop at the node that hands frames to the host is what
- * makes everything arrive by exception, which is what this rung is. A rule
- * pushed into the firmware later is what takes a flow back off it.
- */
 static int nss_wifili_vdev_cmd(struct nss_core *core, int if_num, u32 cmd,
 			       u32 value)
 {
@@ -733,11 +720,23 @@ static int nss_wifili_vdev_cmd(struct nss_core *core, int if_num, u32 cmd,
 				   &c, sizeof(c));
 }
 
-static unsigned int nss_wifili_rx_next_hop = NSS_INTERFACE_N2H;
+static unsigned int nss_wifili_rx_next_hop = NSS_INTERFACE_ETH_RX;
 module_param_named(rx_next_hop, nss_wifili_rx_next_hop, uint, 0644);
-MODULE_PARM_DESC(rx_next_hop, "interface a virtual device forwards receive to, 0 to leave it as created");
+MODULE_PARM_DESC(rx_next_hop, "interface a virtual device forwards receive to, 156 for the host alone");
 
-static int nss_wifili_vdev_next_hop(struct nss_core *core, int if_num)
+/* Where a virtual device sends what it receives.
+ *
+ * The firmware's own ethernet node is what feeds its connection engines, so
+ * it is the only next hop a pushed rule can match on; a frame no rule claims
+ * leaves it for the host as an exception. The node that hands everything to
+ * the host is the exception path alone, kept selectable because it separates
+ * a receive path that does not start from a rule that does not match.
+ *
+ * Addressed to an allocated device, the message is answered without an error
+ * and the core traps seconds later. It is therefore sent once to the base
+ * virtual-device node, after the data plane starts, rather than per device.
+ */
+static int nss_wifili_vdev_next_hop(struct nss_core *core)
 {
 	struct nss_wifi_vdev_msg *v;
 	int ret;
@@ -749,7 +748,7 @@ static int nss_wifili_vdev_next_hop(struct nss_core *core, int if_num)
 	if (!v)
 		return -ENOMEM;
 
-	v->cm.interface = if_num;
+	v->cm.interface = NSS_INTERFACE_VAP_BASE;
 	v->cm.type = NSS_WIFI_VDEV_SET_NEXT_HOP;
 	v->msg.next_hop.ifnumber = nss_wifili_rx_next_hop;
 
@@ -836,8 +835,6 @@ int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
 		ret = nss_wifili_vdev_cmd(core, if_num,
 					  NSS_WIFI_VDEV_DECAP_TYPE_CMD,
 					  decap);
-	if (!ret)
-		ret = nss_wifili_vdev_next_hop(core, if_num);
 	if (!ret) {
 		struct nss_wifi_vdev_enable_msg up = {};
 
@@ -1676,6 +1673,9 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 		   m->cm.response, m->cm.error);
 	if (!ret) {
 		core->wifili_started = true;
+
+		ret = nss_wifili_vdev_next_hop(core);
+		seq_printf(s, "%-14s rc %d\n", "next hop:", ret);
 
 		/* Ask for the statistics push. The firmware raises no wifili
 		 * message at all until it is asked, so a receive path that
