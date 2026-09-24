@@ -77,6 +77,8 @@ unsigned int nss_pool_ceiling(void);
 /* Interface numbers the firmware dispatches on. */
 #define NSS_INTERFACE_N2H	156
 #define NSS_INTERFACE_ETH_RX	158
+#define NSS_INTERFACE_IPV4	161
+#define NSS_INTERFACE_IPV6	163
 #define NSS_INTERFACE_DYNAMIC	176
 /* The base virtual-device node, where the firmware keeps settings that
  * belong to every virtual device rather than to one of them.
@@ -449,6 +451,7 @@ int nss_data_send(struct nss_core *core, struct sk_buff *skb, u32 if_num);
 void nss_doorbell(struct nss_core *core, u32 intr);
 int nss_msg_init(struct nss_core *core);
 int nss_msg_send(struct nss_core *core, void *msg, size_t len);
+int nss_msg_transact(struct nss_core *core, void *msg, size_t len, size_t room);
 bool nss_msg_complete(struct nss_core *core, const struct n2h_descriptor *desc);
 int nss_msg_probe(struct nss_core *core, struct seq_file *s);
 void nss_msg_seen(struct nss_core *core, const struct nss_cmn_msg *ncm,
@@ -470,6 +473,11 @@ int nss_phys_arm(struct nss_core *core, unsigned long mask);
 int nss_phys_msg(struct nss_core *core, int if_num, u32 type,
 		 const void *body, size_t len);
 void nss_phys_arm_ports(struct nss_core *core);
+void nss_flow_bind(struct nss_core *core);
+void nss_flow_flush(void);
+void nss_flow_print(struct seq_file *s);
+int nss_flow_init(void);
+void nss_flow_exit(void);
 int nss_log_show_ring(struct nss_core *core, struct seq_file *s);
 void nss_log_dump(struct nss_core *core, const char *why);
 int nss_log_shadow_init(struct nss_core *core);
