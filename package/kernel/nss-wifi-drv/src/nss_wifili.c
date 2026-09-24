@@ -51,6 +51,8 @@
  * a range trap. The size follows the count: every pool's descriptors plus one
  * spare per pool.
  */
+#define NSS_WIFILI_TX_PROCESSQ		1024
+
 #define NSS_WIFILI_TX_DESC_STRIDE	80
 #define NSS_WIFILI_TX_DESC_EXT_STRIDE	160
 
@@ -1563,6 +1565,12 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 	m->msg.init.wtdim.ext_desc_page_num = 1;
 	m->msg.init.wtdim.num_tx_device_limit = NSS_WIFILI_TX_DESC *
 						nss_wifili_pdevs;
+
+	/* The queue the firmware hands transmit work between its own threads
+	 * on. Left at zero it is sized to nothing and written into anyway,
+	 * which the core answers with a range trap seconds after it starts.
+	 */
+	m->msg.init.tx_sw_internode_queue_size = NSS_WIFILI_TX_PROCESSQ;
 
 	m->msg.init.target_type = nss_wifili_soc.target_type;
 	m->msg.init.wrip.tlv_size = nss_wifili_soc.tlv_size;
