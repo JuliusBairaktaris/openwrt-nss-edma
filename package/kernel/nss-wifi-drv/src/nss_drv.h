@@ -53,6 +53,12 @@
 #define NSS_N2H_BUFFER_PACKET	3
 #define NSS_N2H_BUFFER_STATUS	6
 
+/* The hardware fills the named checksum on the way out; without these a
+ * frame the stack left for the device to finish leaves carrying only the
+ * pseudo-header sum.
+ */
+#define NSS_H2N_FLAG_GEN_IP_CHECKSUM	0x0001
+#define NSS_H2N_FLAG_GEN_L4_CHECKSUM	0x0002
 #define NSS_H2N_FLAG_FIRST_SEGMENT	0x0004
 #define NSS_H2N_FLAG_LAST_SEGMENT	0x0008
 /* The buffer may be kept rather than handed straight back. */
