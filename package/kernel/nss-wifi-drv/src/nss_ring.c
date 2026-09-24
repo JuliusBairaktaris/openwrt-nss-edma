@@ -264,6 +264,9 @@ int nss_data_send(struct nss_core *core, struct sk_buff *skb, u32 if_num)
 		desc->bit_flags = NSS_H2N_FLAG_FIRST_SEGMENT |
 				  NSS_H2N_FLAG_LAST_SEGMENT |
 				  (nss_tx_reusable ? NSS_H2N_FLAG_BUFFER_REUSABLE : 0);
+		if (skb->ip_summed == CHECKSUM_PARTIAL)
+			desc->bit_flags |= NSS_H2N_FLAG_GEN_IP_CHECKSUM |
+					   NSS_H2N_FLAG_GEN_L4_CHECKSUM;
 		desc->opaque = (uintptr_t)skb;
 
 		/* The first few descriptors, whatever built them. A frame this
