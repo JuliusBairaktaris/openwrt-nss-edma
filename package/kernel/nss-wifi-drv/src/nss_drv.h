@@ -64,6 +64,8 @@
 /* The buffer may be kept rather than handed straight back. */
 #define NSS_H2N_FLAG_BUFFER_REUSABLE	0x8000
 
+unsigned int nss_pool_ceiling(void);
+
 /* The firmware chooses its own offset inside a receive buffer, so the buffer
  * it is given is the head of the allocation and it reports where the payload
  * landed.
@@ -357,6 +359,11 @@ struct nss_core {
 	struct work_struct restart;
 	/* Completed once no restart is pending; WLAN interfaces wait on it. */
 	struct completion resumed;
+	/* Buffers the host lends this core, and the firmware's high-water
+	 * mark: the two are kept equal because the firmware hands back
+	 * whatever it holds above its mark.
+	 */
+	u32 pool_size;
 	struct mutex lock;
 	struct dentry *debugfs;
 
@@ -400,6 +407,7 @@ int nss_meminfo_init(struct nss_core *core);
 void *nss_mem_alloc(struct nss_core *core, size_t size, u32 align,
 		    u32 *addr_out);
 void nss_mem_free_all(struct nss_core *core);
+int nss_wifi_pool_set(struct nss_core *core, u32 payloads);
 void nss_core_stop(struct nss_core *core);
 void nss_core_fault(struct nss_core *core);
 void nss_core_resume(struct nss_core *core);

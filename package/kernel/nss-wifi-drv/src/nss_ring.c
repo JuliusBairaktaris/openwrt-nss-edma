@@ -188,12 +188,12 @@ static void nss_notify_recv(struct nss_core *core,
  * chain them and a chain the firmware reads wrongly is a fault rather than a
  * dropped frame.
  */
-/* Whether the firmware may keep the buffer a frame arrives in. A working host
- * driver of this firmware line offers every frame it hands to a virtual
- * device this way and this one did not, which is a difference worth being
- * able to measure rather than to argue about.
+/* Whether the firmware may keep the buffer a frame arrives in. A kept buffer
+ * counts against the firmware's high-water mark, which this driver holds
+ * equal to what it lends, and it comes back later under the same cookie
+ * carrying a received frame, which the completion path below frees unread.
  */
-static bool nss_tx_reusable = true;
+static bool nss_tx_reusable;
 module_param_named(tx_reusable, nss_tx_reusable, bool, 0644);
 MODULE_PARM_DESC(tx_reusable, "offer the firmware the buffer a frame arrives in");
 
@@ -467,6 +467,9 @@ static int nss_refill(struct nss_core *core, int budget)
 		struct sk_buff *skb;
 		dma_addr_t dma;
 
+		if (atomic_read(&core->buffers_queued) + filled >= core->pool_size)
+			break;
+
 		if (next == READ_ONCE(map->h2n_nss_index[NSS_H2N_RING_EMPTY_BUF]))
 			break;
 
@@ -530,7 +533,11 @@ static int nss_poll_sos(struct napi_struct *napi, int budget)
 	struct nss_core *core = ctx->core;
 
 	nss_check_booted(core);
-	nss_refill(core, min(budget, NSS_REFILL_BATCH));
+	/* Every free slot rather than a poll-sized batch. The firmware asks
+	 * when its own pool is low and takes what it needs, so a partial
+	 * answer leaves it short and it has to ask again.
+	 */
+	nss_refill(core, NSS_RING_ENTRIES);
 
 	napi_complete(napi);
 	enable_irq(ctx->irq);
@@ -614,8 +621,14 @@ static int nss_poll_n2h(struct napi_struct *napi, int budget)
 	if (done)
 		WRITE_ONCE(map->n2h_hlos_index[qid], ring->hlos_index);
 
-	/* Whatever came back leaves the firmware that much shorter. */
-	nss_refill(core, returned);
+	/* Top the ring up rather than replacing only what came back. The
+	 * firmware holds one buffer per connection it accelerates, for the
+	 * sync message that connection will send, so a pool kept level with
+	 * returns settles at a ring's worth and every create rule after that
+	 * is refused for want of a buffer. The ceiling is the host's, not the
+	 * firmware's, which takes whatever it is offered.
+	 */
+	nss_refill(core, NSS_RING_ENTRIES);
 
 	if (done < budget) {
 		napi_complete(napi);
