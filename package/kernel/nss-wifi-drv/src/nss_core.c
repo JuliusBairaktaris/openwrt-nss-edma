@@ -263,7 +263,18 @@ static void nss_core_release(struct nss_core *core)
 {
 	u32 val;
 
+	/* Start from the state a cold boot starts from, whatever the last
+	 * occupant left: both reset sets asserted and the fetch clamp on. A
+	 * release over half-reset state boots a core whose peripheral block
+	 * is dead, and the firmware then traps on its first access into it.
+	 */
+	writel(1, core->nphys + NSS_CORE_RESET_CTRL);
 	val = readl(core->misc_reset);
+	val |= (NSS_MISC_RESET_FIRST | NSS_MISC_RESET_SECOND) <<
+	       NSS_MISC_RESET_SHIFT(core->id);
+	writel(val, core->misc_reset);
+	usleep_range(10, 20);
+
 	val &= ~(NSS_MISC_RESET_FIRST << NSS_MISC_RESET_SHIFT(core->id));
 	writel(val, core->misc_reset);
 
@@ -320,6 +331,9 @@ static void nss_core_halt(struct nss_core *core)
 	val |= NSS_MISC_RESET_SECOND << NSS_MISC_RESET_SHIFT(core->id);
 	writel(val, core->misc_reset);
 
+	/* The same settle the release path needs between the two sets. */
+	usleep_range(10, 20);
+
 	val |= NSS_MISC_RESET_FIRST << NSS_MISC_RESET_SHIFT(core->id);
 	writel(val, core->misc_reset);
 
@@ -362,10 +376,8 @@ static int nss_core_boot(struct nss_core *core)
 	if (ret)
 		return ret;
 
-	/* The core executes out of its instruction memory and reads what it
-	 * finds there, whatever a previous occupant left behind. The window is
-	 * cleared through an uncached mapping, so what the core reads is what
-	 * was written with no cache maintenance to get right.
+	/* All of it, as a cold boot leaves it, not only what meminfo hands
+	 * out again.
 	 */
 	memset_io(core->imem, 0, core->imem_size);
 
