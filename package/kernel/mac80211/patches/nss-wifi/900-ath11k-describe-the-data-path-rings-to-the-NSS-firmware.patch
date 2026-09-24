@@ -15,13 +15,17 @@ address: the offsets this driver keeps are into its own mapping, and the
 firmware has no such mapping, so they go over with the register window's
 physical base added.
 
+The description also carries this driver's own hw-restart. The firmware's
+buffers sit in these rings, so a firmware that stops is freed only after
+the radios have stopped, and it restarts on the rings described next.
+
 Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 ---
-Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/dp.c
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp.c
 ===================================================================
---- backports-6.18.39.orig/drivers/net/wireless/ath/ath11k/dp.c
-+++ backports-6.18.39/drivers/net/wireless/ath/ath11k/dp.c
-@@ -15,6 +15,11 @@
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp.c
++++ backports-7.2/drivers/net/wireless/ath/ath11k/dp.c
+@@ -13,6 +13,18 @@
  #include "dp_rx.h"
  #include "peer.h"
  
@@ -30,10 +34,17 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/dp.c
 +
 +#define ATH11K_NSS_TARGET_IPQ8074	24
 +
++/* How much of a receive payload the firmware may use: the receive descriptor
++ * this hardware writes, a rounded pad, the widest 802.11 header with a mesh
++ * header and a SNAP header behind it, and 1500 bytes of ethernet payload. It
++ * is not the size of the buffer the payload sits in.
++ */
++#define ATH11K_NSS_RX_BUF_LEN		1816
++
  static void ath11k_dp_htt_htc_tx_complete(struct ath11k_base *ab,
  					  struct sk_buff *skb)
  {
-@@ -872,6 +877,142 @@ done:
+@@ -869,6 +881,162 @@ done:
  }
  EXPORT_SYMBOL(ath11k_dp_service_srng);
  
@@ -72,6 +83,16 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/dp.c
 +	r->hwreg[1] = reg_base + srng->hwreg_base[1];
 +}
 +
++/* ath11k's own hw-restart. The NSS firmware's buffers sit in these rings, so
++ * a firmware that stops is freed and started again behind it.
++ */
++static void ath11k_nss_reset(void *priv)
++{
++	struct ath11k_base *ab = priv;
++
++	queue_work(ab->workqueue_aux, &ab->reset_work);
++}
++
 +static void ath11k_nss_wifi_describe(struct ath11k_base *ab)
 +{
 +	struct ath11k_dp *dp = &ab->dp;
@@ -79,6 +100,10 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/dp.c
 +	struct resource *res;
 +	u32 reg_base;
 +	int i;
++
++	/* The NSS firmware drives only the radios inside the SoC. */
++	if (ab->hw_rev != ATH11K_HW_IPQ8074)
++		return;
 +
 +	res = platform_get_resource(to_platform_device(ab->dev),
 +				    IORESOURCE_MEM, 0);
@@ -101,9 +126,12 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/dp.c
 +	 */
 +	soc->target_type = ATH11K_NSS_TARGET_IPQ8074;
 +	soc->tlv_size = ab->hw_params.hal_desc_sz;
-+	soc->rx_buf_len = DP_RX_BUFFER_SIZE;
-+	soc->num_tcl = ab->hw_params.max_tx_ring;
++	soc->rx_buf_len = ATH11K_NSS_RX_BUF_LEN;
++	soc->num_tcl = ab->hw_params.hal_params->num_tx_rings;
 +	soc->num_reo = DP_REO_DST_RING_MAX;
++	soc->num_pdevs = ab->num_radios;
++	soc->priv = ab;
++	soc->reset = ath11k_nss_reset;
 +
 +	for (i = 0; i < soc->num_tcl; i++) {
 +		ath11k_nss_wifi_ring(&soc->tcl[i], ab,
@@ -147,6 +175,9 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/dp.c
 +	struct nss_wifi_pdev pdev = {};
 +	struct resource *res;
 +
++	if (ab->hw_rev != ATH11K_HW_IPQ8074)
++		return;
++
 +	res = platform_get_resource(to_platform_device(ab->dev),
 +				    IORESOURCE_MEM, 0);
 +	if (!res)
@@ -176,7 +207,7 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/dp.c
  void ath11k_dp_pdev_free(struct ath11k_base *ab)
  {
  	struct ath11k *ar;
-@@ -917,6 +1058,16 @@ int ath11k_dp_pdev_alloc(struct ath11k_b
+@@ -914,6 +1082,16 @@ int ath11k_dp_pdev_alloc(struct ath11k_b
  	int ret;
  	int i;
  
@@ -193,7 +224,7 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/dp.c
  	/* TODO:Per-pdev rx ring unlike tx ring which is mapped to different AC's */
  	for (i = 0; i < ab->num_radios; i++) {
  		ar = ab->pdevs[i].ar;
-@@ -932,6 +1083,8 @@ int ath11k_dp_pdev_alloc(struct ath11k_b
+@@ -929,6 +1107,8 @@ int ath11k_dp_pdev_alloc(struct ath11k_b
  				    i);
  			goto err;
  		}
@@ -202,12 +233,13 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/dp.c
  	}
  
  	return 0;
-@@ -1025,6 +1178,8 @@ static int ath11k_dp_tx_pending_cleanup(
- 
- void ath11k_dp_free(struct ath11k_base *ab)
- {
-+	nss_wifi_soc_unregister();
-+
+@@ -1025,6 +1205,9 @@ void ath11k_dp_free(struct ath11k_base *
  	struct ath11k_dp *dp = &ab->dp;
  	int i;
+ 
++	if (ab->hw_rev == ATH11K_HW_IPQ8074)
++		nss_wifi_soc_unregister();
++
+ 	ath11k_dp_link_desc_cleanup(ab, dp->link_desc_banks,
+ 				    HAL_WBM_IDLE_LINK, &dp->wbm_idle_ring);
  
