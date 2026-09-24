@@ -45,6 +45,7 @@
  * A descriptor is under 128 bytes, so this many still fit the page below.
  */
 #define NSS_WIFILI_TX_DESC		512
+#define NSS_WIFILI_TX_PROCESSQ		1024
 
 /* The firmware carves both kinds out of the memory given here, at a stride
  * of its own for each, and a block smaller than the declared count leads to
@@ -1521,6 +1522,9 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 	m->msg.init.wtdim.ext_desc_page_num = 1;
 	m->msg.init.wtdim.num_tx_device_limit = NSS_WIFILI_TX_DESC *
 						nss_wifili_pdevs;
+
+	/* Left at zero, the core takes a range trap seconds after it starts. */
+	m->msg.init.tx_sw_internode_queue_size = NSS_WIFILI_TX_PROCESSQ;
 
 	m->msg.init.target_type = nss_wifili_soc.target_type;
 	m->msg.init.wrip.tlv_size = nss_wifili_soc.tlv_size;
