@@ -1049,6 +1049,18 @@ EXPORT_SYMBOL_GPL(nss_wifi_vdev_security);
  * makes every one of these sends an ordinary sleeping one and needs no
  * machinery for posting from a context that cannot sleep.
  */
+/* Whether a station is registered with the firmware at all. Off, the data
+ * plane comes up with virtual devices and no peers, which is what separates a
+ * fault in the peer path from one in everything around it.
+ */
+static bool nss_wifili_peers = true;
+module_param_named(peers, nss_wifili_peers, bool, 0644);
+MODULE_PARM_DESC(peers, "register stations with the firmware");
+
+static bool nss_wifili_stats_push = true;
+module_param_named(stats_push, nss_wifili_stats_push, bool, 0644);
+MODULE_PARM_DESC(stats_push, "ask the firmware for its periodic statistics push");
+
 static unsigned int nss_wifili_peer_mem = 2 * PAGE_SIZE;
 module_param_named(peer_mem, nss_wifili_peer_mem, uint, 0644);
 MODULE_PARM_DESC(peer_mem, "bytes given to the firmware for each peer record");
@@ -1113,6 +1125,9 @@ int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
 	int ret, i;
 
 	guard(mutex)(&nss_wifili_lock);
+
+	if (!nss_wifili_peers)
+		return 0;
 
 	core = nss_wifili_core;
 	if (!core || !core->wifili_started)
@@ -1739,8 +1754,13 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 		 * message at all until it is asked, so a receive path that
 		 * never starts and one that starts and drops everything are
 		 * indistinguishable from the host; the counters in that push
-		 * are what tells them apart.
+		 * are what tells them apart. It is a diagnostic and nothing
+		 * on the data path depends on it, so it can be left off while
+		 * what the firmware does when asked is still in question.
 		 */
+		if (!nss_wifili_stats_push)
+			goto out;
+
 		memset(m, 0, sizeof(*m));
 		m->cm.interface = NSS_INTERFACE_WIFILI;
 		m->cm.type = NSS_WIFILI_STATS_CFG_MSG;
