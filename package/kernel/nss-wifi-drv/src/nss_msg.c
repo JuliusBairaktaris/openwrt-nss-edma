@@ -176,6 +176,7 @@ int nss_msg_send(struct nss_core *core, void *msg, size_t len)
 	ncm = core->msg.buf;
 	switch (ncm->response) {
 	case NSS_CMN_RESPONSE_ACK:
+	case NSS_CMN_RESPONSE_NOTIFY:	/* answered in the same buffer */
 		ret = 0;
 		break;
 	case NSS_CMN_RESPONSE_EMSG:

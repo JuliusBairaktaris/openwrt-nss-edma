@@ -595,6 +595,41 @@ int nss_wifi_pool_set(struct nss_core *core, u32 payloads)
 	return nss_msg_send(core, &wp, sizeof(wp));
 }
 
+/* The firmware reports its own load for clock scaling about a thousand times
+ * a second until told not to, and this driver scales nothing. It is told
+ * the rate the core already runs at, so the clock is not moved by this.
+ */
+#define NSS_INTERFACE_COREFREQ		175
+#define NSS_COREFREQ_CHANGE		1
+#define NSS_CLK_CORE			14
+
+struct nss_corefreq_msg {
+	struct nss_cmn_msg cm;
+	u32 frequency;
+	u32 start_or_end;
+	u32 stats_enable;
+	u32 freq_current;
+	s32 ack;
+};
+
+static void nss_core_stats_off(struct nss_core *core)
+{
+	struct nss_corefreq_msg m = {};
+	int ret;
+
+	/* stats_enable rides on the end-of-change message, as in qca-nss-drv's
+	 * nss_freq_change().
+	 */
+	m.cm.interface = NSS_INTERFACE_COREFREQ;
+	m.cm.type = NSS_COREFREQ_CHANGE;
+	m.frequency = clk_get_rate(core->clks[NSS_CLK_CORE].clk);
+	m.start_or_end = 1;
+	ret = nss_msg_send(core, &m, sizeof(m));
+
+	dev_info(core->dev, "load reports off at %u Hz: %d ack %d\n",
+		 m.frequency, ret, m.ack);
+}
+
 static int nss_core_boot(struct nss_core *core)
 {
 	int ret;
@@ -654,6 +689,7 @@ static int nss_core_boot(struct nss_core *core)
 
 	nss_pool_configure(core);
 	nss_pbuf_pool_add(core, nss_pbuf_bytes);
+	nss_core_stats_off(core);
 
 	return 0;
 
