@@ -133,12 +133,24 @@ static int nss_clocks_get(struct nss_core *core)
  */
 static int nss_clocks_enable(struct nss_core *core)
 {
-	int ret;
+	int i, ret;
 
 	if (!core->clocks_on) {
 		ret = clk_bulk_prepare_enable(NSS_CLK_FABRIC, core->clks);
 		if (ret)
 			return dev_err_probe(core->dev, ret, "fabric clocks\n");
+
+		for (i = 0; i < core->num_aux_clks; i++) {
+			ret = clk_prepare_enable(core->aux_clks[i]);
+			if (ret) {
+				while (--i >= 0)
+					clk_disable_unprepare(core->aux_clks[i]);
+				clk_bulk_disable_unprepare(NSS_CLK_FABRIC,
+							   core->clks);
+				return dev_err_probe(core->dev, ret,
+						     "shared clocks\n");
+			}
+		}
 
 		core->clocks_on = true;
 	}
@@ -152,9 +164,13 @@ static int nss_clocks_enable(struct nss_core *core)
 
 static void nss_clocks_disable(struct nss_core *core)
 {
+	int i;
+
 	if (!core->clocks_on)
 		return;
 
+	for (i = 0; i < core->num_aux_clks; i++)
+		clk_disable_unprepare(core->aux_clks[i]);
 	clk_bulk_disable_unprepare(NSS_CLK_FABRIC, core->clks);
 	core->clocks_on = false;
 }
@@ -999,6 +1015,44 @@ static int nss_phys_get(void *data, u64 *val)
 
 DEFINE_DEBUGFS_ATTRIBUTE(nss_phys_fops, nss_phys_get, nss_phys_set, "%#llx\n");
 
+static void nss_aux_clocks_put(void *data)
+{
+	struct nss_core *core = data;
+	int i;
+
+	for (i = 0; i < core->num_aux_clks; i++)
+		clk_put(core->aux_clks[i]);
+}
+
+/* Clocks the firmware needs that belong to neither core, on the shared node. */
+static int nss_aux_clocks_get(struct nss_core *core, struct device_node *cmn)
+{
+	int i, n;
+
+	n = of_count_phandle_with_args(cmn, "clocks", "#clock-cells");
+	if (n <= 0)
+		return 0;
+
+	core->aux_clks = devm_kcalloc(core->dev, n, sizeof(*core->aux_clks),
+				      GFP_KERNEL);
+	if (!core->aux_clks)
+		return -ENOMEM;
+
+	for (i = 0; i < n; i++) {
+		core->aux_clks[i] = of_clk_get(cmn, i);
+		if (IS_ERR(core->aux_clks[i])) {
+			int ret = PTR_ERR(core->aux_clks[i]);
+
+			core->num_aux_clks = i;
+			nss_aux_clocks_put(core);
+			return ret;
+		}
+	}
+	core->num_aux_clks = n;
+
+	return devm_add_action_or_reset(core->dev, nss_aux_clocks_put, core);
+}
+
 /* The region the core boots from is described once, on the node the two cores
  * share, and each core's load address points into it.
  */
@@ -1039,7 +1093,7 @@ static int nss_region_get(struct nss_core *core)
 	core->region_base = rmem->base;
 	core->region_size = rmem->size;
 
-	return 0;
+	return nss_aux_clocks_get(core, cmn);
 }
 
 static int nss_probe(struct platform_device *pdev)
