@@ -122,10 +122,10 @@ int nss_msg_send(struct nss_core *core, void *msg, size_t len)
 	if (len < sizeof(*ncm) || len > NSS_MSG_BUF_SIZE)
 		return -EMSGSIZE;
 
+	guard(mutex)(&core->msg.lock);
+
 	if (!core->running)
 		return -ENODEV;
-
-	guard(mutex)(&core->msg.lock);
 
 	/* The header is the layer's to fill: the length the firmware checks
 	 * excludes it, and getting that wrong is answered with a rejection

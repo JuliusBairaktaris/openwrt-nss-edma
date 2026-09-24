@@ -188,12 +188,27 @@ void nss_wifi_soc_unregister(void)
 	/* The WLAN driver is about to free the rings this reaches into, and a
 	 * receive poll that read the callback a moment ago is still holding
 	 * it, so the withdrawal is not complete until that poll has ended.
+	 *
+	 * A firmware started on those rings keeps reaping them after they are
+	 * freed and after they are allocated again for the next WLAN
+	 * instance, whose entries it then resolves against descriptors it
+	 * never issued. It is stopped with them.
 	 */
 	WRITE_ONCE(nss_wifili_soc.link_desc_return, NULL);
-	if (nss_wifili_core)
+	if (!nss_wifili_core)
+		return;
+	if (nss_wifili_core->wifili_started)
+		nss_core_stop(nss_wifili_core);
+	else
 		nss_rings_quiesce(nss_wifili_core);
 }
 EXPORT_SYMBOL_GPL(nss_wifi_soc_unregister);
+
+static bool nss_wifili_described(void)
+{
+	return nss_wifili_have_soc &&
+	       nss_wifili_pdevs == nss_wifili_soc.num_pdevs;
+}
 
 int nss_wifi_pdev_register(const struct nss_wifi_pdev *pdev)
 {
@@ -209,9 +224,34 @@ int nss_wifi_pdev_register(const struct nss_wifi_pdev *pdev)
 		pdev->rxdma.num_entries, pdev->rxdma.hwreg[0],
 		pdev->rxdma.hwreg[1], pdev->num_rx_swdesc);
 
+	/* After a reset of the WLAN driver, which is the last thing it does
+	 * before its interfaces come back.
+	 */
+	if (nss_wifili_core && nss_wifili_described())
+		nss_core_resume(nss_wifili_core);
+
 	return 0;
 }
 EXPORT_SYMBOL_GPL(nss_wifi_pdev_register);
+
+/* Reset the WLAN driver because the core runs Wi-Fi (@started): the radios
+ * hold buffers it lent, freed once they have stopped, and the reset halts the
+ * core on its way down. Or because a running core ran Wi-Fi before a halt:
+ * the reset is what registers the radios' interfaces with it.
+ */
+bool nss_wifili_reset(struct nss_core *core, bool started)
+{
+	guard(mutex)(&nss_wifili_lock);
+
+	if (!core->wifi_on || core->wifili_started != started ||
+	    (!started && !core->running) ||
+	    !nss_wifili_have_soc || !nss_wifili_soc.reset)
+		return false;
+
+	nss_wifili_soc.reset(nss_wifili_soc.priv);
+
+	return true;
+}
 
 /* The one message the firmware sends unasked that must be acted on.
  *
@@ -782,6 +822,13 @@ int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
 	struct nss_core *core;
 	int if_num, ret, i;
 
+	/* A core the WLAN driver's reset brings back is restarted behind it,
+	 * while the subsystem is already adding the interfaces again.
+	 */
+	core = READ_ONCE(nss_wifili_core);
+	if (core)
+		wait_for_completion_timeout(&core->resumed, 10 * HZ);
+
 	guard(mutex)(&nss_wifili_lock);
 
 	core = nss_wifili_core;
@@ -1339,17 +1386,16 @@ static unsigned int nss_wifili_mem_profile;
 module_param_named(mem_profile, nss_wifili_mem_profile, uint, 0644);
 MODULE_PARM_DESC(mem_profile, "memory profile the firmware sizes its pools from");
 
-int nss_wifili_start(struct seq_file *s)
+static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 {
 	struct nss_wifili_ctx *w;
 	struct nss_wifili_msg *m;
-	struct nss_core *core;
 	int i, ret;
 
-	guard(mutex)(&nss_wifili_lock);
+	/* Against a halt freeing the memory this hands over. */
+	guard(mutex)(&core->lock);
 
-	core = nss_wifili_core;
-	if (!core || !core->running)
+	if (!core->running)
 		return -ENODEV;
 
 	if (!nss_wifili_have_soc || !nss_wifili_pdevs) {
@@ -1594,4 +1640,30 @@ out:
 	kfree(m);
 
 	return 0;
+}
+
+int nss_wifili_start(struct seq_file *s)
+{
+	guard(mutex)(&nss_wifili_lock);
+
+	if (!nss_wifili_core)
+		return -ENODEV;
+
+	return nss_wifili_start_locked(nss_wifili_core, s);
+}
+
+/* Start Wi-Fi again on a core that ran it before it was restarted. */
+void nss_wifili_resume(struct nss_core *core)
+{
+	/* No buffer: what the start prints is discarded. */
+	struct seq_file s = {};
+
+	guard(mutex)(&nss_wifili_lock);
+
+	if (!core->wifi_on || core->wifili_started || !nss_wifili_described())
+		return;
+
+	nss_wifili_start_locked(core, &s);
+	dev_info(core->dev, "Wi-Fi data plane %s\n",
+		 core->wifili_started ? "restarted" : "did not restart");
 }

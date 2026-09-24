@@ -337,7 +337,12 @@ static void nss_core_halt(struct nss_core *core)
 	val |= NSS_MISC_RESET_FIRST << NSS_MISC_RESET_SHIFT(core->id);
 	writel(val, core->misc_reset);
 
-	core->running = false;
+	/* Wait out any message or frame already past its running check: the
+	 * rings and the lent table go below.
+	 */
+	scoped_guard(mutex, &core->msg.lock)
+		core->running = false;
+	synchronize_net();
 
 	nss_log_shadow_stop(core);
 	nss_rings_stop(core);
@@ -352,16 +357,17 @@ static void nss_core_halt(struct nss_core *core)
 	nss_mem_free_all(core);
 	clk_bulk_disable_unprepare(NSS_CLK_OWN, &core->clks[NSS_CLK_FABRIC]);
 
-	core->loaded = false;
 	core->wifili_probed = false;
 	core->wifili_started = false;
+	WRITE_ONCE(core->loaded, false);
+	wake_up_var(&core->loaded);
 }
 
 static int nss_core_boot(struct nss_core *core)
 {
 	int ret;
 
-	guard(mutex)(&core->lock);
+	lockdep_assert_held(&core->lock);
 
 	if (core->loaded)
 		return -EBUSY;
@@ -383,11 +389,11 @@ static int nss_core_boot(struct nss_core *core)
 
 	ret = nss_firmware_load(core);
 	if (ret)
-		return ret;
+		goto clk;
 
 	ret = nss_meminfo_init(core);
 	if (ret)
-		return ret;
+		goto free;
 
 	ret = nss_rings_start(core);
 	if (ret)
@@ -418,22 +424,117 @@ static int nss_core_boot(struct nss_core *core)
 
 free:
 	nss_mem_free_all(core);
+clk:
 	clk_bulk_disable_unprepare(NSS_CLK_OWN, &core->clks[NSS_CLK_FABRIC]);
 
 	return ret;
 }
 
+/* For the WLAN driver, whose rings the firmware reaps: they are about to go,
+ * and the firmware has no way to be told that short of stopping.
+ */
+void nss_core_stop(struct nss_core *core)
+{
+	guard(mutex)(&core->lock);
+	nss_core_halt(core);
+}
+
+/* A core that faults this often is left halted and the host routes. */
+#define NSS_FAULTS_MAX		3
+#define NSS_FAULT_WINDOW	(10 * 60 * HZ)
+#define NSS_HALT_TIMEOUT	(30 * HZ)
+
+/* A dead core is treated as stopped at once and halted from process context,
+ * because the halt sleeps.
+ */
+void nss_core_fault(struct nss_core *core)
+{
+	core->running = false;
+	qca_edma_cpu_queues_to_host(core->conduit);
+	core->faulted = true;
+	schedule_work(&core->restart);
+}
+
+/* The WLAN driver has described its rings again. */
+void nss_core_resume(struct nss_core *core)
+{
+	if (!READ_ONCE(core->up))
+		return;
+
+	reinit_completion(&core->resumed);
+	schedule_work(&core->restart);
+}
+
+static void nss_core_restart(struct work_struct *work)
+{
+	struct nss_core *core = container_of(work, struct nss_core, restart);
+	bool fault = core->faulted;
+	int ret = 0;
+
+	if (fault) {
+		core->faulted = false;
+
+		if (time_after(jiffies, core->fault_window)) {
+			core->faults = 0;
+			core->fault_window = jiffies + NSS_FAULT_WINDOW;
+		}
+		if (++core->faults > NSS_FAULTS_MAX) {
+			dev_err(core->dev, "core %u faulted %u times; leaving it halted\n",
+				core->id, core->faults);
+			WRITE_ONCE(core->up, false);
+		}
+
+		/* The radios still hold buffers the dead core lent them, so
+		 * the WLAN driver's reset halts it, and resumes it after.
+		 */
+		if (nss_wifili_reset(core, true))
+			return;
+
+		scoped_guard(mutex, &core->lock)
+			nss_core_halt(core);
+	}
+
+	nss_edma_settle(core);
+	scoped_guard(mutex, &core->lock)
+		if (READ_ONCE(core->up) && !core->loaded)
+			ret = nss_core_boot(core);
+	/* After a fault the radios' interfaces are registered with the dead
+	 * instance; after a WLAN reset they are about to register again.
+	 */
+	if (!ret && fault)
+		nss_wifili_reset(core, false);
+	else if (!ret)
+		nss_wifili_resume(core);
+	complete_all(&core->resumed);
+}
+
 static int nss_boot_set(void *data, u64 val)
 {
 	struct nss_core *core = data;
+	int ret = 0;
 
-	if (val) {
-		nss_edma_settle(core);
-		return nss_core_boot(core);
+	WRITE_ONCE(core->up, val);
+
+	if (!val) {
+		if (nss_wifili_reset(core, true) &&
+		    !wait_var_event_timeout(&core->loaded,
+					    !READ_ONCE(core->loaded),
+					    NSS_HALT_TIMEOUT))
+			return -ETIMEDOUT;
+
+		scoped_guard(mutex, &core->lock)
+			nss_core_halt(core);
+		return 0;
 	}
 
-	guard(mutex)(&core->lock);
-	nss_core_halt(core);
+	nss_edma_settle(core);
+	scoped_guard(mutex, &core->lock)
+		ret = nss_core_boot(core);
+	if (ret)
+		return ret;
+
+	/* The radios' interfaces registered with the last instance. */
+	nss_wifili_reset(core, false);
 
 	return 0;
 }
@@ -450,6 +551,21 @@ static int nss_boot_get(void *data, u64 *val)
 
 DEFINE_DEBUGFS_ATTRIBUTE(nss_boot_fops, nss_boot_get, nss_boot_set, "%llu\n");
 
+/* Bench: take the path a coredump takes, on a core that is still running. */
+static int nss_fault_set(void *data, u64 val)
+{
+	struct nss_core *core = data;
+
+	guard(mutex)(&core->lock);
+	if (!core->running)
+		return -ENODEV;
+	nss_core_fault(core);
+
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(nss_fault_fops, NULL, nss_fault_set, "%llu\n");
+
 static int nss_log_show(struct seq_file *s, void *unused)
 {
 	struct nss_core *core = s->private;
@@ -464,6 +580,7 @@ static int nss_probe_show(struct seq_file *s, void *unused)
 {
 	struct nss_core *core = s->private;
 
+	guard(mutex)(&core->lock);
 	if (!core->running)
 		return -ENODEV;
 
@@ -480,6 +597,8 @@ static int nss_rx_show(struct seq_file *s, void *unused)
 {
 	struct nss_core *core = s->private;
 	int i;
+
+	guard(mutex)(&core->lock);
 
 	for (i = 0; i < ARRAY_SIZE(core->rx_type); i++)
 		if (core->rx_type[i])
@@ -642,7 +761,9 @@ static int nss_probe(struct platform_device *pdev)
 	core->dev = dev;
 	INIT_LIST_HEAD(&core->allocs);
 	init_completion(&core->booted);
-
+	init_completion(&core->resumed);
+	complete_all(&core->resumed);
+	INIT_WORK(&core->restart, nss_core_restart);
 	INIT_WORK(&core->edma_reset, nss_edma_reset_work);
 
 	ret = devm_mutex_init(dev, &core->lock);
@@ -731,6 +852,7 @@ static int nss_probe(struct platform_device *pdev)
 
 	core->debugfs = debugfs_create_dir(dev_name(dev), NULL);
 	debugfs_create_file("boot", 0600, core->debugfs, core, &nss_boot_fops);
+	debugfs_create_file("fault", 0200, core->debugfs, core, &nss_fault_fops);
 	debugfs_create_file("log", 0400, core->debugfs, core, &nss_log_fops);
 	debugfs_create_file("msg_probe", 0400, core->debugfs, core,
 			    &nss_probe_fops);
@@ -754,7 +876,11 @@ static void nss_remove(struct platform_device *pdev)
 
 	nss_wifili_bind(NULL);
 	debugfs_remove_recursive(core->debugfs);
-	nss_core_halt(core);
+	WRITE_ONCE(core->up, false);
+	scoped_guard(mutex, &core->lock)
+		nss_core_halt(core);
+	cancel_work_sync(&core->restart);
+	complete_all(&core->resumed);
 	flush_work(&core->edma_reset);
 	dev_put(core->conduit);
 	nss_clocks_disable(core);
