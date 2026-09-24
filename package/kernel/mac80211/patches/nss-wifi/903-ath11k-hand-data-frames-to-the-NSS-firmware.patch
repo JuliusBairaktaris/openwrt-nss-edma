@@ -17,13 +17,23 @@ The interface number the registration returns is what a transmitted frame
 is addressed to, so it is kept with the interface rather than looked up per
 frame.
 
+The firmware returns a frame with no transmit status, and the control block
+the subsystem reports against is overwritten on the way down. A frame that
+asks for a status is reported unacknowledged at the divert and a clone is
+sent instead, so its ack-status entry is released.
+
+The firmware also hands up frames the hardware did not decapsulate, such
+as a block ack request from a station, on the same path as ethernet. The
+receive descriptor at the head of the buffer gives the format, and such a
+frame goes to mac80211 as 802.11, as on the host receive path.
+
 Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 ---
-Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/core.h
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/core.h
 ===================================================================
---- backports-6.18.39.orig/drivers/net/wireless/ath/ath11k/core.h
-+++ backports-6.18.39/drivers/net/wireless/ath/ath11k/core.h
-@@ -66,6 +66,7 @@ extern bool ath11k_nss_offload;
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/core.h
++++ backports-7.2/drivers/net/wireless/ath/ath11k/core.h
+@@ -67,6 +67,7 @@ extern bool ath11k_nss_offload;
  extern bool ath11k_nss_prefill;
  extern bool ath11k_nss_hash;
  extern bool ath11k_nss_keep_mask;
@@ -31,7 +41,7 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/core.h
  
  #define ATH11K_SCAN_TIMEOUT_HZ (20 * HZ)
  
-@@ -377,6 +378,9 @@ struct ath11k_vif {
+@@ -378,6 +379,9 @@ struct ath11k_vif {
  	u8 hal_addr_search_flags;
  	u8 search_type;
  
@@ -41,10 +51,10 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/core.h
  	struct ath11k *ar;
  	struct ieee80211_vif *vif;
  
-Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/mac.c
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
 ===================================================================
---- backports-6.18.39.orig/drivers/net/wireless/ath/ath11k/mac.c
-+++ backports-6.18.39/drivers/net/wireless/ath/ath11k/mac.c
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/mac.c
++++ backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
 @@ -5,6 +5,7 @@
   */
  
@@ -53,7 +63,7 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/mac.c
  #include <net/cfg80211.h>
  #include <linux/etherdevice.h>
  #include <linux/bitfield.h>
-@@ -6216,14 +6217,34 @@ static void ath11k_mac_op_tx(struct ieee
+@@ -6546,14 +6547,57 @@ static void ath11k_mac_op_tx(struct ieee
  		return;
  	}
  
@@ -84,18 +94,41 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/mac.c
 +	 * which is what makes the check it performs vacuous rather than
 +	 * wrong.
  	 */
--	if (ath11k_nss_offload) {
+-	if (ar->ab->nss_offload) {
 -		ieee80211_free_txskb(ar->hw, skb);
-+	if (ath11k_nss_offload && !ath11k_nss_host_tx) {
-+		if ((!(info_flags & IEEE80211_TX_CTL_HW_80211_ENCAP) &&
-+		     ieee80211_data_to_8023(skb, hdr->addr1,
-+					    NL80211_IFTYPE_STATION)) ||
-+		    nss_wifi_vdev_tx(arvif->nss_ifnum, skb))
++	if (ar->ab->nss_offload && !ath11k_nss_host_tx) {
++		struct sk_buff *orig = skb;
++
++		if (!(info_flags & IEEE80211_TX_CTL_HW_80211_ENCAP) &&
++		    ieee80211_data_to_8023(skb, hdr->addr1,
++					   NL80211_IFTYPE_STATION)) {
 +			ieee80211_free_txskb(ar->hw, skb);
++			return;
++		}
++
++		/* The firmware returns a frame without saying whether it was
++		 * acknowledged, and the control block holding the status
++		 * request is overwritten on the way down. A frame that asks
++		 * for a status is reported unacknowledged now and a clone is
++		 * sent.
++		 */
++		if (info_flags & IEEE80211_TX_CTL_REQ_TX_STATUS) {
++			skb = skb_clone(orig, GFP_ATOMIC);
++			ieee80211_free_txskb(ar->hw, orig);
++			if (!skb)
++				return;
++		}
++
++		if (nss_wifi_vdev_tx(arvif->nss_ifnum, skb)) {
++			if (skb == orig)
++				ieee80211_free_txskb(ar->hw, skb);
++			else
++				dev_kfree_skb_any(skb);
++		}
  		return;
  	}
  
-@@ -6551,6 +6572,56 @@ static int ath11k_mac_setup_vdev_create_
+@@ -6881,6 +6925,56 @@ static int ath11k_mac_setup_vdev_create_
  	return 0;
  }
  
@@ -152,7 +185,7 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/mac.c
  static void ath11k_mac_op_update_vif_offload(struct ieee80211_hw *hw,
  					     struct ieee80211_vif *vif)
  {
-@@ -6797,6 +6868,7 @@ static int ath11k_mac_op_add_interface(s
+@@ -7127,6 +7221,7 @@ static int ath11k_mac_op_add_interface(s
  
  	arvif->ar = ar;
  	arvif->vif = vif;
@@ -160,17 +193,17 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/mac.c
  
  	INIT_LIST_HEAD(&arvif->list);
  	INIT_WORK(&arvif->bcn_tx_work, ath11k_mac_bcn_tx_work);
-@@ -6882,6 +6954,9 @@ static int ath11k_mac_op_add_interface(s
+@@ -7212,6 +7307,9 @@ static int ath11k_mac_op_add_interface(s
  
  	ath11k_mac_op_update_vif_offload(hw, vif);
  
-+	if (ath11k_nss_offload)
++	if (ab->nss_offload)
 +		ath11k_nss_vdev_register(arvif, vif);
 +
  	nss = get_num_chains(ar->cfg_tx_chainmask) ? : 1;
  	ret = ath11k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id,
  					    WMI_VDEV_PARAM_NSS, nss);
-@@ -7064,6 +7139,17 @@ static void ath11k_mac_op_remove_interfa
+@@ -7394,6 +7492,17 @@ static void ath11k_mac_op_remove_interfa
  				    arvif->vdev_id, ret);
  	}
  
@@ -188,18 +221,104 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/mac.c
  	ret = ath11k_mac_vdev_delete(ar, arvif);
  	if (ret) {
  		ath11k_warn(ab, "failed to delete vdev %d: %d\n",
-Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/core.c
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/core.c
 ===================================================================
---- backports-6.18.39.orig/drivers/net/wireless/ath/ath11k/core.c
-+++ backports-6.18.39/drivers/net/wireless/ath/ath11k/core.c
-@@ -43,7 +43,11 @@ bool ath11k_nss_offload;
- module_param_named(nss_offload, ath11k_nss_offload, bool, 0444);
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/core.c
++++ backports-7.2/drivers/net/wireless/ath/ath11k/core.c
+@@ -42,6 +42,10 @@ bool ath11k_nss_offload;
+ module_param_named(nss_offload, ath11k_nss_offload, bool, 0644);
  MODULE_PARM_DESC(nss_offload, "Hand the data-path rings to the NSS firmware");
  
 +bool ath11k_nss_host_tx;
-+module_param_named(nss_host_tx, ath11k_nss_host_tx, bool, 0444);
++module_param_named(nss_host_tx, ath11k_nss_host_tx, bool, 0644);
 +MODULE_PARM_DESC(nss_host_tx, "Transmit from here rather than through the firmware");
 +
  bool ath11k_nss_keep_mask;
- module_param_named(nss_keep_mask, ath11k_nss_keep_mask, bool, 0444);
+ module_param_named(nss_keep_mask, ath11k_nss_keep_mask, bool, 0644);
  MODULE_PARM_DESC(nss_keep_mask, "Leave the ring mask alone while offloading");
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp.c
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp.c
++++ backports-7.2/drivers/net/wireless/ath/ath11k/dp.c
+@@ -989,6 +989,7 @@ static void ath11k_nss_wifi_describe(str
+ 	soc->priv = ab;
+ 	soc->reset = ath11k_nss_reset;
+ 	soc->link_desc_return = ath11k_nss_link_desc_return;
++	soc->rx_80211 = ath11k_dp_rx_nss_80211;
+ 
+ 	for (i = 0; i < soc->num_tcl; i++) {
+ 		ath11k_nss_wifi_ring(&soc->tcl[i], ab,
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp_rx.c
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp_rx.c
++++ backports-7.2/drivers/net/wireless/ath/ath11k/dp_rx.c
+@@ -2506,6 +2506,55 @@ static void ath11k_dp_rx_deliver_msdu(st
+ 	ieee80211_rx_napi(ar->hw, pubsta, msdu, napi);
+ }
+ 
++/* A frame the NSS firmware hands back as 802.11, with the receive
++ * descriptor the hardware wrote still at the head of the buffer.
++ */
++void ath11k_dp_rx_from_nss(struct ath11k *ar, struct sk_buff *msdu,
++			   struct napi_struct *napi)
++{
++	struct ath11k_skb_rxcb *rxcb = ATH11K_SKB_RXCB(msdu);
++	struct ieee80211_rx_status rx_status = {};
++
++	memset(rxcb, 0, sizeof(*rxcb));
++	rxcb->rx_desc = (struct hal_rx_desc *)msdu->head;
++	rxcb->is_first_msdu = true;
++	rxcb->is_last_msdu = true;
++
++	ath11k_dp_rx_h_ppdu(ar, rxcb->rx_desc, &rx_status);
++	ath11k_dp_rx_h_mpdu(ar, msdu, rxcb->rx_desc, &rx_status);
++
++	rx_status.flag |= RX_FLAG_SKIP_MONITOR | RX_FLAG_DUP_VALIDATED;
++
++	ath11k_dp_rx_deliver_msdu(ar, napi, msdu, &rx_status);
++}
++
++/* The NSS firmware hands up a frame the hardware did not decapsulate, such
++ * as a block ack request, on the same path as ethernet. It goes to mac80211
++ * as on the host's own receive path.
++ */
++bool ath11k_dp_rx_nss_80211(void *priv, struct net_device *dev,
++			    struct sk_buff *msdu, struct napi_struct *napi)
++{
++	struct hal_rx_desc *desc = (struct hal_rx_desc *)msdu->head;
++	struct ieee80211_vif *vif;
++
++	switch (ath11k_dp_rx_h_msdu_start_decap_type(priv, desc)) {
++	case DP_RX_DECAP_TYPE_RAW:
++	case DP_RX_DECAP_TYPE_NATIVE_WIFI:
++		break;
++	default:
++		return false;
++	}
++
++	vif = wdev_to_ieee80211_vif(dev->ieee80211_ptr);
++	if (vif)
++		ath11k_dp_rx_from_nss(ath11k_vif_to_arvif(vif)->ar, msdu, napi);
++	else
++		dev_kfree_skb_any(msdu);
++
++	return true;
++}
++
+ static bool ath11k_dp_rx_check_nwifi_hdr_len_valid(struct ath11k_base *ab,
+ 						   struct hal_rx_desc *rx_desc,
+ 						   struct sk_buff *msdu)
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp_rx.h
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp_rx.h
++++ backports-7.2/drivers/net/wireless/ath/ath11k/dp_rx.h
+@@ -100,4 +100,9 @@ int ath11k_dp_rx_pktlog_stop(struct ath1
+ 
+ int ath11k_dp_rx_crypto_mic_len(struct ath11k *ar, enum hal_encrypt_type enctype);
+ 
++void ath11k_dp_rx_from_nss(struct ath11k *ar, struct sk_buff *msdu,
++			   struct napi_struct *napi);
++bool ath11k_dp_rx_nss_80211(void *priv, struct net_device *dev,
++			    struct sk_buff *msdu, struct napi_struct *napi);
++
+ #endif /* ATH11K_DP_RX_H */

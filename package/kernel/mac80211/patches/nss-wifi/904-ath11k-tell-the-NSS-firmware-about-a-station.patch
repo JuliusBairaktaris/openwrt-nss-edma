@@ -16,10 +16,10 @@ has to leave a context that cannot sleep.
 
 Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 ---
-Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/peer.c
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/peer.c
 ===================================================================
---- backports-6.18.39.orig/drivers/net/wireless/ath/ath11k/peer.c
-+++ backports-6.18.39/drivers/net/wireless/ath/ath11k/peer.c
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/peer.c
++++ backports-7.2/drivers/net/wireless/ath/ath11k/peer.c
 @@ -5,6 +5,8 @@
   */
  
@@ -37,7 +37,7 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/peer.c
 +	 * identifier the host record carries and that record is gone by the
 +	 * time the unmap event runs.
 +	 */
-+	if (ath11k_nss_offload) {
++	if (ar->ab->nss_offload) {
 +		struct ath11k_peer *peer;
 +		u16 peer_id = 0;
 +
@@ -78,7 +78,7 @@ Index: backports-6.18.39/drivers/net/wireless/ath/ath11k/peer.c
 +	 * the record was held, and the record cannot go before this returns:
 +	 * the delete runs under the mutex this call already holds.
 +	 */
-+	if (ath11k_nss_offload) {
++	if (ar->ab->nss_offload) {
 +		/* A firmware that will not take the peer is a peer that is not
 +		 * offloaded, not a peer that may not exist. Failing the
 +		 * creation here deletes it, and for an access point's own
