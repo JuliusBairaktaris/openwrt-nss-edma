@@ -364,6 +364,9 @@ struct nss_core {
 	 * whatever it holds above its mark.
 	 */
 	u32 pool_size;
+	void **pbuf_page;
+	dma_addr_t *pbuf_dma;
+	u32 pbuf_pages;
 	struct mutex lock;
 	struct dentry *debugfs;
 
@@ -408,6 +411,7 @@ void *nss_mem_alloc(struct nss_core *core, size_t size, u32 align,
 		    u32 *addr_out);
 void nss_mem_free_all(struct nss_core *core);
 int nss_wifi_pool_set(struct nss_core *core, u32 payloads);
+void nss_pbuf_pool_free(struct nss_core *core);
 void nss_core_stop(struct nss_core *core);
 void nss_core_fault(struct nss_core *core);
 void nss_core_resume(struct nss_core *core);

@@ -356,6 +356,7 @@ static void nss_core_halt(struct nss_core *core)
 	 */
 	schedule_work(&core->edma_reset);
 
+	nss_pbuf_pool_free(core);
 	nss_mem_free_all(core);
 	clk_bulk_disable_unprepare(NSS_CLK_OWN, &core->clks[NSS_CLK_FABRIC]);
 
@@ -473,6 +474,115 @@ static void nss_pool_configure(struct nss_core *core)
 		 be32_to_cpu(p.high_water), ret);
 }
 
+/* Memory the firmware carves its own packet descriptors out of.
+ *
+ * Without extra pbuf pages a radio's receive ring stops filling short of full,
+ * with no error reported. Pages lent with N2H_ADD_BUF_POOL, as qca-nss-drv's
+ * extra_pbuf setting does, let it fill.
+ *
+ * The pages are the firmware's for as long as the core runs. They are mapped
+ * for the device and never touched again by the host, and they go back only
+ * once the core is in reset.
+ */
+#define NSS_N2H_ADD_BUF_POOL		5
+#define NSS_N2H_PAGES_PER_MSG		32
+
+struct nss_n2h_buf_pool {
+	struct nss_cmn_msg cm;
+	u32 page_size;
+	u32 num_pages;
+	u32 addr[NSS_N2H_PAGES_PER_MSG];
+	/* 64-bit entries, as in qca-nss-drv's nss_n2h_buf_pool. */
+	u64 vaddr[NSS_N2H_PAGES_PER_MSG];
+};
+
+static unsigned int nss_pbuf_bytes = 3100000;
+module_param_named(pbuf_bytes, nss_pbuf_bytes, uint, 0644);
+MODULE_PARM_DESC(pbuf_bytes, "memory lent for the firmware's packet descriptors");
+
+void nss_pbuf_pool_free(struct nss_core *core)
+{
+	u32 i;
+
+	for (i = 0; i < core->pbuf_pages; i++) {
+		dma_unmap_single(core->dev, core->pbuf_dma[i], PAGE_SIZE,
+				 DMA_BIDIRECTIONAL);
+		kfree(core->pbuf_page[i]);
+	}
+
+	kfree(core->pbuf_page);
+	kfree(core->pbuf_dma);
+	core->pbuf_page = NULL;
+	core->pbuf_dma = NULL;
+	core->pbuf_pages = 0;
+}
+
+static int nss_pbuf_pool_add(struct nss_core *core, size_t bytes)
+{
+	u32 want = DIV_ROUND_UP(bytes, PAGE_SIZE);
+	struct nss_n2h_buf_pool *m;
+	int ret = 0;
+
+	if (!want)
+		return 0;
+
+	core->pbuf_page = kcalloc(want, sizeof(*core->pbuf_page), GFP_KERNEL);
+	core->pbuf_dma = kcalloc(want, sizeof(*core->pbuf_dma), GFP_KERNEL);
+	m = kzalloc(sizeof(*m), GFP_KERNEL);
+	if (!core->pbuf_page || !core->pbuf_dma || !m) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	while (core->pbuf_pages < want) {
+		u32 n = 0;
+
+		memset(m, 0, sizeof(*m));
+		m->cm.interface = NSS_INTERFACE_N2H;
+		m->cm.type = NSS_N2H_ADD_BUF_POOL;
+		m->page_size = PAGE_SIZE;
+
+		while (n < NSS_N2H_PAGES_PER_MSG && core->pbuf_pages < want) {
+			void *page = kzalloc(PAGE_SIZE, GFP_KERNEL);
+			dma_addr_t dma;
+
+			if (!page)
+				break;
+
+			dma = dma_map_single(core->dev, page, PAGE_SIZE,
+					     DMA_BIDIRECTIONAL);
+			if (dma_mapping_error(core->dev, dma)) {
+				kfree(page);
+				break;
+			}
+
+			m->addr[n] = dma;
+			core->pbuf_page[core->pbuf_pages] = page;
+			core->pbuf_dma[core->pbuf_pages] = dma;
+			core->pbuf_pages++;
+			n++;
+		}
+
+		if (!n) {
+			ret = -ENOMEM;
+			break;
+		}
+
+		m->num_pages = n;
+		ret = nss_msg_send(core, m, sizeof(*m));
+		if (ret)
+			break;
+	}
+
+	dev_info(core->dev, "packet descriptors: %u pages of %lu lent: %d\n",
+		 core->pbuf_pages, PAGE_SIZE, ret);
+out:
+	/* Pages already lent stay lent: they go back when the core halts. */
+	kfree(m);
+
+	return ret;
+}
+
 /* Payloads the firmware keeps for the Wi-Fi data plane.
  *
  * Without NSS_N2H_WIFI_POOL_BUF_CFG the radio receive rings stay empty
@@ -547,6 +657,7 @@ static int nss_core_boot(struct nss_core *core)
 	}
 
 	nss_pool_configure(core);
+	nss_pbuf_pool_add(core, nss_pbuf_bytes);
 
 	return 0;
 
