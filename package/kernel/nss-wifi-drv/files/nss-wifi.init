@@ -1,0 +1,133 @@
+#!/bin/sh /etc/rc.common
+# START and USE_PROCD are read by /etc/rc.common, not by this file.
+# shellcheck disable=SC2034
+# Wi-Fi data-path decision, made once before netifd builds the topology.
+#
+# The radios bind their data path at probe and never rebind, so which path
+# they take is a module parameter and not a runtime switch: it has to be
+# decided before the WLAN driver loads. That is the whole reason this service
+# exists, and it is why the bus module carries no autoload - unloading and
+# reloading the WLAN driver to change the decision is what wedges the board.
+#
+# The decision is on by default and turned off with:
+#   uci set nss-wifi.general.offload='0'; uci commit nss-wifi
+# Anything else loads the driver exactly as an image without this package
+# would. A failure once the radios have probed for the offload leaves Wi-Fi
+# down until the next boot. Wired networking never depends on either path.
+# A bring-up the board did not survive is not tried again until
+# /etc/nss-wifi.pending is removed; the setting itself is left alone.
+
+START=19
+USE_PROCD=1
+
+# Present from the start of a bring-up until the board has survived it.
+PENDING=/etc/nss-wifi.pending
+
+wifi_load_host() {
+	modprobe ath11k 2>/dev/null
+	modprobe ath11k_ahb 2>/dev/null
+	modprobe ath11k_pci 2>/dev/null
+}
+
+start_service() {
+	local dir i param
+
+	[ "$(uci -q get nss-wifi.general.offload)" = "1" ] || {
+		wifi_load_host
+		return 0
+	}
+
+	[ -e "$PENDING" ] && {
+		logger -t nss-wifi "offload skipped: $(cat "$PENDING"); rm $PENDING to try again"
+		wifi_load_host
+		return 0
+	}
+
+	# ath11k offloads only IPQ8074 radios; elsewhere none would ever hand
+	# its rings over and the wait below would only delay the boot.
+	grep -qs 'qcom,ipq8074-wifi' /proc/device-tree/soc*/wifi@*/compatible || {
+		wifi_load_host
+		return 0
+	}
+
+	# Marked before anything is tried, and cleared only once the board
+	# has survived the bring-up. A bring-up that hangs the board therefore
+	# costs one boot, not every boot after it.
+	echo "the last bring-up did not complete" > "$PENDING"
+	sync
+
+	modprobe nss-wifi-drv 2>/dev/null
+
+	# The radios are handed over below, so a board whose device tree
+	# describes no NSS core keeps them on the host path instead.
+	dir=$(ls -d /sys/kernel/debug/*.nss 2>/dev/null | head -1)
+	[ -n "$dir" ] || {
+		logger -t nss-wifi "no NSS core to boot, staying on the host path"
+		rm -f "$PENDING"
+		wifi_load_host
+		return 0
+	}
+
+	# Parameters are read when the plane is brought up below, and modprobe
+	# on this image carries none, so anything to be varied between boots is
+	# written here:
+	#   uci add_list nss-wifi.general.param='payloads=32768'
+	for param in $(uci -q get nss-wifi.general.param); do
+		echo "${param#*=}" > "/sys/module/nss_wifi_drv/parameters/${param%%=*}" 2>/dev/null &&
+			logger -t nss-wifi "$param"
+	done
+
+	# A radio reads these when it probes, and the bus module is what
+	# probes one, so they are written between the two modprobes.
+	modprobe ath11k 2>/dev/null
+	if ! echo 1 > /sys/module/ath11k/parameters/nss_offload 2>/dev/null; then
+		logger -t nss-wifi "ath11k has no offload parameter, staying on the host path"
+		rm -f "$PENDING"
+		wifi_load_host
+		return 0
+	fi
+	echo 2 > /sys/module/ath11k/parameters/frame_mode 2>/dev/null
+	modprobe ath11k_ahb 2>/dev/null
+
+	# A radio describes its rings from its own probe, which loading the
+	# bus module only begins, so the bring-up waits for that rather than
+	# racing it. Reading wifili_start is what sends the sequence.
+	#
+	# A radio logs its rings as it hands them over, and that line is the
+	# only thing that says the description is complete: the phy appears
+	# early in the probe, well before it. Releasing the core while a radio
+	# is still probing hangs the board.
+	i=0
+	while [ $i -lt 60 ]; do
+		[ "$(dmesg | grep -c 'nss-wifi-drv: radio')" -gt 0 ] && break
+		sleep 1
+		i=$((i + 1))
+	done
+	sleep 3
+
+	echo 1 > "$dir/boot" || {
+		echo "the NSS core would not boot" > "$PENDING"
+		logger -t nss-wifi "the NSS core would not boot"
+		return 0
+	}
+	cat "$dir/wifili_start" | logger -t nss-wifi
+
+	[ "$(cat "$dir/boot")" = "1" ] || {
+		echo "the NSS core did not stay up" > "$PENDING"
+		logger -t nss-wifi "the NSS core did not stay up"
+		return 0
+	}
+
+	# Cleared only once the board has been up long enough to have survived
+	# the bring-up, not when the core reports itself started: a hang
+	# arrives after that, and clearing before it turns one bad boot into
+	# every boot.
+	(sleep 120
+	 rm -f "$PENDING"
+	 sync
+	 logger -t nss-wifi "bring-up survived, offload stays on for the next boot") &
+}
+
+stop_service() {
+	echo "The Wi-Fi data path is chosen at probe; reboot to change it."
+}
