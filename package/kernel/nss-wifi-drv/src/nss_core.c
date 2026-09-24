@@ -363,6 +363,128 @@ static void nss_core_halt(struct nss_core *core)
 	wake_up_var(&core->loaded);
 }
 
+/* How many empty buffers the firmware may hold, and the ceiling the host's own
+ * refill stops at; the two are one number because they cannot disagree.
+ *
+ * The firmware takes one buffer for every connection it accelerates, to carry
+ * that connection's statistics back, so a pool sized for the exception path
+ * alone stops the flow engines accepting rules once it is spent - the refusal
+ * is a buffer allocation failure and says nothing about the rule. An
+ * unconfigured pool is unbounded the other way: the firmware accepted 82242
+ * buffers, 329 MB of slab on a 411 MB box, within ten seconds of the core
+ * booting. The Wi-Fi data plane's own share of it is declared separately,
+ * through nss_wifi_pool_set().
+ */
+unsigned int nss_pool_size = 30624;
+module_param_named(pool_size, nss_pool_size, uint, 0644);
+MODULE_PARM_DESC(pool_size, "empty buffers the host will lend the firmware");
+
+unsigned int nss_pool_low = 4352;
+module_param_named(pool_low, nss_pool_low, uint, 0644);
+MODULE_PARM_DESC(pool_low, "buffers below which the firmware asks for more");
+/* The firmware refuses a span narrower than the ring the pool is topped up
+ * through, so the asked-for ceiling is not always the one that takes effect.
+ * The table of lent buffers is sized from the same answer, and is allocated
+ * before the pool is configured.
+ */
+unsigned int nss_pool_ceiling(void)
+{
+	if (nss_pool_low < NSS_RING_ENTRIES)
+		nss_pool_low = NSS_RING_ENTRIES;
+	if (nss_pool_size < 2 * nss_pool_low)
+		nss_pool_size = 2 * nss_pool_low;
+
+	return nss_pool_size;
+}
+
+#define NSS_N2H_SET_WATER_MARK		6
+#define NSS_N2H_GET_WATER_MARK		7
+#define NSS_N2H_WIFI_POOL_BUF_CFG	8
+
+struct nss_n2h_water_mark {
+	struct nss_cmn_msg cm;
+	__be32 low_water;
+	__be32 high_water;
+};
+
+struct nss_n2h_payload_info {
+	struct nss_cmn_msg cm;
+	__be32 pool_size;
+	__be32 low_water;
+	__be32 high_water;
+};
+
+struct nss_n2h_wifi_pool {
+	struct nss_cmn_msg cm;
+	__be32 payloads;
+};
+
+/* Say what the pool may reach, and stop the refill at the same number.
+ *
+ * The firmware drains whatever it holds above its high-water mark straight
+ * back, so the mark is what a pool settles at: set below what the host is
+ * willing to lend it empties as fast as it is filled and a receive ring never
+ * fills, set above it the host stops first and the mark is never reached. The
+ * low mark is a ring's worth, the point at which a top-up is worth an
+ * interrupt. The counts are byte-swapped, as the other control-plane scalars
+ * on this interface are; the addresses beside them are not.
+ */
+static int nss_pool_set(struct nss_core *core, u32 payloads)
+{
+	struct nss_n2h_water_mark wm = {};
+	int ret;
+
+	wm.cm.interface = NSS_INTERFACE_N2H;
+	wm.cm.type = NSS_N2H_SET_WATER_MARK;
+	wm.low_water = cpu_to_be32(nss_pool_low);
+	wm.high_water = cpu_to_be32(payloads);
+
+	/* Recorded before the message goes out, because this is the first one
+	 * after a core boot and the first one is answered late: the firmware
+	 * takes it and the host's wait expires first. A ceiling left unset by
+	 * that is a host that lends nothing at all.
+	 */
+	core->pool_size = payloads;
+
+	ret = nss_msg_send(core, &wm, sizeof(wm));
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+static void nss_pool_configure(struct nss_core *core)
+{
+	struct nss_n2h_payload_info p = {};
+	int ret;
+
+	ret = nss_pool_set(core, nss_pool_ceiling());
+	dev_info(core->dev, "payload pool set to %u: %d\n", nss_pool_size, ret);
+
+	p.cm.interface = NSS_INTERFACE_N2H;
+	p.cm.type = NSS_N2H_GET_WATER_MARK;
+	ret = nss_msg_send(core, &p, sizeof(p));
+	dev_info(core->dev, "payload pool %u low %u high %u: %d\n",
+		 be32_to_cpu(p.pool_size), be32_to_cpu(p.low_water),
+		 be32_to_cpu(p.high_water), ret);
+}
+
+/* Payloads the firmware keeps for the Wi-Fi data plane.
+ *
+ * Without NSS_N2H_WIFI_POOL_BUF_CFG the radio receive rings stay empty
+ * whatever the pool size.
+ */
+int nss_wifi_pool_set(struct nss_core *core, u32 payloads)
+{
+	struct nss_n2h_wifi_pool wp = {};
+
+	wp.cm.interface = NSS_INTERFACE_N2H;
+	wp.cm.type = NSS_N2H_WIFI_POOL_BUF_CFG;
+	wp.payloads = cpu_to_be32(payloads);
+
+	return nss_msg_send(core, &wp, sizeof(wp));
+}
+
 static int nss_core_boot(struct nss_core *core)
 {
 	int ret;
@@ -419,6 +541,8 @@ static int nss_core_boot(struct nss_core *core)
 		nss_core_halt(core);
 		return -ETIMEDOUT;
 	}
+
+	nss_pool_configure(core);
 
 	return 0;
 

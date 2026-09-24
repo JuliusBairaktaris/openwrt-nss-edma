@@ -1382,9 +1382,58 @@ int nss_wifili_tx(struct seq_file *s)
  * hardware, and the start that puts the firmware's workers on the rings -
  * needs rings that exist, and these are them.
  */
+/* The Wi-Fi share of the payload pool, and the transmit budget a radio is
+ * given for each of the four peer-count ranges. Both are what the working
+ * configuration puts on the wire on this board.
+ */
+static unsigned int nss_wifili_payloads = 8192;
+module_param_named(payloads, nss_wifili_payloads, uint, 0644);
+
+static unsigned int nss_wifili_radio_bufs = 8192;
+module_param_named(radio_bufs, nss_wifili_radio_bufs, uint, 0644);
+
 static unsigned int nss_wifili_mem_profile;
 module_param_named(mem_profile, nss_wifili_mem_profile, uint, 0644);
 MODULE_PARM_DESC(mem_profile, "memory profile the firmware sizes its pools from");
+
+/* How many payloads a radio may carve for its own receive.
+ *
+ * Without this the firmware leaves the radio on the budget it starts with and
+ * fills no receive descriptor, so the ring the WLAN firmware needs full is
+ * filled by nobody - and a ring the host fills instead carries cookies the
+ * firmware cannot resolve. The count is asked for across all four peer-count
+ * ranges, because which one applies is the firmware's choice and a range left
+ * unset is a station count that silently loses the budget again.
+ */
+#define NSS_WIFILI_BUF_RANGES	4
+
+static int nss_wifili_radio_buf_cfg(struct nss_core *core, int if_num,
+				    u32 bufs)
+{
+	struct nss_wifili_msg *m __free(kfree) = kzalloc(sizeof(*m), GFP_KERNEL);
+	u32 range;
+	int ret;
+
+	if (!m)
+		return -ENOMEM;
+
+	for (range = 0; range < NSS_WIFILI_BUF_RANGES; range++) {
+		memset(m, 0, sizeof(*m));
+		m->cm.interface = NSS_INTERFACE_WIFILI;
+		m->cm.type = NSS_WIFILI_RADIO_BUF_CFG;
+		m->msg.radiocfgmsg.radio_if_num = if_num;
+		m->msg.radiocfgmsg.radiomsg.radiobufcfgmsg.buf_cnt = bufs;
+		m->msg.radiocfgmsg.radiomsg.radiobufcfgmsg.range = range;
+
+		ret = nss_msg_send(core, m,
+				   offsetof(struct nss_wifili_msg, msg) +
+				   sizeof(m->msg.radiocfgmsg));
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
 
 static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 {
@@ -1574,6 +1623,17 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 	if (ret)
 		goto out;
 
+	/* The receive rings are filled from the firmware's Wi-Fi share of the
+	 * payload pool, one payload per entry for as long as the radio is up.
+	 * Declared before the radios are initialised, because the first fill
+	 * runs when they are.
+	 */
+	ret = nss_wifi_pool_set(core, nss_wifili_payloads);
+	seq_printf(s, "%-14s rc %d (%u payloads)\n", "wifi pool:", ret,
+		   nss_wifili_payloads);
+	if (ret)
+		goto out;
+
 	for (i = 0; i < nss_wifili_pdevs; i++) {
 		int if_num;
 
@@ -1605,6 +1665,14 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 		seq_printf(s, "radio %u init:  rc %d response %u error %u\n",
 			   nss_wifili_pdev[i].radio_id, ret, m->cm.response,
 			   m->cm.error);
+		if (ret)
+			goto out;
+
+		ret = nss_wifili_radio_buf_cfg(core, if_num,
+					       nss_wifili_radio_bufs);
+		seq_printf(s, "radio %u bufs:  rc %d (%u per range)\n",
+			   nss_wifili_pdev[i].radio_id, ret,
+			   nss_wifili_radio_bufs);
 		if (ret)
 			goto out;
 	}
