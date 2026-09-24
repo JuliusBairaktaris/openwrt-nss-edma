@@ -222,7 +222,7 @@ int nss_data_send(struct nss_core *core, struct sk_buff *skb, u32 if_num)
 	 */
 	shift = (skb->data - skb->head) & 3;
 	if (shift) {
-		if (skb_headroom(skb) < shift)
+		if (skb_headroom(skb) < shift || skb_cow_head(skb, 0))
 			return -ENOBUFS;
 
 		memmove(skb->data - shift, skb->data, skb->len);
