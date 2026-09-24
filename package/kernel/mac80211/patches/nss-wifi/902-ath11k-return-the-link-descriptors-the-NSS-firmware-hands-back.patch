@@ -15,8 +15,8 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 ---
 --- a/drivers/net/wireless/ath/ath11k/dp.c
 +++ b/drivers/net/wireless/ath/ath11k/dp.c
-@@ -913,6 +913,21 @@
- 	r->hwreg[1] = reg_base + srng->hwreg_base[1];
+@@ -934,6 +934,21 @@ static void ath11k_nss_reset(void *priv)
+ 	queue_work(ab->workqueue_aux, &ab->reset_work);
  }
  
 +/* Put back an MSDU-link descriptor the firmware cannot release itself: the
@@ -37,18 +37,17 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  static void ath11k_nss_wifi_describe(struct ath11k_base *ab)
  {
  	struct ath11k_dp *dp = &ab->dp;
-@@ -945,6 +960,8 @@
- 	soc->rx_buf_len = DP_RX_BUFFER_SIZE;
- 	soc->num_tcl = ab->hw_params.max_tx_ring;
- 	soc->num_reo = DP_REO_DST_RING_MAX;
-+	soc->priv = ab;
+@@ -973,6 +988,7 @@ static void ath11k_nss_wifi_describe(str
+ 	soc->num_pdevs = ab->num_radios;
+ 	soc->priv = ab;
+ 	soc->reset = ath11k_nss_reset;
 +	soc->link_desc_return = ath11k_nss_link_desc_return;
  
  	for (i = 0; i < soc->num_tcl; i++) {
  		ath11k_nss_wifi_ring(&soc->tcl[i], ab,
 --- a/drivers/net/wireless/ath/ath11k/dp_rx.c
 +++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
-@@ -848,9 +848,8 @@
+@@ -847,9 +847,8 @@ void ath11k_peer_rx_tid_delete(struct at
  	rx_tid->unaligned_size = 0;
  }
  
@@ -62,7 +61,7 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  	struct hal_srng *srng;
 --- a/drivers/net/wireless/ath/ath11k/dp_rx.h
 +++ b/drivers/net/wireless/ath/ath11k/dp_rx.h
-@@ -73,6 +73,8 @@
+@@ -73,6 +73,8 @@ int ath11k_dp_process_rx_err(struct ath1
  int ath11k_dp_process_rx(struct ath11k_base *ab, int mac_id,
  			 struct napi_struct *napi,
  			 int budget);
