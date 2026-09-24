@@ -65,12 +65,6 @@ bool nss_msg_complete(struct nss_core *core, const struct n2h_descriptor *desc)
 	return true;
 }
 
-/* Send a message and wait for the firmware's answer in place.
- *
- * One at a time: bring-up is a sequence of questions, and a second buffer
- * would need a way to tell two answers apart that the protocol does not
- * provide.
- */
 /* What the firmware says when nothing asked it.
  *
  * Every unsolicited message is counted by type, and the first of each type
@@ -110,7 +104,17 @@ void nss_msg_seen(struct nss_core *core, const struct nss_cmn_msg *ncm,
 	seen->words = words;
 }
 
-/* @len is the message as sent and what the firmware's length check sees;
+static bool nss_msg_trace;
+module_param_named(msg_trace, nss_msg_trace, bool, 0644);
+MODULE_PARM_DESC(msg_trace, "dump every control message sent to the firmware");
+
+/* Send a message and wait for the firmware's answer in place.
+ *
+ * One at a time: bring-up is a sequence of questions, and a second buffer
+ * would need a way to tell two answers apart that the protocol does not
+ * provide.
+ *
+ * @len is the message as sent and what the firmware's length check sees;
  * @room is how much of the answer the caller reads back. They differ only
  * for a request whose reply carries an array sized by the buffer, like the
  * connection-statistics sweep.
@@ -147,6 +151,14 @@ int nss_msg_transact(struct nss_core *core, void *msg, size_t len, size_t room)
 	ncm->version = NSS_HLOS_MESSAGE_VERSION;
 	ncm->len = len - sizeof(*ncm);
 	memcpy(core->msg.buf, msg, len);
+
+	/* What went out, in the form another host driver of this firmware can
+	 * be compared against byte for byte. Off unless asked for.
+	 */
+	if (nss_msg_trace)
+		print_hex_dump(KERN_INFO, "nssmsg: ", DUMP_PREFIX_OFFSET, 32, 4,
+			       msg, min_t(size_t, len, 512), false);
+
 	/* Before the descriptor is published, not after: the firmware drains
 	 * this ring by its index and needs no doorbell to find one, so an
 	 * answer that arrives between publishing and arming is an answer this
