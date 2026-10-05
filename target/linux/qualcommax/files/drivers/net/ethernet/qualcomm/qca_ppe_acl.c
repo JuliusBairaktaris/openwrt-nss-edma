@@ -852,6 +852,10 @@ static int ppe_acl_parse_action(struct qca_ppe_priv *priv,
 			 * which port it drains is the queue's business, not
 			 * the classifier's.
 			 */
+			if (a->queue.vf) {
+				NL_SET_ERR_MSG_MOD(extack, "no VF to steer to");
+				return -EOPNOTSUPP;
+			}
 			if (a->queue.index > FIELD_MAX(PPE_ACL_QID) ||
 			    (a->queue.index >= PPE_CPU_UCAST_QUEUES &&
 			     a->queue.index < PPE_PORT_UCAST_BASE)) {
@@ -1201,6 +1205,9 @@ static int ppe_acl_rxnfc_ins(struct qca_ppe_priv *priv, int port,
 	 * priority field has.
 	 */
 	if (fs->location > FIELD_MAX(PPE_ACL_RULE_PRI))
+		return -EINVAL;
+	/* No RSS context exists for the queue to be taken relative to. */
+	if (fs->flow_type & FLOW_RSS)
 		return -EINVAL;
 
 	mutex_lock(&priv->acl_lock);
