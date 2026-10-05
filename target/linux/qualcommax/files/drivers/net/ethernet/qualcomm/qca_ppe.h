@@ -1258,6 +1258,7 @@ struct ppe_port_shaper {
 	u64 base_bytes;
 	u32 base_pkts;
 	u32 base_drops;
+	u32 base_backlog;
 };
 
 struct qca_ppe_priv {
