@@ -386,6 +386,11 @@ static int ppe_acl_parse_key(struct flow_rule *rule,
 				s->key[1] |= PPE_ACL_L3_FRAG;
 			s->mask[1] |= PPE_ACL_L3_FRAG;
 		}
+	} else if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV4_ADDRS)) {
+		/* ethtool registers the address key without the control key */
+		addr_type = FLOW_DISSECTOR_KEY_IPV4_ADDRS;
+	} else if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV6_ADDRS)) {
+		addr_type = FLOW_DISSECTOR_KEY_IPV6_ADDRS;
 	}
 
 	/* The engine tells the families apart by one bit rather than by the
