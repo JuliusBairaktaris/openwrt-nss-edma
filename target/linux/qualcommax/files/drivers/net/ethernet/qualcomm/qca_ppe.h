@@ -1306,6 +1306,7 @@ struct ppe_class_shaper {
 	u32 cfg;
 	u32 credit;
 	u32 slot;
+	u64 min_bps;
 	u64 rate_bps;
 };
 
