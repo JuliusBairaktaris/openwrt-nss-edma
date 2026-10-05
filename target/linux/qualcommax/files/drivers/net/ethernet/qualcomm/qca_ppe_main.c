@@ -2649,34 +2649,61 @@ static void qca_ppe_port_fast_age(struct dsa_switch *ds, int port)
 	}
 }
 
-/* One analyzer serves the whole switch, for both directions, so every mirror on
- * the box has to name the same destination; a second one naming another port is
- * refused rather than silently redirecting the first. The analyzer is a switch
- * port, so mirroring costs a LAN port for as long as it is on. A classifier
- * rule that mirrors takes the same analyzer, which is why this is shared.
+/* One analyzer per direction serves the whole switch, so every mirror of a
+ * direction has to name the same destination; a second one naming another
+ * port is refused rather than silently redirecting the first. The analyzer is
+ * a switch port, so mirroring costs a LAN port for as long as it is on.
  */
-int ppe_mirror_analyzer_get(struct qca_ppe_priv *priv, int to_port)
+static void ppe_mirror_analyzer_write(struct qca_ppe_priv *priv)
 {
-	if (priv->mirror_ref && priv->mirror_port != to_port)
-		return -EBUSY;
-
 	regmap_write(priv->regmap, PPE_MIRROR_ANALYZER,
-		     FIELD_PREP(PPE_MIRROR_IN_ANALYZER, to_port) |
-		     FIELD_PREP(PPE_MIRROR_EG_ANALYZER, to_port));
+		     FIELD_PREP(PPE_MIRROR_IN_ANALYZER, priv->mirror_port[1]) |
+		     FIELD_PREP(PPE_MIRROR_EG_ANALYZER, priv->mirror_port[0]));
+}
 
-	priv->mirror_port = to_port;
-	priv->mirror_ref++;
+static int ppe_mirror_get(struct qca_ppe_priv *priv, int to_port, u8 dirs)
+{
+	int d;
+
+	for (d = 0; d < 2; d++)
+		if ((dirs & BIT(d)) && priv->mirror_ref[d] &&
+		    priv->mirror_port[d] != to_port)
+			return -EBUSY;
+
+	for (d = 0; d < 2; d++) {
+		if (!(dirs & BIT(d)))
+			continue;
+		priv->mirror_port[d] = to_port;
+		priv->mirror_ref[d]++;
+	}
+
+	ppe_mirror_analyzer_write(priv);
 
 	return 0;
 }
 
+static void ppe_mirror_put(struct qca_ppe_priv *priv, u8 dirs)
+{
+	int d;
+
+	for (d = 0; d < 2; d++)
+		if ((dirs & BIT(d)) && !--priv->mirror_ref[d])
+			priv->mirror_port[d] = 0;
+
+	ppe_mirror_analyzer_write(priv);
+}
+
+/* Which analyzer a classifier rule's mirror uses is not known, so it claims
+ * both.
+ */
+int ppe_mirror_analyzer_get(struct qca_ppe_priv *priv, int to_port)
+{
+	return ppe_mirror_get(priv, to_port, BIT(0) | BIT(1));
+}
+
 void ppe_mirror_analyzer_put(struct qca_ppe_priv *priv)
 {
-	if (--priv->mirror_ref)
-		return;
-
-	regmap_write(priv->regmap, PPE_MIRROR_ANALYZER, 0);
-	priv->mirror_port = -1;
+	ppe_mirror_put(priv, BIT(0) | BIT(1));
 }
 
 int qca_ppe_port_mirror_add(struct dsa_switch *ds, int port,
@@ -2686,10 +2713,10 @@ int qca_ppe_port_mirror_add(struct dsa_switch *ds, int port,
 	struct qca_ppe_priv *priv = ds_to_priv(ds);
 	int ret;
 
-	ret = ppe_mirror_analyzer_get(priv, mirror->to_local_port);
+	ret = ppe_mirror_get(priv, mirror->to_local_port, BIT(ingress));
 	if (ret) {
 		NL_SET_ERR_MSG_MOD(extack,
-				   "another port is already mirrored elsewhere");
+				   "this direction is already mirrored elsewhere");
 		return ret;
 	}
 
@@ -2717,7 +2744,7 @@ void qca_ppe_port_mirror_del(struct dsa_switch *ds, int port,
 				   mirror->ingress ? PPE_PORT_MIRROR_IN_EN :
 						     PPE_PORT_MIRROR_EG_EN, 0);
 
-	ppe_mirror_analyzer_put(priv);
+	ppe_mirror_put(priv, BIT(mirror->ingress));
 }
 
 static const struct dsa_switch_ops qca_ppe_ops = {
@@ -3000,7 +3027,6 @@ static int qca_ppe_probe(struct platform_device *pdev)
 	 * is what stops a third bond from sharing one.
 	 */
 	ds->num_lag_ids = PPE_TRUNK_GROUPS;
-	priv->mirror_port = -1;
 	ds->phylink_mac_ops = &qca_ppe_phylink_mac_ops;
 
 	for (i = 1; i < data->num_ports; i++) {

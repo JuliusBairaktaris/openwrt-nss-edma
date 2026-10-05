@@ -1324,8 +1324,9 @@ struct qca_ppe_priv {
 	DECLARE_BITMAP(acl_meter_used, PPE_ACL_METER_ENTRIES);
 	struct list_head acl_rules;
 	struct mutex acl_lock;
-	s8 mirror_port;
-	u16 mirror_ref;
+	/* Indexed by direction: egress 0, ingress 1. */
+	u8 mirror_port[2];
+	u16 mirror_ref[2];
 	u8 mirror_dir_ref[QCA_PPE_MAX_PORTS][2];
 	struct ppe_port_shaper shaper[QCA_PPE_MAX_PORTS];
 	/* Owner of each egress admission group: port * 2 + kind + 1, or 0. */
