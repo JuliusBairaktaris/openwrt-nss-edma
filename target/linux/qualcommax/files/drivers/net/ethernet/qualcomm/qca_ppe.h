@@ -1315,6 +1315,12 @@ struct qca_ppe_priv {
 	struct ppe_port_shaper shaper[QCA_PPE_MAX_PORTS];
 	/* Owner of each egress admission group: port * 2 + kind + 1, or 0. */
 	u8 ac_grp_owner[PPE_AC_GROUPS];
+	/* Port meter counts last handed to tc. */
+	struct {
+		u64 bytes;
+		u32 pkts;
+		u32 drops;
+	} policer_base[QCA_PPE_MAX_PORTS];
 	struct dentry *debugfs;
 	DECLARE_BITMAP(vsi_bitmap, PPE_VSI_MAX);
 	DECLARE_BITMAP(xlt_bitmap, PPE_XLT_TBL_NUM);
@@ -1453,6 +1459,8 @@ int qca_ppe_port_policer_add(struct dsa_switch *ds, int port,
 			     const struct flow_action_police *policer,
 			     struct netlink_ext_ack *extack);
 void qca_ppe_port_policer_del(struct dsa_switch *ds, int port);
+int qca_ppe_port_policer_stats(struct dsa_switch *ds, int port,
+			       struct flow_stats *stats);
 int ppe_token_bucket(unsigned long clk, u32 slot, u64 rate_bps, u32 burst,
 		     u32 cir_max, u32 cbs_max, u32 *cir, u32 *cbs);
 
