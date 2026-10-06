@@ -20,7 +20,7 @@ DEFAULT_PACKAGES += \
 	tc-tiny kmod-sched-flower kmod-sched-prio \
 	kmod-sched-act-police kmod-sched-act-pedit \
 	kmod-sched-mqprio kmod-sched-ets kmod-sched-act-vlan dcb \
-	kmod-sched-red \
+	kmod-sched-red kmod-sched-gred \
 	ethtool devlink
 
 $(eval $(call BuildTarget))
