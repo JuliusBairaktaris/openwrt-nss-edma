@@ -4,6 +4,7 @@
  * Copyright (c) 2023-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
+#include <linux/bitfield.h>
 #include <linux/clk.h>
 #include <linux/ethtool.h>
 #include <linux/hash.h>
@@ -686,6 +687,8 @@ static u32 edma_clean_rx(struct edma_priv *priv, int budget,
 			goto next;
 		}
 		tag_info->port = src_port;
+		tag_info->cpu_code = FIELD_GET(EDMA_RXPH_CPU_CODE,
+					       le32_to_cpu(rxph->rx_pre4));
 
 		dev_sw_netstats_rx_add(priv->netdev, pkt_len);
 		napi_gro_receive(&priv->rx_napi, skb);
@@ -1115,7 +1118,7 @@ static void edma_configure_txdesc_ring(struct edma_priv *priv,
 	u32 val;
 
 	regmap_write(priv->regmap, EDMA_REG_TXDESC_BA(soc->txdesc_ring),
-		    (u32)txdesc_ring->dma);
+		     (u32)txdesc_ring->dma);
 
 	regmap_write(priv->regmap,
 		     EDMA_REG_TXDESC_RING_SIZE(soc->txdesc_ring),
