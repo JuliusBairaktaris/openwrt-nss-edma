@@ -1191,6 +1191,8 @@
 #define PPE_L0_UCAST_QUEUES		256
 /* The CPU port's unicast queues the L0 scheduler serves (l0_port0[]). */
 #define PPE_CPU_UCAST_QUEUES		12
+#define PPE_CPU_CODE_QUEUE		4
+#define PPE_TRAP_BURST_MAX		64
 /* First unicast queue of a user port. */
 #define PPE_PORT_UCAST_BASE		144
 
@@ -1220,6 +1222,7 @@
 
 #define PPE_TRUNK_GROUPS		2
 #define PPE_TRAP_CODES			7
+#define PPE_NUM_TRAPS			14
 
 #define PPE_XLT_TBL_NUM			64
 #define PPE_XLT_CVID_DEL		2
@@ -1501,7 +1504,7 @@ struct qca_ppe_priv {
 	u32 vlan_filtering;
 	/* Drop traps whose action is trap; indexes into ppe_traps. */
 	u8 trap_to_cpu;
-	void *trap_ctx[PPE_TRAP_CODES];
+	void *trap_ctx[PPE_NUM_TRAPS];
 	/* Serializes the MRU/MTU entries, which a trap action rewrites. */
 	struct mutex mtu_lock;
 	u32 port_frame_size[QCA_PPE_MAX_PORTS];
@@ -1592,6 +1595,10 @@ int ppe_scheduler_ready(struct qca_ppe_priv *priv);
 void ppe_scheduler_unready(struct qca_ppe_priv *priv);
 void ppe_scheduler_exit(struct qca_ppe_priv *priv);
 void ppe_vlan_xlt_miss_apply(struct qca_ppe_priv *priv);
+void ppe_cpu_code_queue_set(struct qca_ppe_priv *priv, u8 code, u32 policer);
+int ppe_trap_policer_set(struct qca_ppe_priv *priv, u32 id, u64 rate,
+			 u64 burst);
+u64 ppe_trap_policer_drops(struct qca_ppe_priv *priv, u32 id);
 void ppe_port_queues_enable(struct qca_ppe_priv *priv, int port, bool en);
 void ppe_port_queue_drops(struct qca_ppe_priv *priv, int port, u32 *early,
 			  u32 *tail);
