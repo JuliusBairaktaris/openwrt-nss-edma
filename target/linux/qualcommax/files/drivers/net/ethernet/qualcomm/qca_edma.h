@@ -354,6 +354,7 @@ struct edma_priv {
 	bool threaded_set;
 
 	int misc_irq;
+	struct hrtimer probe_poll;
 };
 
 #endif /* __QCA_EDMA_H__ */

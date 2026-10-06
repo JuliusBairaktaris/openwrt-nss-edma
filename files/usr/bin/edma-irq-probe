@@ -1,0 +1,39 @@
+#!/bin/sh
+# Find the GIC SPI of each EDMA ring of ring sets 1-3 on an IRQ probe build.
+# Run it while a LAN host sends and receives traffic through this router
+# (see the PR), then post the output.
+E=0x3ab00000; G=0x0b000000
+case "$(tr '\0' ' ' < /proc/device-tree/compatible)" in
+	*ipq6018*) TXI=0x91000; TXC=23 ;;
+	*ipq8074*) TXI=0x21000; TXC=7 ;;
+	*) echo "unknown SoC: $(tr '\0' ' ' < /proc/device-tree/compatible)"; exit 1 ;;
+esac
+dmesg | grep -q 'IRQ probe build' || { echo "not an IRQ probe build"; exit 1; }
+own=" $(awk '/edma_/ {print $(NF-2)-32}' /proc/interrupts | tr '\n' ' ') "
+pend(){ n=$1; acc=""; i=0
+	while [ $i -lt $n ]; do
+		for w in 9 10 11 12 13; do
+			v=$(devmem $((G + 0x200 + w * 4)) 32); b=0
+			while [ $b -lt 32 ]; do
+				[ $(( (v >> b) & 1 )) = 1 ] && acc="$acc $((w * 32 + b - 32))"
+				b=$((b + 1))
+			done
+		done
+		i=$((i + 1))
+	done
+	echo $acc | tr ' ' '\n' | sort -un | tr '\n' ' '; }
+base=" $(pend 20) "
+probe(){ name=$1 mask=$2 val=$3 thr=$4; old=""
+	[ -n "$thr" ] && { old=$(devmem $thr 32); devmem $thr 32 0xffff; }
+	devmem $mask 32 $val; p=$(pend 100); devmem $mask 32 0
+	[ -n "$thr" ] && devmem $thr 32 $old
+	new=""; for s in $p; do case "$base$own" in *" $s "*) ;; *) new="$new $s" ;; esac; done
+	echo "$name ->$new"; }
+echo "soc: $(cat /proc/device-tree/model)"
+echo "own lines:$own base:$base"
+for i in 1 2 3; do
+	c=$((TXC - i)); f=$((7 - i)); d=$((15 - i))
+	probe "txcmpl$c" $((E + TXI + 0x4 + c * 0x1000)) 3
+	probe "rxdesc$d" $((E + 0x49004 + d * 0x1000)) 1
+	probe "rxfill$f" $((E + 0x31004 + f * 0x1000)) 1 $((E + 0x29018 + f * 0x1000))
+done

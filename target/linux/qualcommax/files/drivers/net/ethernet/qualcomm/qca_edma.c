@@ -22,6 +22,7 @@
 #include <linux/version.h>
 #include <net/netdev_queues.h>
 
+#include <linux/hrtimer.h>
 #include "qca_edma.h"
 
 static void edma_irq_disable_all(struct edma_priv *priv)
@@ -55,6 +56,8 @@ static void edma_tx_irq_mask(struct edma_queue *q)
 
 static void edma_tx_irq_unmask(struct edma_queue *q)
 {
+	if (q->idx)
+		return;
 	struct edma_priv *priv = q->priv;
 	const struct edma_soc_data *soc = priv->soc;
 
@@ -75,6 +78,8 @@ static void edma_rx_irq_mask(struct edma_queue *q)
 
 static void edma_rx_irq_unmask(struct edma_queue *q)
 {
+	if (q->idx)
+		return;
 	struct edma_priv *priv = q->priv;
 
 	regmap_write(priv->regmap,
@@ -1595,12 +1600,16 @@ static int edma_irq_init(struct edma_priv *priv)
 	if (priv->misc_irq < 0)
 		return priv->misc_irq;
 
-	ret = devm_request_irq(dev, priv->misc_irq, edma_misc_irq_handle, 0,
-			       "edma_misc", priv);
+	/* IRQ probe build: misc may share a line with a ring under test. */
+	ret = 0;
+	if (0)
+		ret = devm_request_irq(dev, priv->misc_irq,
+				       edma_misc_irq_handle, 0, "edma_misc",
+				       priv);
 	if (ret)
 		return ret;
 
-	for (i = 0; i < priv->num_queues; i++) {
+	for (i = 0; i < 1; i++) {
 		struct edma_queue *q = &priv->q[i];
 		const struct cpumask *cpu = cpumask_of(i % num_possible_cpus());
 
@@ -1857,6 +1866,18 @@ static int edma_get_mac_address(struct net_device *netdev,
 	return -ENODEV;
 }
 
+/* IRQ probe build: ring sets 1-3 run without interrupts, polled. */
+static enum hrtimer_restart edma_probe_poll(struct hrtimer *t)
+{
+	struct edma_priv *priv = container_of(t, struct edma_priv, probe_poll);
+	unsigned int i;
+
+	for (i = 1; i < priv->num_queues; i++)
+		napi_schedule(&priv->q[i].napi);
+	hrtimer_forward_now(t, us_to_ktime(100));
+	return HRTIMER_RESTART;
+}
+
 static int edma_probe(struct platform_device *pdev)
 {
 	struct page_pool *pools[EDMA_MAX_QUEUES];
@@ -1899,7 +1920,7 @@ static int edma_probe(struct platform_device *pdev)
 	nq = 1;
 	if (nirq > EDMA_IRQS_PER_QUEUE + 1)
 		nq += (nirq - EDMA_IRQS_PER_QUEUE - 1) / EDMA_IRQS_PER_QUEUE;
-	nq = min(nq, EDMA_MAX_QUEUES);
+	nq = EDMA_MAX_QUEUES;
 
 	netdev = devm_alloc_etherdev_mqs(dev, sizeof(*priv), nq, nq);
 	if (!netdev)
@@ -1976,6 +1997,10 @@ static int edma_probe(struct platform_device *pdev)
 	edma_set_xps(priv);
 
 	platform_set_drvdata(pdev, priv);
+	hrtimer_setup(&priv->probe_poll, edma_probe_poll, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL);
+	hrtimer_start(&priv->probe_poll, us_to_ktime(100), HRTIMER_MODE_REL);
+	dev_info(dev, "IRQ probe build: ring sets 1-%u polled\n", nq - 1);
 
 	return 0;
 
