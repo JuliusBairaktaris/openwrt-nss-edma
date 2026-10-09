@@ -1,0 +1,82 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] net: dsa: qca8k: support the qca-etype tagging protocol
+
+Add change_tag_protocol so a CPU port can select "qca-etype", and set
+the header type in HEADER_CTRL to match. Register access and MIB
+autocast over Ethernet build frames with the plain header, so with
+qca-etype they stay on MDIO.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+--- a/drivers/net/dsa/qca/qca8k-8xxx.c
++++ b/drivers/net/dsa/qca/qca8k-8xxx.c
+@@ -1743,6 +1743,27 @@ qca8k_get_tag_protocol(struct dsa_switch
+ 	return DSA_TAG_PROTO_QCA;
+ }
+ 
++static int qca8k_change_tag_protocol(struct dsa_switch *ds,
++				     enum dsa_tag_protocol proto)
++{
++	struct qca8k_priv *priv = ds->priv;
++	u32 val;
++
++	switch (proto) {
++	case DSA_TAG_PROTO_QCA:
++		val = 0;
++		break;
++	case DSA_TAG_PROTO_QCA_ETYPE:
++		val = QCA8K_HEADER_CTRL_TYPE_LEN |
++		      FIELD_PREP(QCA8K_HEADER_CTRL_TYPE_VAL, QCA_HDR_ETYPE);
++		break;
++	default:
++		return -EPROTONOSUPPORT;
++	}
++
++	return qca8k_write(priv, QCA8K_REG_HEADER_CTRL, val);
++}
++
+ static struct dsa_port *
+ qca8k_preferred_default_local_cpu_port(struct dsa_switch *ds)
+ {
+@@ -1873,8 +1894,10 @@ qca8k_conduit_change(struct dsa_switch *
+ 	struct dsa_port *dp = conduit->dsa_ptr;
+ 	struct qca8k_priv *priv = ds->priv;
+ 
+-	/* Ethernet MIB/MDIO is only supported for CPU port 0 */
+-	if (dp->index != 0)
++	/* Ethernet MIB/MDIO is only supported for CPU port 0, and its frames
++	 * carry the plain header.
++	 */
++	if (dp->index != 0 || dp->tag_ops->proto != DSA_TAG_PROTO_QCA)
+ 		return;
+ 
+ 	mutex_lock(&priv->mgmt_eth_data.mutex);
+@@ -1899,6 +1922,8 @@ static int qca8k_connect_tag_protocol(st
+ 		tagger_data->mib_autocast_handler = qca8k_mib_autocast_handler;
+ 
+ 		break;
++	case DSA_TAG_PROTO_QCA_ETYPE:
++		break;
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+@@ -2122,6 +2147,7 @@ static const struct phylink_mac_ops qca8
+ 
+ static const struct dsa_switch_ops qca8k_switch_ops = {
+ 	.get_tag_protocol	= qca8k_get_tag_protocol,
++	.change_tag_protocol	= qca8k_change_tag_protocol,
+ 	.setup			= qca8k_setup,
+ 	.get_strings		= qca8k_get_strings,
+ 	.get_ethtool_stats	= qca8k_get_ethtool_stats,
+--- a/drivers/net/dsa/qca/qca8k.h
++++ b/drivers/net/dsa/qca/qca8k.h
+@@ -149,6 +149,9 @@
+ #define   QCA8K_PORT_STATUS_LINK_AUTO			BIT(9)
+ #define   QCA8K_PORT_STATUS_LINK_PAUSE			BIT(10)
+ #define   QCA8K_PORT_STATUS_FLOW_AUTO			BIT(12)
++#define QCA8K_REG_HEADER_CTRL				0x98
++#define   QCA8K_HEADER_CTRL_TYPE_LEN			BIT(16)
++#define   QCA8K_HEADER_CTRL_TYPE_VAL			GENMASK(15, 0)
+ #define QCA8K_REG_PORT_HDR_CTRL(_i)			(0x9c + (_i * 4))
+ #define   QCA8K_PORT_HDR_CTRL_RX_MASK			GENMASK(3, 2)
+ #define   QCA8K_PORT_HDR_CTRL_TX_MASK			GENMASK(1, 0)
