@@ -31,12 +31,6 @@
 #include <net/mld.h>
 
 #include "nss_drv.h"
-#include "nss_cmn.h"
-#include "nss_dynamic_interface.h"
-#include "nss_shaper.h"
-#include "nss_if.h"
-#include "nss_wifi_vdev.h"
-#include "nss_wifili_if.h"
 #include <linux/soc/qcom/nss_wifi.h>
 
 /* Small on purpose. Nothing drains these, and the receive ring the firmware
@@ -1670,7 +1664,7 @@ static void nss_me_msg_fill(struct nss_wifi_vdev_me_snptbl_grp_mbr_add_msg *a,
 {
 	a->ether_type = m->proto;
 	if (m->proto == ETH_P_IP) {
-		a->u.grpaddr_ip4 = (__force u32)m->grp.ip4;
+		a->u.grpaddr_ip4 = m->grp.ip4;
 		ip_eth_mc_map(m->grp.ip4, a->grp_addr);
 	} else {
 		memcpy(a->u.grpaddr_ip6, &m->grp.ip6, sizeof(m->grp.ip6));

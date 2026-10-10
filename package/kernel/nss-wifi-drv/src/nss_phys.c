@@ -32,11 +32,6 @@
 #include <net/dsa.h>
 
 #include "nss_drv.h"
-/* The interface header names a shaper configuration in a message this driver
- * does not send, and does not carry the definition itself.
- */
-#include "nss_shaper.h"
-#include "nss_if.h"
 
 /* Where the firmware sends what a port receives once the port is open: its
  * ethernet node, which is what feeds the connection engines.

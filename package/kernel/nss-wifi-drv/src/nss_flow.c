@@ -38,11 +38,6 @@
 #include <net/pkt_cls.h>
 
 #include "nss_drv.h"
-#include "nss_dynamic_interface.h"
-#include "nss_shaper.h"	/* nss_if.h needs it and does not include it */
-#include "nss_if.h"
-#include "nss_ipv4.h"
-#include "nss_ipv6.h"
 
 /* Clamp the priority to the range the egress queues express; a higher value
  * selects no distinct queue. The shipped PPE flow back end bounds the same
@@ -949,8 +944,13 @@ static void nss_flow_withdraw(struct nss_core *core, struct nss_flow_entry *e)
 		m->msg.rule_destroy.tuple = e->t6;
 		m->cm.interface = NSS_INTERFACE_IPV6;
 		m->cm.type = NSS_IPV6_TX_DESTROY_RULE_MSG;
-		nss_msg_send(core, m, offsetof(struct nss_ipv6_msg, msg) +
-				      sizeof(m->msg.rule_destroy));
+		/* A connection the firmware already dropped is gone either way. */
+		if (nss_msg_send_quiet(core, m, offsetof(struct nss_ipv6_msg, msg) +
+					   sizeof(m->msg.rule_destroy)) &&
+		    m->cm.error != NSS_IPV6_DR_NO_CONNECTION_ENTRY_ERROR)
+			dev_warn_ratelimited(core->dev,
+					     "v6 rule destroy refused: error %u\n",
+					     m->cm.error);
 	} else {
 		struct nss_ipv4_msg *m __free(kfree) =
 			kzalloc(sizeof(*m), GFP_KERNEL);
@@ -960,8 +960,12 @@ static void nss_flow_withdraw(struct nss_core *core, struct nss_flow_entry *e)
 		m->msg.rule_destroy.tuple = e->t4;
 		m->cm.interface = NSS_INTERFACE_IPV4;
 		m->cm.type = NSS_IPV4_TX_DESTROY_RULE_MSG;
-		nss_msg_send(core, m, offsetof(struct nss_ipv4_msg, msg) +
-				      sizeof(m->msg.rule_destroy));
+		if (nss_msg_send_quiet(core, m, offsetof(struct nss_ipv4_msg, msg) +
+					   sizeof(m->msg.rule_destroy)) &&
+		    m->cm.error != NSS_IPV4_DR_NO_CONNECTION_ENTRY_ERROR)
+			dev_warn_ratelimited(core->dev,
+					     "v4 rule destroy refused: error %u\n",
+					     m->cm.error);
 	}
 
 	e->installed = false;
@@ -1121,15 +1125,19 @@ static bool nss_flow_is_v6(const struct nss_flow_entry *e,
 }
 
 /* A record from the firmware's sweep marks its connection recently used if
- * any of its four counters moved since the previous sweep.
+ * any of its four counters moved since the previous sweep, and gone if the
+ * firmware flushed or evicted it, so that no destroy follows for it.
  */
 static void nss_flow_sync_mark_v4(const struct nss_ipv4_conn_sync *r)
 {
 	struct rhashtable_iter iter;
 	struct nss_flow_entry *e;
 
-	if (!(r->flow_rx_packet_count | r->flow_tx_packet_count |
-	      r->return_rx_packet_count | r->return_tx_packet_count))
+	bool gone = r->reason == NSS_IPV4_RULE_SYNC_REASON_FLUSH ||
+		    r->reason == NSS_IPV4_RULE_SYNC_REASON_EVICT;
+
+	if (!gone && !(r->flow_rx_packet_count | r->flow_tx_packet_count |
+		       r->return_rx_packet_count | r->return_tx_packet_count))
 		return;
 
 	rhashtable_walk_enter(&nss_flow_table, &iter);
@@ -1139,6 +1147,8 @@ static void nss_flow_sync_mark_v4(const struct nss_ipv4_conn_sync *r)
 			continue;
 		if (!e->installed || !nss_flow_is_v4(e, r))
 			continue;
+		if (gone)
+			WRITE_ONCE(e->installed, false);
 		e->lastused = jiffies;
 		e->cnt[0] += r->flow_rx_packet_count;
 		e->cnt[1] += r->flow_tx_packet_count;
@@ -1155,8 +1165,11 @@ static void nss_flow_sync_mark_v6(const struct nss_ipv6_conn_sync *r)
 	struct rhashtable_iter iter;
 	struct nss_flow_entry *e;
 
-	if (!(r->flow_rx_packet_count | r->flow_tx_packet_count |
-	      r->return_rx_packet_count | r->return_tx_packet_count))
+	bool gone = r->reason == NSS_IPV6_RULE_SYNC_REASON_FLUSH ||
+		    r->reason == NSS_IPV6_RULE_SYNC_REASON_EVICT;
+
+	if (!gone && !(r->flow_rx_packet_count | r->flow_tx_packet_count |
+		       r->return_rx_packet_count | r->return_tx_packet_count))
 		return;
 
 	rhashtable_walk_enter(&nss_flow_table, &iter);
@@ -1166,6 +1179,8 @@ static void nss_flow_sync_mark_v6(const struct nss_ipv6_conn_sync *r)
 			continue;
 		if (!e->installed || !nss_flow_is_v6(e, r))
 			continue;
+		if (gone)
+			WRITE_ONCE(e->installed, false);
 		e->lastused = jiffies;
 		e->cnt[0] += r->flow_rx_packet_count;
 		e->cnt[1] += r->flow_tx_packet_count;

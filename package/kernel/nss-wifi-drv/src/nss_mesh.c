@@ -22,12 +22,6 @@
 #include <linux/workqueue.h>
 
 #include "nss_drv.h"
-#include "nss_dynamic_interface.h"
-#include "nss_shaper.h"
-#include "nss_if.h"
-#include "nss_wifi_mesh.h"
-#include "nss_wifi_vdev.h"
-#include "nss_wifili_if.h"
 #include <linux/soc/qcom/nss_wifi.h>
 
 #ifdef NSS_FIRMWARE_VERSION_11_4

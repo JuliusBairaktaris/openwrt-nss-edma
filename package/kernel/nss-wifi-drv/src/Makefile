@@ -3,6 +3,6 @@ obj-m += nss-wifi-drv.o
 nss-wifi-drv-objs := nss_bridge.o nss_core.o nss_flow.o nss_mc.o nss_meminfo.o \
 		     nss_mesh.o nss_msg.o nss_phys.o nss_ring.o nss_wifili.o
 
-ccflags-y += -I$(src)/exports -I$(src)/include
+ccflags-y += -I$(src)/include
 ccflags-y += -DCONFIG_NSS_WIFI_DRV=1
 ccflags-$(CONFIG_NSS_FIRMWARE_VERSION_11_4) += -DNSS_FIRMWARE_VERSION_11_4

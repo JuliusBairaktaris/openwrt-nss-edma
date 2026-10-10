@@ -24,7 +24,6 @@
 #include <linux/spinlock.h>
 
 #include "nss_drv.h"
-#include "nss_dynamic_interface.h"
 
 /* The firmware answers in the buffer it was sent, so the buffer is as large
  * as the largest answer rather than as the request.
@@ -119,7 +118,8 @@ MODULE_PARM_DESC(msg_trace, "dump every control message sent to the firmware");
  * for a request whose reply carries an array sized by the buffer, like the
  * connection-statistics sweep.
  */
-int nss_msg_transact(struct nss_core *core, void *msg, size_t len, size_t room)
+static int nss_msg_xact(struct nss_core *core, void *msg, size_t len,
+			size_t room, bool quiet)
 {
 	struct nss_cmn_msg *ncm = msg;
 	struct nss_h2n_ring *ring = &core->h2n[NSS_H2N_RING_COMMAND];
@@ -205,8 +205,9 @@ int nss_msg_transact(struct nss_core *core, void *msg, size_t len, size_t room)
 		ret = 0;
 		break;
 	case NSS_CMN_RESPONSE_EMSG:
-		dev_err(core->dev, "interface %u type %u refused: %u\n",
-			ncm->interface, ncm->type, ncm->error);
+		if (!quiet)
+			dev_err(core->dev, "interface %u type %u refused: %u\n",
+				ncm->interface, ncm->type, ncm->error);
 		ret = -EPROTO;
 		break;
 	default:
@@ -221,9 +222,20 @@ int nss_msg_transact(struct nss_core *core, void *msg, size_t len, size_t room)
 	return ret;
 }
 
+int nss_msg_transact(struct nss_core *core, void *msg, size_t len, size_t room)
+{
+	return nss_msg_xact(core, msg, len, room, false);
+}
+
 int nss_msg_send(struct nss_core *core, void *msg, size_t len)
 {
-	return nss_msg_transact(core, msg, len, len);
+	return nss_msg_xact(core, msg, len, len, false);
+}
+
+/* For a sender that judges the refusal itself. */
+int nss_msg_send_quiet(struct nss_core *core, void *msg, size_t len)
+{
+	return nss_msg_xact(core, msg, len, len, true);
 }
 
 /* Whether the firmware has a node of this kind to give, and what it calls it.
