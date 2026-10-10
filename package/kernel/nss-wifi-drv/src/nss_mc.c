@@ -37,8 +37,6 @@
 #include <net/switchdev.h>
 
 #include "nss_drv.h"
-#include "nss_ipv4.h"
-#include "nss_ipv6.h"
 
 #define NSS_MC_VLAN_NONE	0xfff
 /* ponytail: port pairs per (S,G); one stream rarely uses more than one */

@@ -38,11 +38,6 @@
 #include <net/pkt_cls.h>
 
 #include "nss_drv.h"
-#include "nss_dynamic_interface.h"
-#include "nss_shaper.h"	/* nss_if.h needs it and does not include it */
-#include "nss_if.h"
-#include "nss_ipv4.h"
-#include "nss_ipv6.h"
 
 /* Clamp the priority to the range the egress queues express; a higher value
  * selects no distinct queue. The shipped PPE flow back end bounds the same

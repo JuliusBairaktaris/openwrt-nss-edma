@@ -20,9 +20,7 @@
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
-#include "nss_arch.h"
-#include "nss_def.h"
-#include "nss_cmn.h"
+#include "nss_fw.h"
 
 /* Ring geometry. The index page always describes 16 host-to-firmware and 15
  * firmware-to-host slots whatever the SoC populates, so the arrays are sized

@@ -24,7 +24,6 @@
 #include <linux/spinlock.h>
 
 #include "nss_drv.h"
-#include "nss_dynamic_interface.h"
 
 /* The firmware answers in the buffer it was sent, so the buffer is as large
  * as the largest answer rather than as the request.
