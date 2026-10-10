@@ -52,6 +52,7 @@
 #define NSS_N2H_BUFFER_EMPTY	1
 #define NSS_N2H_BUFFER_PACKET	3
 #define NSS_N2H_BUFFER_STATUS	6
+#define NSS_N2H_BUFFER_PACKET_EXT	13
 
 /* The hardware fills the named checksum on the way out; without these a
  * frame the stack left for the device to finish leaves carrying only the
@@ -355,6 +356,7 @@ struct nss_core {
 	bool running;
 	bool wifili_probed;
 	bool wifili_started;
+	bool mesh_capable;
 	bool clocks_on;
 	/* Asked to run: set and cleared through debugfs, cleared by faults. */
 	bool up;
@@ -474,6 +476,49 @@ bool nss_wifili_rx_80211(u32 if_num, struct net_device *dev,
 			 struct sk_buff *skb, struct napi_struct *napi);
 void nss_wifili_me_print(struct seq_file *s);
 void nss_wifili_me_exit(void);
+int nss_wifili_vdev_msg(struct nss_core *core, int if_num, u32 type,
+			const void *body, size_t len);
+int nss_wifili_vdev_cmd(struct nss_core *core, int if_num, u32 cmd, u32 value);
+
+struct nss_wifi_mesh_ops;
+
+#ifdef NSS_FIRMWARE_VERSION_11_4
+bool nss_mesh_probe(struct nss_core *core);
+int nss_mesh_add(struct nss_core *core, struct net_device *dev, int link,
+		 const u8 *mac, const struct nss_wifi_mesh_ops *ops, void *priv);
+int nss_mesh_attach(struct nss_core *core, int link);
+void nss_mesh_stop(struct nss_core *core, int link);
+void nss_mesh_del(struct nss_core *core, int link);
+void nss_mesh_reset(void);
+int nss_mesh_ifnum(int ifindex);
+bool nss_mesh_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
+		     u32 len);
+bool nss_mesh_recv(struct nss_core *core, struct napi_struct *napi,
+		   const struct n2h_descriptor *desc, struct sk_buff *skb);
+void nss_mesh_print(struct seq_file *s);
+void nss_mesh_exit(void);
+#else
+static inline bool nss_mesh_probe(struct nss_core *core) { return false; }
+static inline void nss_mesh_stop(struct nss_core *core, int link) {}
+static inline void nss_mesh_del(struct nss_core *core, int link) {}
+static inline void nss_mesh_reset(void) {}
+static inline int nss_mesh_ifnum(int ifindex) { return -ENODEV; }
+static inline bool nss_mesh_notify(struct nss_core *core,
+				   const struct nss_cmn_msg *ncm, u32 len)
+{
+	return false;
+}
+
+static inline bool nss_mesh_recv(struct nss_core *core, struct napi_struct *napi,
+				 const struct n2h_descriptor *desc,
+				 struct sk_buff *skb)
+{
+	return false;
+}
+
+static inline void nss_mesh_print(struct seq_file *s) {}
+static inline void nss_mesh_exit(void) {}
+#endif
 int nss_phys_arm(struct nss_core *core, unsigned long mask);
 int nss_phys_msg(struct nss_core *core, int if_num, u32 type,
 		 const void *body, size_t len);
