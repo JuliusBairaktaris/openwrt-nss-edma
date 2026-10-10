@@ -1,0 +1,611 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] mac80211: let a driver mirror the mesh path table
+
+A device that forwards 802.11s frames itself needs the mesh path and
+proxy tables, and it sees path use and proxied addresses that the stack
+does not.
+
+Add config_mesh_offload_path(), called in atomic context whenever a path
+or proxy is added, changed, deactivated or deleted, and
+ieee80211_mesh_path_offld_change_notify() for the device to report a path
+in use, a destination it has no path to, an expired path, or a proxy it
+learned. The mesh TTL, path refresh time and forwarding setting are copied
+into the BSS configuration when the mesh starts and when they change.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+Index: backports-7.2/include/net/mac80211.h
+===================================================================
+--- backports-7.2.orig/include/net/mac80211.h
++++ backports-7.2/include/net/mac80211.h
+@@ -146,6 +146,75 @@
+ struct device;
+ 
+ /**
++ * enum ieee80211_mesh_path_offld_cmd - mesh path table change
++ * @IEEE80211_MESH_PATH_OFFLD_CMD_ADD_MPATH: path added
++ * @IEEE80211_MESH_PATH_OFFLD_CMD_UPDATE_MPATH: path changed
++ * @IEEE80211_MESH_PATH_OFFLD_CMD_DELETE_MPATH: path deleted
++ * @IEEE80211_MESH_PATH_OFFLD_CMD_ADD_MPP: proxy added
++ * @IEEE80211_MESH_PATH_OFFLD_CMD_UPDATE_MPP: proxy changed
++ * @IEEE80211_MESH_PATH_OFFLD_CMD_DELETE_MPP: proxy deleted
++ */
++enum ieee80211_mesh_path_offld_cmd {
++	IEEE80211_MESH_PATH_OFFLD_CMD_ADD_MPATH,
++	IEEE80211_MESH_PATH_OFFLD_CMD_UPDATE_MPATH,
++	IEEE80211_MESH_PATH_OFFLD_CMD_DELETE_MPATH,
++	IEEE80211_MESH_PATH_OFFLD_CMD_ADD_MPP,
++	IEEE80211_MESH_PATH_OFFLD_CMD_UPDATE_MPP,
++	IEEE80211_MESH_PATH_OFFLD_CMD_DELETE_MPP,
++};
++
++/**
++ * enum ieee80211_mesh_path_offld_action - mesh path event from a device
++ * @IEEE80211_MESH_PATH_OFFLD_ACTION_MPATH_REFRESH: path in use, refresh it
++ * @IEEE80211_MESH_PATH_OFFLD_ACTION_MPATH_DEL: path to a proxied address
++ * @IEEE80211_MESH_PATH_OFFLD_ACTION_MPATH_EXP: path expired
++ * @IEEE80211_MESH_PATH_OFFLD_ACTION_MPP_LEARN: proxy learned, not yet added
++ * @IEEE80211_MESH_PATH_OFFLD_ACTION_MPP_ADD: proxy added by the device
++ * @IEEE80211_MESH_PATH_OFFLD_ACTION_MPP_UPDATE: proxy changed or in use
++ * @IEEE80211_MESH_PATH_OFFLD_ACTION_PATH_NOT_FOUND: no path to a destination
++ */
++enum ieee80211_mesh_path_offld_action {
++	IEEE80211_MESH_PATH_OFFLD_ACTION_MPATH_REFRESH,
++	IEEE80211_MESH_PATH_OFFLD_ACTION_MPATH_DEL,
++	IEEE80211_MESH_PATH_OFFLD_ACTION_MPATH_EXP,
++	IEEE80211_MESH_PATH_OFFLD_ACTION_MPP_LEARN,
++	IEEE80211_MESH_PATH_OFFLD_ACTION_MPP_ADD,
++	IEEE80211_MESH_PATH_OFFLD_ACTION_MPP_UPDATE,
++	IEEE80211_MESH_PATH_OFFLD_ACTION_PATH_NOT_FOUND,
++};
++
++#define IEEE80211_MESH_PATH_ACTIVE	BIT(0)
++#define IEEE80211_MESH_PATH_RESOLVING	BIT(1)
++#define IEEE80211_MESH_PATH_FIXED	BIT(3)
++#define IEEE80211_MESH_PATH_RESOLVED	BIT(4)
++
++/**
++ * struct ieee80211_mesh_path_offld - a mesh path, for a device
++ * @mesh_da: path destination, or the mesh proxy of @da
++ * @da: proxied destination
++ * @next_hop: next hop
++ * @old_next_hop: next hop before this change
++ * @ta: transmitter of a frame that found no path
++ * @metric: path metric
++ * @exp_time: ms until the path expires
++ * @hop_count: hop count
++ * @flags: IEEE80211_MESH_PATH_* flags
++ * @mesh_gate: the destination is a mesh gate
++ */
++struct ieee80211_mesh_path_offld {
++	u8 mesh_da[ETH_ALEN];
++	u8 da[ETH_ALEN];
++	u8 next_hop[ETH_ALEN];
++	u8 old_next_hop[ETH_ALEN];
++	u8 ta[ETH_ALEN];
++	u32 metric;
++	u32 exp_time;
++	u8 hop_count;
++	u8 flags;
++	bool mesh_gate;
++};
++
++/**
+  * enum ieee80211_max_queues - maximum number of queues
+  *
+  * @IEEE80211_MAX_QUEUES: Maximum number of regular device queues.
+@@ -793,6 +862,9 @@ struct ieee80211_bss_npca_params {
+  * @s1g_long_beacon_period: number of beacon intervals between each long
+  *	beacon transmission.
+  * @npca: NPCA parameters
++ * @mesh_ttl: mesh TTL, for a driver that forwards mesh frames itself
++ * @mesh_path_refresh_time: mesh path refresh time in ms, likewise
++ * @mesh_forwarding: whether the mesh forwards, likewise
+  */
+ struct ieee80211_bss_conf {
+ 	struct ieee80211_vif *vif;
+@@ -898,6 +970,10 @@ struct ieee80211_bss_conf {
+ 	u8 s1g_long_beacon_period;
+ 
+ 	struct ieee80211_bss_npca_params npca;
++
++	u8 mesh_ttl;
++	u32 mesh_path_refresh_time;
++	bool mesh_forwarding;
+ };
+ 
+ #define IEEE80211_NAN_MAX_CHANNELS 3
+@@ -4675,6 +4751,8 @@ struct ieee80211_prep_tx_info {
+  *	to use rx decapsulation offload
+  * @sta_set_airtime_weight: Called to notify the driver of a change to a
+  *	station's airtime fairness weight, so it can be programmed in hardware.
++ * @config_mesh_offload_path: Mirror a mesh path table change into a device
++ *	that forwards mesh frames itself. Called in atomic context.
+  * @add_twt_setup: Update hw with TWT agreement parameters received from the peer.
+  *	This callback allows the hw to check if requested parameters
+  *	are supported and if there is enough room for a new agreement.
+@@ -5092,6 +5170,10 @@ struct ieee80211_ops {
+ 	void (*sta_set_airtime_weight)(struct ieee80211_hw *hw,
+ 				       struct ieee80211_vif *vif,
+ 				       struct ieee80211_sta *sta, u16 weight);
++	void (*config_mesh_offload_path)(struct ieee80211_hw *hw,
++					 struct ieee80211_vif *vif,
++					 enum ieee80211_mesh_path_offld_cmd cmd,
++					 const struct ieee80211_mesh_path_offld *path);
+ 	void (*add_twt_setup)(struct ieee80211_hw *hw,
+ 			      struct ieee80211_sta *sta,
+ 			      struct ieee80211_twt_setup *twt);
+@@ -8230,4 +8312,29 @@ bool ieee80211_vif_nan_started(struct ie
+  * Return: 0 if success and non-zero on error
+  */
+ int ieee80211_encrypt_tx_skb(struct sk_buff *skb);
++
++/**
++ * ieee80211_mesh_path_offld_change_notify - report a mesh path event
++ * @vif: the mesh interface
++ * @path: the path; which fields are valid depends on @action
++ * @action: what the device saw
++ *
++ * For a device that forwards mesh frames itself and so sees path use and
++ * proxied addresses the stack does not. May be called from softirq.
++ *
++ * Return: 0 on success, a negative error otherwise.
++ */
++#ifdef CPTCFG_MAC80211_MESH
++int ieee80211_mesh_path_offld_change_notify(struct ieee80211_vif *vif,
++					    const struct ieee80211_mesh_path_offld *path,
++					    enum ieee80211_mesh_path_offld_action action);
++#else
++static inline int
++ieee80211_mesh_path_offld_change_notify(struct ieee80211_vif *vif,
++					const struct ieee80211_mesh_path_offld *path,
++					enum ieee80211_mesh_path_offld_action action)
++{
++	return -EOPNOTSUPP;
++}
++#endif
+ #endif /* MAC80211_H */
+Index: backports-7.2/net/mac80211/driver-ops.h
+===================================================================
+--- backports-7.2.orig/net/mac80211/driver-ops.h
++++ backports-7.2/net/mac80211/driver-ops.h
+@@ -1833,4 +1833,18 @@ drv_nan_peer_sched_changed(struct ieee80
+ 	return ret;
+ }
+ 
++static inline void
++drv_config_mesh_offload_path(struct ieee80211_local *local,
++			     struct ieee80211_sub_if_data *sdata,
++			     enum ieee80211_mesh_path_offld_cmd cmd,
++			     const struct ieee80211_mesh_path_offld *path)
++{
++	if (!(sdata->flags & IEEE80211_SDATA_IN_DRIVER))
++		return;
++
++	if (local->ops->config_mesh_offload_path)
++		local->ops->config_mesh_offload_path(&local->hw, &sdata->vif,
++						     cmd, path);
++}
++
+ #endif /* __MAC80211_DRIVER_OPS */
+Index: backports-7.2/net/mac80211/mesh.h
+===================================================================
+--- backports-7.2.orig/net/mac80211/mesh.h
++++ backports-7.2/net/mac80211/mesh.h
+@@ -316,6 +316,12 @@ mesh_path_lookup_by_idx(struct ieee80211
+ struct mesh_path *
+ mpp_path_lookup_by_idx(struct ieee80211_sub_if_data *sdata, int idx);
+ void mesh_path_fix_nexthop(struct mesh_path *mpath, struct sta_info *next_hop);
++void mesh_path_offld(struct mesh_path *mpath,
++		     enum ieee80211_mesh_path_offld_cmd cmd,
++		     const u8 *old_next_hop);
++int __mpp_path_add(struct ieee80211_sub_if_data *sdata,
++		   const u8 *dst, const u8 *mpp, bool offld);
++void ieee80211_mesh_offld_config(struct ieee80211_sub_if_data *sdata);
+ void mesh_path_expire(struct ieee80211_sub_if_data *sdata);
+ void mesh_rx_path_sel_frame(struct ieee80211_sub_if_data *sdata,
+ 			    struct ieee80211_mgmt *mgmt, size_t len);
+Index: backports-7.2/net/mac80211/mesh_pathtbl.c
+===================================================================
+--- backports-7.2.orig/net/mac80211/mesh_pathtbl.c
++++ backports-7.2/net/mac80211/mesh_pathtbl.c
+@@ -15,6 +15,7 @@
+ #include "wme.h"
+ #include "ieee80211_i.h"
+ #include "mesh.h"
++#include "driver-ops.h"
+ #include <linux/rhashtable.h>
+ 
+ static void mesh_path_free_rcu(struct mesh_table *tbl, struct mesh_path *mpath);
+@@ -240,17 +241,66 @@ static void mesh_path_move_to_queue(stru
+ }
+ 
+ 
++/**
++ * mesh_path_offld - mirror a path table change into the driver
++ * @mpath: the path
++ * @cmd: what changed
++ * @old_next_hop: next hop before the change, or NULL if it did not change
++ *
++ * For a device that forwards mesh frames itself.
++ */
++void mesh_path_offld(struct mesh_path *mpath,
++		     enum ieee80211_mesh_path_offld_cmd cmd,
++		     const u8 *old_next_hop)
++{
++	struct ieee80211_sub_if_data *sdata = mpath->sdata;
++	struct ieee80211_mesh_path_offld p = {};
++	struct sta_info *next_hop;
++
++	if (!sdata->local->ops->config_mesh_offload_path)
++		return;
++
++	if (cmd >= IEEE80211_MESH_PATH_OFFLD_CMD_ADD_MPP) {
++		ether_addr_copy(p.mesh_da, mpath->mpp);
++		ether_addr_copy(p.da, mpath->dst);
++	} else {
++		ether_addr_copy(p.mesh_da, mpath->dst);
++	}
++
++	rcu_read_lock();
++	next_hop = rcu_dereference(mpath->next_hop);
++	if (next_hop)
++		ether_addr_copy(p.next_hop, next_hop->sta.addr);
++	rcu_read_unlock();
++
++	ether_addr_copy(p.old_next_hop, old_next_hop ?: p.next_hop);
++	p.metric = mpath->metric;
++	if (time_before(jiffies, mpath->exp_time))
++		p.exp_time = jiffies_to_msecs(mpath->exp_time - jiffies);
++	p.hop_count = mpath->hop_count;
++	p.flags = mpath->flags;
++	p.mesh_gate = mpath->is_gate;
++
++	drv_config_mesh_offload_path(sdata->local, sdata, cmd, &p);
++}
++
+ static struct mesh_path *mpath_lookup(struct mesh_table *tbl, const u8 *dst,
+ 				      struct ieee80211_sub_if_data *sdata)
+ {
+ 	struct mesh_path *mpath;
++	bool was_active;
+ 
+ 	mpath = rhashtable_lookup(&tbl->rhead, dst, mesh_rht_params);
+ 
+ 	if (mpath && mpath_expired(mpath)) {
+ 		spin_lock_bh(&mpath->state_lock);
++		was_active = mpath->flags & MESH_PATH_ACTIVE;
+ 		mpath->flags &= ~MESH_PATH_ACTIVE;
+ 		spin_unlock_bh(&mpath->state_lock);
++		if (was_active && tbl == &sdata->u.mesh.mesh_paths)
++			mesh_path_offld(mpath,
++					IEEE80211_MESH_PATH_OFFLD_CMD_UPDATE_MPATH,
++					NULL);
+ 	}
+ 	return mpath;
+ }
+@@ -713,14 +763,17 @@ struct mesh_path *mesh_path_add(struct i
+ 			return mpath;
+ 
+ 		new_mpath = mpath;
++	} else {
++		mesh_path_offld(new_mpath, IEEE80211_MESH_PATH_OFFLD_CMD_ADD_MPATH,
++				NULL);
+ 	}
+ 
+ 	sdata->u.mesh.mesh_paths_generation++;
+ 	return new_mpath;
+ }
+ 
+-int mpp_path_add(struct ieee80211_sub_if_data *sdata,
+-		 const u8 *dst, const u8 *mpp)
++int __mpp_path_add(struct ieee80211_sub_if_data *sdata,
++		   const u8 *dst, const u8 *mpp, bool offld)
+ {
+ 	struct mesh_table *tbl;
+ 	struct mesh_path *new_mpath;
+@@ -745,8 +798,13 @@ int mpp_path_add(struct ieee80211_sub_if
+ 	ret = rhashtable_lookup_insert_fast(&tbl->rhead,
+ 					    &new_mpath->rhash,
+ 					    mesh_rht_params);
+-	if (!ret)
++	if (!ret) {
+ 		hlist_add_head_rcu(&new_mpath->walk_list, &tbl->walk_head);
++		if (offld)
++			mesh_path_offld(new_mpath,
++					IEEE80211_MESH_PATH_OFFLD_CMD_ADD_MPP,
++					NULL);
++	}
+ 	spin_unlock_bh(&tbl->walk_lock);
+ 
+ 	if (ret)
+@@ -758,6 +816,12 @@ int mpp_path_add(struct ieee80211_sub_if
+ 	return ret;
+ }
+ 
++int mpp_path_add(struct ieee80211_sub_if_data *sdata,
++		 const u8 *dst, const u8 *mpp)
++{
++	return __mpp_path_add(sdata, dst, mpp, true);
++}
++
+ 
+ /**
+  * mesh_plink_broken - deactivates paths and sends perr when a link breaks
+@@ -783,6 +847,9 @@ void mesh_plink_broken(struct sta_info *
+ 			mpath->flags &= ~MESH_PATH_ACTIVE;
+ 			++mpath->sn;
+ 			spin_unlock_bh(&mpath->state_lock);
++			mesh_path_offld(mpath,
++					IEEE80211_MESH_PATH_OFFLD_CMD_UPDATE_MPATH,
++					sta->sta.addr);
+ 			mesh_path_error_tx(sdata,
+ 				sdata->u.mesh.mshcfg.element_ttl,
+ 				mpath->dst, mpath->sn,
+@@ -810,6 +877,9 @@ static void mesh_path_free_rcu(struct me
+ 
+ static void __mesh_path_del(struct mesh_table *tbl, struct mesh_path *mpath)
+ {
++	mesh_path_offld(mpath, tbl == &mpath->sdata->u.mesh.mpp_paths ?
++			       IEEE80211_MESH_PATH_OFFLD_CMD_DELETE_MPP :
++			       IEEE80211_MESH_PATH_OFFLD_CMD_DELETE_MPATH, NULL);
+ 	hlist_del_rcu(&mpath->walk_list);
+ 	rhashtable_remove_fast(&tbl->rhead, &mpath->rhash, mesh_rht_params);
+ 	if (tbl == &mpath->sdata->u.mesh.mpp_paths)
+@@ -1046,7 +1116,14 @@ void mesh_path_flush_pending(struct mesh
+  */
+ void mesh_path_fix_nexthop(struct mesh_path *mpath, struct sta_info *next_hop)
+ {
++	u8 old_next_hop[ETH_ALEN] = {};
++	struct sta_info *old;
++
+ 	spin_lock_bh(&mpath->state_lock);
++	old = rcu_dereference_protected(mpath->next_hop,
++					lockdep_is_held(&mpath->state_lock));
++	if (old)
++		ether_addr_copy(old_next_hop, old->sta.addr);
+ 	mesh_path_assign_nexthop(mpath, next_hop);
+ 	mpath->sn = 0xffff;
+ 	mpath->metric = 0;
+@@ -1056,6 +1133,8 @@ void mesh_path_fix_nexthop(struct mesh_p
+ 	mesh_path_activate(mpath);
+ 	mesh_fast_tx_flush_mpath(mpath);
+ 	spin_unlock_bh(&mpath->state_lock);
++	mesh_path_offld(mpath, IEEE80211_MESH_PATH_OFFLD_CMD_UPDATE_MPATH,
++			old_next_hop);
+ 	ewma_mesh_fail_avg_init(&next_hop->mesh->fail_avg);
+ 	/* init it at a low value - 0 start is tricky */
+ 	ewma_mesh_fail_avg_add(&next_hop->mesh->fail_avg, 1);
+Index: backports-7.2/net/mac80211/mesh_hwmp.c
+===================================================================
+--- backports-7.2.orig/net/mac80211/mesh_hwmp.c
++++ backports-7.2/net/mac80211/mesh_hwmp.c
+@@ -463,7 +463,12 @@ static u32 hwmp_route_info_get(struct ie
+ 		}
+ 
+ 		if (fresh_info) {
+-			if (rcu_access_pointer(mpath->next_hop) != sta) {
++			struct sta_info *old = rcu_dereference(mpath->next_hop);
++			u8 old_next_hop[ETH_ALEN] = {};
++
++			if (old)
++				ether_addr_copy(old_next_hop, old->sta.addr);
++			if (old != sta) {
+ 				mpath->path_change_count++;
+ 				flush_mpath = true;
+ 			}
+@@ -476,6 +481,9 @@ static u32 hwmp_route_info_get(struct ie
+ 			mpath->hop_count = hopcount;
+ 			mesh_path_activate(mpath);
+ 			spin_unlock_bh(&mpath->state_lock);
++			mesh_path_offld(mpath,
++					IEEE80211_MESH_PATH_OFFLD_CMD_UPDATE_MPATH,
++					old_next_hop);
+ 			if (flush_mpath)
+ 				mesh_fast_tx_flush_mpath(mpath);
+ 			ewma_mesh_fail_avg_init(&sta->mesh->fail_avg);
+@@ -515,7 +523,12 @@ static u32 hwmp_route_info_get(struct ie
+ 		}
+ 
+ 		if (fresh_info) {
+-			if (rcu_access_pointer(mpath->next_hop) != sta) {
++			struct sta_info *old = rcu_dereference(mpath->next_hop);
++			u8 old_next_hop[ETH_ALEN] = {};
++
++			if (old)
++				ether_addr_copy(old_next_hop, old->sta.addr);
++			if (old != sta) {
+ 				mpath->path_change_count++;
+ 				flush_mpath = true;
+ 			}
+@@ -526,6 +539,9 @@ static u32 hwmp_route_info_get(struct ie
+ 			mpath->hop_count = 1;
+ 			mesh_path_activate(mpath);
+ 			spin_unlock_bh(&mpath->state_lock);
++			mesh_path_offld(mpath,
++					IEEE80211_MESH_PATH_OFFLD_CMD_UPDATE_MPATH,
++					old_next_hop);
+ 			if (flush_mpath)
+ 				mesh_fast_tx_flush_mpath(mpath);
+ 			ewma_mesh_fail_avg_init(&sta->mesh->fail_avg);
+@@ -790,6 +806,9 @@ static void hwmp_perr_frame_process(stru
+ 			else
+ 				mpath->sn += 1;
+ 			spin_unlock_bh(&mpath->state_lock);
++			mesh_path_offld(mpath,
++					IEEE80211_MESH_PATH_OFFLD_CMD_UPDATE_MPATH,
++					ta);
+ 			if (!ifmsh->mshcfg.dot11MeshForwarding)
+ 				goto endperr;
+ 			mesh_path_error_tx(sdata, ttl, target_addr,
+@@ -1356,3 +1375,128 @@ void mesh_path_tx_root_frame(struct ieee
+ 		return;
+ 	}
+ }
++
++/* A path the device forwards over and the stack never sees used. */
++static int mesh_path_offld_refresh(struct ieee80211_sub_if_data *sdata,
++				   const u8 *mda)
++{
++	struct mesh_path *mpath;
++
++	mpath = mesh_path_lookup(sdata, mda);
++	if (!mpath || !(mpath->flags & MESH_PATH_ACTIVE))
++		return -ENOENT;
++
++	if (!(mpath->flags & (MESH_PATH_RESOLVING | MESH_PATH_FIXED)))
++		mesh_queue_preq(mpath, PREQ_Q_F_START | PREQ_Q_F_REFRESH);
++
++	return 0;
++}
++
++/* The device found the destination behind a proxy as well. */
++static int mesh_path_offld_del(struct ieee80211_sub_if_data *sdata,
++			       const u8 *mda)
++{
++	if (!mesh_path_lookup(sdata, mda) || !mpp_path_lookup(sdata, mda))
++		return -ENOENT;
++
++	return mesh_path_del(sdata, mda);
++}
++
++/* A path the device holds expired, or has none: discover it, and on a
++ * forwarded frame tell the transmitter it was not forwarded.
++ */
++static int mesh_path_offld_resolve(struct ieee80211_sub_if_data *sdata,
++				   const u8 *mda, const u8 *ta, bool expired)
++{
++	struct mesh_path *mpath;
++
++	mpath = mesh_path_lookup(sdata, mda);
++	if (!mpath) {
++		mpath = mesh_path_add(sdata, mda);
++		if (IS_ERR(mpath))
++			return PTR_ERR(mpath);
++	}
++
++	if (expired) {
++		spin_lock_bh(&mpath->state_lock);
++		mpath->flags &= ~MESH_PATH_ACTIVE;
++		spin_unlock_bh(&mpath->state_lock);
++	}
++
++	if (!(mpath->flags & MESH_PATH_RESOLVING) &&
++	    mesh_path_sel_is_hwmp(sdata))
++		mesh_queue_preq(mpath, PREQ_Q_F_START);
++
++	if (ta && !is_zero_ether_addr(ta))
++		mesh_path_error_tx(sdata, sdata->u.mesh.mshcfg.element_ttl, mda,
++				   0, WLAN_REASON_MESH_PATH_NOFORWARD, ta);
++
++	return 0;
++}
++
++static int mesh_path_offld_mpp(struct ieee80211_sub_if_data *sdata,
++			       const u8 *da, const u8 *mda, bool add,
++			       bool offld)
++{
++	struct mesh_path *mppath;
++
++	mppath = mpp_path_lookup(sdata, da);
++	if (add)
++		return mppath ? -EEXIST : __mpp_path_add(sdata, da, mda, offld);
++
++	if (!mppath)
++		return -ENOENT;
++
++	spin_lock_bh(&mppath->state_lock);
++	if (!ether_addr_equal(mppath->mpp, mda))
++		memcpy(mppath->mpp, mda, ETH_ALEN);
++	mppath->exp_time = jiffies;
++	spin_unlock_bh(&mppath->state_lock);
++
++	return 0;
++}
++
++int ieee80211_mesh_path_offld_change_notify(struct ieee80211_vif *vif,
++					    const struct ieee80211_mesh_path_offld *path,
++					    enum ieee80211_mesh_path_offld_action action)
++{
++	struct ieee80211_sub_if_data *sdata = vif_to_sdata(vif);
++	int ret;
++
++	rcu_read_lock();
++
++	switch (action) {
++	case IEEE80211_MESH_PATH_OFFLD_ACTION_MPATH_REFRESH:
++		ret = mesh_path_offld_refresh(sdata, path->mesh_da);
++		break;
++	case IEEE80211_MESH_PATH_OFFLD_ACTION_MPATH_DEL:
++		ret = mesh_path_offld_del(sdata, path->mesh_da);
++		break;
++	case IEEE80211_MESH_PATH_OFFLD_ACTION_MPATH_EXP:
++		ret = mesh_path_offld_resolve(sdata, path->mesh_da, NULL, true);
++		break;
++	case IEEE80211_MESH_PATH_OFFLD_ACTION_PATH_NOT_FOUND:
++		ret = mesh_path_offld_resolve(sdata, path->da, path->ta, false);
++		break;
++	case IEEE80211_MESH_PATH_OFFLD_ACTION_MPP_LEARN:
++		ret = mesh_path_offld_mpp(sdata, path->da, path->mesh_da, true,
++					  true);
++		break;
++	case IEEE80211_MESH_PATH_OFFLD_ACTION_MPP_ADD:
++		ret = mesh_path_offld_mpp(sdata, path->da, path->mesh_da, true,
++					  false);
++		break;
++	case IEEE80211_MESH_PATH_OFFLD_ACTION_MPP_UPDATE:
++		ret = mesh_path_offld_mpp(sdata, path->da, path->mesh_da, false,
++					  false);
++		break;
++	default:
++		ret = -EINVAL;
++		break;
++	}
++
++	rcu_read_unlock();
++
++	return ret;
++}
++EXPORT_SYMBOL(ieee80211_mesh_path_offld_change_notify);
+Index: backports-7.2/net/mac80211/mesh.c
+===================================================================
+--- backports-7.2.orig/net/mac80211/mesh.c
++++ backports-7.2/net/mac80211/mesh.c
+@@ -1155,6 +1155,16 @@ void ieee80211_mbss_info_change_notify(s
+ 	wiphy_work_queue(sdata->local->hw.wiphy, &sdata->work);
+ }
+ 
++/* For a device that forwards mesh frames itself. */
++void ieee80211_mesh_offld_config(struct ieee80211_sub_if_data *sdata)
++{
++	struct mesh_config *conf = &sdata->u.mesh.mshcfg;
++
++	sdata->vif.bss_conf.mesh_ttl = conf->dot11MeshTTL;
++	sdata->vif.bss_conf.mesh_path_refresh_time = conf->path_refresh_time;
++	sdata->vif.bss_conf.mesh_forwarding = conf->dot11MeshForwarding;
++}
++
+ int ieee80211_start_mesh(struct ieee80211_sub_if_data *sdata)
+ {
+ 	struct ieee80211_if_mesh *ifmsh = &sdata->u.mesh;
+@@ -1190,6 +1200,7 @@ int ieee80211_start_mesh(struct ieee8021
+ 	}
+ 
+ 	ieee80211_recalc_dtim(sdata, drv_get_tsf(local, sdata));
++	ieee80211_mesh_offld_config(sdata);
+ 	ieee80211_link_info_change_notify(sdata, &sdata->deflink, changed);
+ 
+ 	netif_carrier_on(sdata->dev);
+Index: backports-7.2/net/mac80211/cfg.c
+===================================================================
+--- backports-7.2.orig/net/mac80211/cfg.c
++++ backports-7.2/net/mac80211/cfg.c
+@@ -3297,6 +3297,7 @@ static int ieee80211_update_mesh_config(
+ 	if (_chg_mesh_attr(NL80211_MESHCONF_CONNECTED_TO_AS, mask))
+ 		conf->dot11MeshConnectedToAuthServer =
+ 			nconf->dot11MeshConnectedToAuthServer;
++	ieee80211_mesh_offld_config(sdata);
+ 	ieee80211_mbss_info_change_notify(sdata, BSS_CHANGED_BEACON);
+ 	return 0;
+ }
