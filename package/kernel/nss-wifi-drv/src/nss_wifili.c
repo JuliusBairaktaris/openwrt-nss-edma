@@ -1201,10 +1201,12 @@ int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
 	pm.tx_ast_hash = tx_ast_hash;
 	pm.nss_peer_mem = dma;
 
+#ifndef NSS_FIRMWARE_VERSION_11_4
 	/* The working stack sends a size of 0. With a size declared, most
 	 * frames queued to the peer are dropped.
 	 */
 	pm.peer_memory_size = 0;
+#endif
 
 	ret = nss_wifili_peer_msg(core, NSS_WIFILI_PEER_CREATE_MSG, &pm);
 	if (ret) {

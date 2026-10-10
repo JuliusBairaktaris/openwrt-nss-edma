@@ -87,7 +87,11 @@
 				/**< Maximum DMA error codes. */
 #define NSS_WIFILI_MAX_TID 8
 				/**< Maximum TID values. */
+#ifndef NSS_FIRMWARE_VERSION_11_4
 #define NSS_WIFILI_DELAY_INDEX_MAX 13
+#else
+#define NSS_WIFILI_DELAY_INDEX_MAX 10
+#endif
 				/**< Maximum software enqueue delay buckets. */
 #define NSS_WIFILI_MAX_NUMBER_OF_ADDTNL_SEG 64
 				/**< Maximum number of additional pages allocated from host. */
@@ -965,8 +969,10 @@ struct nss_wifili_peer_msg {
 			/**< Peer extended statistics memory. */
 	uint32_t flags;
 			/**< Peer flags. */
+#ifndef NSS_FIRMWARE_VERSION_11_4
 	uint32_t peer_memory_size;
 			/**< Peer memory allocated from host to NSS. */
+#endif
 };
 
 /**
@@ -1086,8 +1092,10 @@ struct nss_wifili_tx_comp_ring_stats {
 	uint32_t invalid_cookie;		/**< Tx completion ring descriptor has invalid cookies. */
 	uint32_t hw_ring_empty;			/**< Tx completion hardware ring empty. */
 	uint32_t ring_reaped;			/**< Tx completion successfull ring reaped. */
+#ifndef NSS_FIRMWARE_VERSION_11_4
 	uint32_t tx_cap_enqueue_count;		/**< Number of Tx packets enqueued to host. */
 	uint32_t tx_cap_enqueue_fail_count;	/**< Number of Tx packets failed to enqueue to host. */
+#endif
 };
 
 /**
@@ -1486,11 +1494,14 @@ struct nss_wifili_rx_ctrl_stats {
 	uint32_t bcast_rcv_cnt;			/**< Total number of broadcast packets received. */
 	uint32_t bcast_rcv_bytes;		/**< Total number of broadcast bytes received. */
 	uint32_t defrag_mcast_drop;		/**< Total number of defrag multicast dropped packets. */
+#ifndef NSS_FIRMWARE_VERSION_11_4
 	uint32_t mcast_3addr_drop;		/**< Total number of 3 address multicast dropped packets. */
 	uint32_t ucast_rcv_cnt;			/**< Total number of unicast packets received. */
 	uint32_t ucast_rcv_bytes;		/**< Total number of unicast bytes received. */
+#endif
 };
 
+#ifndef NSS_FIRMWARE_VERSION_11_4
 /**
  * nss_wifili_retry_ctrl_stats
  *	Peer retry statistics.
@@ -1503,6 +1514,7 @@ struct nss_wifili_retry_ctrl_stats {
 	uint32_t tx_mpdu_retry_count;		/**< Per mpdu retry count. */
 	uint32_t tx_mpdu_total_retry_count;	/**< Total mpdu retry count. */
 };
+#endif
 
 /**
  * nss_wifili_peer_ctrl_stats
@@ -1514,8 +1526,10 @@ struct nss_wifili_peer_ctrl_stats {
 				/**< Peer Tx control statistics. */
 	struct nss_wifili_rx_ctrl_stats rx;
 				/**< Peer Rx control statistics. */
+#ifndef NSS_FIRMWARE_VERSION_11_4
 	struct nss_wifili_retry_ctrl_stats retry;
 				/**< Peer retry Statistics. */
+#endif
 };
 
 /**

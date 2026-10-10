@@ -1057,10 +1057,12 @@ struct nss_wifi_vdev_mcast_enhance_stats {
 	 */
 	uint32_t igmp_ucast_converted;
 
+#ifndef NSS_FIRMWARE_VERSION_11_4
 	/**
 	 * Number of group members that could not be added due to failed allocation.
 	 */
 	uint32_t mcast_mbr_alloc_failed;
+#endif
 };
 
 /**
@@ -1110,10 +1112,12 @@ struct nss_wifi_vdev_stats_sync_msg {
 	uint32_t rx_mic_err;			/**< Receive MIC error */
 	uint32_t mcbc_exc_host_fail_cnt;
 			/**< Number of multicast/broadcast packets failed to send to host through exception path. */
+#ifndef NSS_FIRMWARE_VERSION_11_4
 	uint32_t addr4_exc_fail;			/**< Number of failed 4 address exceptions. */
 	uint32_t addr4_exc_pass;			/**< Number of successful 4 address exceptions. */
 	uint32_t eapol_over_nl_exc_fail_cnt;		/**< Number of EAPOL over NL exception packet failures. */
 	uint32_t eapol_over_nl_exc_pass_cnt;		/**< Number of EAPOL over NL exception packet successes. */
+#endif
 };
 
 /**
