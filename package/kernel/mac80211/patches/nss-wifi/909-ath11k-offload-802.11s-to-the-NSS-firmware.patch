@@ -1,0 +1,265 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] ath11k: offload 802.11s to the NSS firmware
+
+On a firmware line that forwards a mesh itself, a mesh interface is
+registered with the NSS firmware as a mesh device and mesh nodes instead
+of as a virtual device. Frames to it stay 802.11, without the QoS control,
+which the hardware inserts. The mesh path table is mirrored to the
+firmware, and its path events go back to mac80211. Multicast the firmware
+receives on the mesh enters mac80211 as 802.11, which forwards it and
+drops duplicates.
+
+The firmware transmits mesh data itself, so the transmit status mac80211
+builds the airtime metric from is taken from the PPDU statistics instead.
+An open mesh installs no key, so a mesh peer is authorised in the firmware
+when the station is.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp_rx.c
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp_rx.c
++++ backports-7.2/drivers/net/wireless/ath/ath11k/dp_rx.c
+@@ -1381,6 +1381,9 @@ ath11k_update_per_peer_tx_stats(struct a
+ 	u32 tx_duration = 0;
+ 	u8 tid = HTT_PPDU_STATS_NON_QOS_TID;
+ 	bool is_ampdu = false;
++	struct ieee80211_rate_status status_rate = {};
++	struct ieee80211_tx_status status = {};
++	struct ieee80211_tx_info info = {};
+ 
+ 	if (!(usr_stats->tlv_flags & BIT(HTT_PPDU_STATS_TAG_USR_RATE)))
+ 		return;
+@@ -1505,9 +1508,27 @@ ath11k_update_per_peer_tx_stats(struct a
+ 
+ 		if (ath11k_debugfs_is_extd_tx_stats_enabled(ar))
+ 			ath11k_debugfs_sta_add_tx_stats(arsta, peer_stats, rate_idx);
++
++		/* Data the NSS firmware sends never completes here, and
++		 * the mesh path metric is built from transmit status.
++		 */
++		if (ab->nss_offload &&
++		    arsta->arvif->vif->type == NL80211_IFTYPE_MESH_POINT) {
++			info.flags = succ_pkts ? IEEE80211_TX_STAT_ACK : 0;
++			status_rate.rate_idx = arsta->txrate;
++			status_rate.try_count = 1;
++			status.sta = sta;
++			status.info = &info;
++			status.rates = &status_rate;
++			status.n_rates = 1;
++		}
+ 	}
+ 
+ 	spin_unlock_bh(&ab->base_lock);
++
++	if (status.sta)
++		ieee80211_tx_status_ext(ar->hw, &status);
++
+ 	rcu_read_unlock();
+ }
+ 
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/mac.c
++++ backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
+@@ -3570,6 +3570,14 @@ static void ath11k_mac_op_bss_info_chang
+ 					    ret);
+ 		}
+ 
++		/* The firmware forwards the mesh, so it is told how. */
++		if (vif->type == NL80211_IFTYPE_MESH_POINT &&
++		    arvif->nss_ifnum >= 0 &&
++		    nss_wifi_mesh_config(arvif->nss_ifnum, info->mesh_ttl,
++					 info->mesh_path_refresh_time,
++					 info->mesh_forwarding))
++			ath11k_warn(ar->ab, "failed to configure the NSS mesh\n");
++
+ 		if (arvif->bcca_zero_sent)
+ 			arvif->do_not_send_tmpl = true;
+ 		else
+@@ -6596,6 +6604,26 @@ static void ath11k_mac_op_tx(struct ieee
+ 	 * which is what makes the check it performs vacuous rather than
+ 	 * wrong.
+ 	 */
++	/* A mesh device carries 802.11, without the QoS control the
++	 * hardware inserts itself.
++	 */
++	if (ar->ab->nss_offload && !ath11k_nss_host_tx &&
++	    vif->type == NL80211_IFTYPE_MESH_POINT) {
++		if (ieee80211_is_data_qos(hdr->frame_control)) {
++			u8 *qc = ieee80211_get_qos_ctl(hdr);
++
++			memmove(skb->data + IEEE80211_QOS_CTL_LEN, skb->data,
++				qc - skb->data);
++			skb_pull(skb, IEEE80211_QOS_CTL_LEN);
++			hdr = (struct ieee80211_hdr *)skb->data;
++			hdr->frame_control &=
++				~cpu_to_le16(IEEE80211_STYPE_QOS_DATA);
++		}
++		if (nss_wifi_vdev_tx(arvif->nss_ifnum, skb))
++			ieee80211_free_txskb(ar->hw, skb);
++		return;
++	}
++
+ 	if (ar->ab->nss_offload && !ath11k_nss_host_tx) {
+ 		struct sk_buff *orig = skb;
+ 
+@@ -6975,6 +7003,50 @@ static u8 ath11k_nss_vdev_mode(struct at
+ 	return ATH11K_HW_TXRX_NATIVE_WIFI;
+ }
+ 
++static const u8 ath11k_nss_mesh_action[] = {
++	[NSS_WIFI_MESH_EV_REFRESH] = IEEE80211_MESH_PATH_OFFLD_ACTION_MPATH_REFRESH,
++	[NSS_WIFI_MESH_EV_NOT_FOUND] = IEEE80211_MESH_PATH_OFFLD_ACTION_PATH_NOT_FOUND,
++	[NSS_WIFI_MESH_EV_MPATH_DEL] = IEEE80211_MESH_PATH_OFFLD_ACTION_MPATH_DEL,
++	[NSS_WIFI_MESH_EV_EXPIRY] = IEEE80211_MESH_PATH_OFFLD_ACTION_MPATH_EXP,
++	[NSS_WIFI_MESH_EV_MPP_LEARN] = IEEE80211_MESH_PATH_OFFLD_ACTION_MPP_LEARN,
++	[NSS_WIFI_MESH_EV_MPP_ADD] = IEEE80211_MESH_PATH_OFFLD_ACTION_MPP_ADD,
++	[NSS_WIFI_MESH_EV_MPP_UPDATE] = IEEE80211_MESH_PATH_OFFLD_ACTION_MPP_UPDATE,
++};
++
++static void ath11k_nss_mesh_event(void *priv, enum nss_wifi_mesh_event ev,
++				  const struct nss_wifi_mesh_path *p)
++{
++	struct ath11k_vif *arvif = priv;
++	struct ieee80211_mesh_path_offld path = {};
++
++	if (ev >= ARRAY_SIZE(ath11k_nss_mesh_action))
++		return;
++
++	ether_addr_copy(path.mesh_da, p->mesh_da);
++	ether_addr_copy(path.da, p->da);
++	ether_addr_copy(path.next_hop, p->next_hop);
++	ether_addr_copy(path.ta, p->ta);
++
++	ieee80211_mesh_path_offld_change_notify(arvif->vif, &path,
++						ath11k_nss_mesh_action[ev]);
++}
++
++/* Multicast the firmware received on the mesh. The stack forwards it and
++ * drops duplicates by the mesh sequence number, so it goes in at 802.11.
++ */
++static void ath11k_nss_mesh_rx(void *priv, struct sk_buff *skb,
++			       struct napi_struct *napi)
++{
++	struct ath11k_vif *arvif = priv;
++
++	ath11k_dp_rx_from_nss(arvif->ar, skb, napi);
++}
++
++static const struct nss_wifi_mesh_ops ath11k_nss_mesh_ops = {
++	.event = ath11k_nss_mesh_event,
++	.rx = ath11k_nss_mesh_rx,
++};
++
+ static void ath11k_nss_vdev_register(struct ath11k_vif *arvif,
+ 				     struct ieee80211_vif *vif)
+ {
+@@ -6986,13 +7058,20 @@ static void ath11k_nss_vdev_register(str
+ 	if (!wdev || !wdev->netdev)
+ 		return;
+ 
+-	ret = nss_wifi_vdev_register(wdev->netdev, ar->pdev_idx, arvif->vdev_id,
+-				     vif->addr,
+-				     vif->type == NL80211_IFTYPE_AP,
+-				     ath11k_nss_vdev_mode(ar->ab, vif,
+-							  IEEE80211_OFFLOAD_ENCAP_ENABLED),
+-				     ath11k_nss_vdev_mode(ar->ab, vif,
+-							  IEEE80211_OFFLOAD_DECAP_ENABLED));
++	if (vif->type == NL80211_IFTYPE_MESH_POINT)
++		ret = nss_wifi_mesh_register(wdev->netdev, ar->pdev_idx,
++					     arvif->vdev_id, vif->addr,
++					     ath11k_nss_vdev_mode(ar->ab, vif,
++								  IEEE80211_OFFLOAD_ENCAP_ENABLED),
++					     &ath11k_nss_mesh_ops, arvif);
++	else
++		ret = nss_wifi_vdev_register(wdev->netdev, ar->pdev_idx,
++					     arvif->vdev_id, vif->addr,
++					     vif->type == NL80211_IFTYPE_AP,
++					     ath11k_nss_vdev_mode(ar->ab, vif,
++								  IEEE80211_OFFLOAD_ENCAP_ENABLED),
++					     ath11k_nss_vdev_mode(ar->ab, vif,
++								  IEEE80211_OFFLOAD_DECAP_ENABLED));
+ 	if (ret < 0) {
+ 		ath11k_warn(ar->ab, "failed to give vdev %d to the NSS firmware: %d\n",
+ 			    arvif->vdev_id, ret);
+@@ -10117,6 +10196,7 @@ static int ath11k_mac_op_sta_state(struc
+ 	enum ieee80211_ap_reg_power power_type;
+ 	struct cur_regulatory_info *reg_info;
+ 	struct ath11k_peer *peer;
++	u16 peer_id;
+ 	int ret = 0;
+ 
+ 	/* cancel must be done outside the mutex to avoid deadlock */
+@@ -10185,9 +10265,17 @@ static int ath11k_mac_op_sta_state(struc
+ 		peer = ath11k_peer_find(ar->ab, arvif->vdev_id, sta->addr);
+ 		if (peer)
+ 			peer->is_authorized = true;
++		peer_id = peer ? peer->peer_id : 0;
+ 
+ 		spin_unlock_bh(&ar->ab->base_lock);
+ 
++		/* An open mesh installs no key, which is where the firmware
++		 * is otherwise told a peer may pass frames.
++		 */
++		if (ar->ab->nss_offload && peer_id &&
++		    vif->type == NL80211_IFTYPE_MESH_POINT)
++			nss_wifi_peer_authorize(peer_id);
++
+ 		if (vif->type == NL80211_IFTYPE_STATION && arvif->is_up) {
+ 			ret = ath11k_wmi_set_peer_param(ar, sta->addr,
+ 							arvif->vdev_id,
+@@ -10273,6 +10361,44 @@ static int ath11k_mac_op_net_setup_tc(st
+  * The subsystem only asks once it has resolved the destination to a
+  * station it holds.
+  */
++static const u8 ath11k_nss_mesh_flags[][2] = {
++	{ IEEE80211_MESH_PATH_ACTIVE, NSS_WIFI_MESH_PATH_ACTIVE },
++	{ IEEE80211_MESH_PATH_RESOLVING, NSS_WIFI_MESH_PATH_RESOLVING },
++	{ IEEE80211_MESH_PATH_RESOLVED, NSS_WIFI_MESH_PATH_RESOLVED },
++	{ IEEE80211_MESH_PATH_FIXED, NSS_WIFI_MESH_PATH_FIXED },
++};
++
++/* Called with the stack's path locks held; the firmware driver queues it. */
++static void
++ath11k_mac_op_config_mesh_offload_path(struct ieee80211_hw *hw,
++				       struct ieee80211_vif *vif,
++				       enum ieee80211_mesh_path_offld_cmd cmd,
++				       const struct ieee80211_mesh_path_offld *path)
++{
++	struct ath11k_vif *arvif = ath11k_vif_to_arvif(vif);
++	struct nss_wifi_mesh_path p = {};
++	int i;
++
++	if (!arvif->ar->ab->nss_offload || arvif->nss_ifnum < 0)
++		return;
++
++	ether_addr_copy(p.mesh_da, path->mesh_da);
++	ether_addr_copy(p.da, path->da);
++	ether_addr_copy(p.next_hop, path->next_hop);
++	ether_addr_copy(p.old_next_hop, path->old_next_hop);
++	p.metric = path->metric;
++	p.exp_ms = path->exp_time;
++	p.hop_count = path->hop_count;
++	p.gate = path->mesh_gate;
++	for (i = 0; i < ARRAY_SIZE(ath11k_nss_mesh_flags); i++)
++		if (path->flags & ath11k_nss_mesh_flags[i][0])
++			p.flags |= ath11k_nss_mesh_flags[i][1];
++
++	BUILD_BUG_ON((int)IEEE80211_MESH_PATH_OFFLD_CMD_DELETE_MPP !=
++		     (int)NSS_WIFI_MESH_MPP_DEL);
++	nss_wifi_mesh_path(arvif->nss_ifnum, (enum nss_wifi_mesh_cmd)cmd, &p);
++}
++
+ static int ath11k_mac_op_net_fill_forward_path(struct ieee80211_hw *hw,
+ 					       struct ieee80211_vif *vif,
+ 					       struct ieee80211_sta *sta,
+@@ -10329,6 +10455,7 @@ static const struct ieee80211_ops ath11k
+ 	.flush_sta			= ath11k_mac_op_flush_sta,
+ 	.sta_statistics			= ath11k_mac_op_sta_statistics,
+ 	.net_setup_tc			= ath11k_mac_op_net_setup_tc,
++	.config_mesh_offload_path	= ath11k_mac_op_config_mesh_offload_path,
+ 	.net_fill_forward_path		= ath11k_mac_op_net_fill_forward_path,
+ 	CFG80211_TESTMODE_CMD(ath11k_tm_cmd)
+ 
