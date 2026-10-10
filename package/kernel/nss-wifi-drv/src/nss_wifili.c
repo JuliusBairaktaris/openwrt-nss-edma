@@ -21,8 +21,14 @@
 #include <linux/etherdevice.h>
 #include <linux/ieee80211.h>
 #include <linux/if_ether.h>
+#include <linux/igmp.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/workqueue.h>
+#include <net/addrconf.h>
+#include <net/if_inet6.h>
+#include <net/ip.h>
+#include <net/mld.h>
 
 #include "nss_drv.h"
 #include "nss_cmn.h"
@@ -161,6 +167,7 @@ void nss_wifi_soc_unregister(void)
 	 * never issued. It is stopped with them.
 	 */
 	WRITE_ONCE(nss_wifili_soc.link_desc_return, NULL);
+	WRITE_ONCE(nss_wifili_soc.rx_80211, NULL);
 	if (!nss_wifili_core)
 		return;
 	if (nss_wifili_core->wifili_started)
@@ -598,6 +605,8 @@ struct nss_wifili_vdev {
 };
 
 static struct nss_wifili_vdev nss_wifili_vdev_tbl[NSS_WIFILI_VDEV_MAX];
+/* Interface numbers whose receive the WLAN driver gets to look at first. */
+static DECLARE_BITMAP(nss_wifili_vdev_on, NSS_INTERFACE_MAX);
 
 static struct {
 	int if_num;
@@ -672,6 +681,11 @@ void nss_wifili_vdev_stats_print(struct seq_file *s)
 			   v->tx_rcvd, v->tx_enqueue_cnt,
 			   v->tx_enqueue_fail_cnt, v->tx_hw_ring_full,
 			   v->tx_desc_alloc_fail, v->dropped);
+		seq_printf(s, "  me rcvd %u converted %u no_member_drop %u alloc_fail %u enq_fail %u\n",
+			   v->wvmes.mcast_rcvd, v->wvmes.mcast_ucast_converted,
+			   v->wvmes.mcast_no_enhance_drop_cnt,
+			   v->wvmes.mcast_alloc_fail,
+			   v->wvmes.mcast_pbuf_enq_fail);
 	}
 }
 
@@ -685,9 +699,12 @@ void nss_wifili_vdev_stats_print(struct seq_file *s)
  * success. A device with no address of its own matches nothing in either
  * direction.
  */
-static int nss_wifili_vdev_msg(struct nss_core *core, int if_num, u32 type,
-			       const void *body, size_t len)
+static DECLARE_BITMAP(nss_wifili_vdev_err_seen, 64);
+
+static int __nss_wifili_vdev_msg(struct nss_core *core, int if_num, u32 type,
+				 const void *body, size_t len, u32 *error)
 {
+	u32 seen = type - NSS_WIFI_VDEV_INTERFACE_CONFIGURE_MSG;
 	struct nss_wifi_vdev_msg *v;
 	int ret;
 
@@ -702,12 +719,24 @@ static int nss_wifili_vdev_msg(struct nss_core *core, int if_num, u32 type,
 
 	ret = nss_msg_send(core, v,
 			   offsetof(struct nss_wifi_vdev_msg, msg) + len);
-	if (!ret && v->cm.error)
+	if ((!ret || ret == -EPROTO) && v->cm.error) {
 		ret = -EIO;
+		if (error)
+			*error = v->cm.error;
+		if (seen < 64 && !test_and_set_bit(seen, nss_wifili_vdev_err_seen))
+			dev_warn(core->dev, "interface %d type %u: error %u\n",
+				 if_num, type, v->cm.error);
+	}
 
 	kfree(v);
 
 	return ret;
+}
+
+static int nss_wifili_vdev_msg(struct nss_core *core, int if_num, u32 type,
+			       const void *body, size_t len)
+{
+	return __nss_wifili_vdev_msg(core, if_num, type, body, len, NULL);
 }
 
 static int nss_wifili_vdev_cmd(struct nss_core *core, int if_num, u32 cmd,
@@ -761,6 +790,10 @@ static int nss_wifili_vdev_next_hop(struct nss_core *core)
 
 	return ret;
 }
+
+static void nss_me_enable(struct nss_core *core, int if_num);
+static void nss_me_drop(int if_num);
+static void nss_me_peer_gone(const u8 *mac);
 
 /* Put one virtual device on a radio and take it up.
  *
@@ -854,9 +887,13 @@ int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
 
 	dev_hold(dev);
 	rcu_assign_pointer(core->iface[if_num], dev);
+	set_bit(if_num, nss_wifili_vdev_on);
 
 	dev_info(core->dev, "vdev %u on radio %u is interface %d, encap %u decap %u\n",
 		 vdev_id, radio, if_num, encap, decap);
+
+	if (ap)
+		nss_me_enable(core, if_num);
 
 	return if_num;
 }
@@ -887,10 +924,12 @@ void nss_wifi_vdev_unregister(struct net_device *dev)
 		 * dropped against what was there rather than against this
 		 * having been the one to remove it.
 		 */
+		clear_bit(if_num, nss_wifili_vdev_on);
 		if (rcu_replace_pointer(core->iface[if_num], NULL, true)) {
 			synchronize_rcu();
 			dev_put(dev);
 		}
+		nss_me_drop(if_num);
 
 		nss_wifili_vdev_tbl[i].dev = NULL;
 		nss_wifili_vdev_tbl[i].if_num = -1;
@@ -1175,6 +1214,7 @@ static void nss_wifili_peer_release(struct nss_core *core, int i)
 			  nss_wifili_peer_tbl[i].mem,
 			  nss_wifili_peer_tbl[i].dma);
 	nss_wifili_peer_tbl[i].mem = NULL;
+	nss_me_peer_gone(nss_wifili_peer_tbl[i].mac);
 }
 
 /* A virtual device takes its peers with it. The WLAN driver removes them from
@@ -1276,6 +1316,515 @@ int nss_wifi_vdev_tx(int if_num, struct sk_buff *skb)
 	return nss_data_send(core, skb, if_num);
 }
 EXPORT_SYMBOL_GPL(nss_wifi_vdev_tx);
+
+/* Multicast to unicast on access point vdevs.
+ *
+ * With multicast enhancement on, the vdev sends a group frame as one unicast
+ * copy per member in its snoop table and drops a group that has no entry;
+ * the well-known link-local groups, IGMP and MLD stay multicast. Membership
+ * is learnt from the reports stations send, which reach the host as
+ * exceptions, and expires after the IGMP/MLD membership interval like the
+ * bridge's own entries.
+ */
+#define NSS_ME_MAX		64
+#define NSS_ME_INTERVAL		(260 * HZ)
+#define NSS_ME_SCAN		(10 * HZ)
+/* Any value from 1 to 3 converts to the members' own addresses. */
+#define NSS_ME_MODE		2
+#define NSS_ME_ERRS		48
+
+static bool nss_me_param = true;
+module_param_named(me, nss_me_param, bool, 0644);
+MODULE_PARM_DESC(me, "convert multicast to unicast on access point vdevs");
+
+union nss_me_grp {
+	__be32 ip4;
+	struct in6_addr ip6;
+};
+
+struct nss_me_mbr {
+	union nss_me_grp grp;
+	u16 proto;		/* ETH_P_IP or ETH_P_IPV6, 0 when free */
+	u8 mac[ETH_ALEN];
+	int if_num;
+	unsigned long expires;
+	bool want;
+	bool in_fw;
+};
+
+static struct nss_me_mbr nss_me_tbl[NSS_ME_MAX];
+static DECLARE_BITMAP(nss_me_on, NSS_INTERFACE_MAX);
+static DEFINE_SPINLOCK(nss_me_lock);
+static struct {
+	u32 joins, leaves, expired, full, added, removed;
+	u32 no_core, no_peer, host_err, fw_err[NSS_ME_ERRS];
+} nss_me_cnt;
+
+static void nss_me_sync(struct work_struct *work);
+static DECLARE_DELAYED_WORK(nss_me_work, nss_me_sync);
+
+static void nss_me_enable(struct nss_core *core, int if_num)
+{
+	if (!nss_me_param)
+		return;
+	if (nss_wifili_vdev_cmd(core, if_num, NSS_WIFI_VDEV_ENABLE_ME_CMD,
+				NSS_ME_MODE))
+		dev_warn(core->dev, "interface %d: no multicast to unicast\n",
+			 if_num);
+	else
+		set_bit(if_num, nss_me_on);
+}
+
+static void nss_me_update(int if_num, const u8 *mac, u16 proto,
+			  const union nss_me_grp *grp, bool join)
+{
+	struct nss_me_mbr *e, *free = NULL;
+	int i;
+
+	guard(spinlock_bh)(&nss_me_lock);
+
+	for (i = 0; i < NSS_ME_MAX; i++) {
+		e = &nss_me_tbl[i];
+		if (!e->proto) {
+			free = free ?: e;
+			continue;
+		}
+		if (e->if_num == if_num && e->proto == proto &&
+		    ether_addr_equal(e->mac, mac) &&
+		    !memcmp(&e->grp, grp, sizeof(*grp)))
+			break;
+	}
+
+	if (i == NSS_ME_MAX) {
+		if (!join)
+			return;
+		if (!free) {
+			nss_me_cnt.full++;
+			return;
+		}
+		e = free;
+		e->grp = *grp;
+		e->proto = proto;
+		ether_addr_copy(e->mac, mac);
+		e->if_num = if_num;
+		e->in_fw = false;
+	}
+
+	if (join) {
+		nss_me_cnt.joins++;
+		e->expires = jiffies + NSS_ME_INTERVAL;
+	} else {
+		nss_me_cnt.leaves++;
+	}
+	e->want = join;
+	if (e->want != e->in_fw)
+		mod_delayed_work(system_wq, &nss_me_work, 0);
+}
+
+static void nss_me_ip4(int if_num, const u8 *mac, __be32 group, bool join)
+{
+	union nss_me_grp g = {};
+
+	g.ip4 = group;
+
+	if (ipv4_is_multicast(group) && !ipv4_is_local_multicast(group))
+		nss_me_update(if_num, mac, ETH_P_IP, &g, join);
+}
+
+static void nss_me_ip6(int if_num, const u8 *mac, const struct in6_addr *group,
+		       bool join)
+{
+	union nss_me_grp g = {};
+
+	g.ip6 = *group;
+
+	if (ipv6_addr_is_multicast(group) &&
+	    IPV6_ADDR_MC_SCOPE(group) > IPV6_ADDR_SCOPE_LINKLOCAL)
+		nss_me_update(if_num, mac, ETH_P_IPV6, &g, join);
+}
+
+static void nss_me_igmp(int if_num, struct sk_buff *skb)
+{
+	const u8 *mac = eth_hdr(skb)->h_source;
+	struct igmpv3_report *r;
+	struct igmpv3_grec *g;
+	unsigned int len;
+	int i, n;
+
+	if (ip_mc_check_igmp(skb))
+		return;
+
+	switch (igmp_hdr(skb)->type) {
+	case IGMP_HOST_MEMBERSHIP_REPORT:
+	case IGMPV2_HOST_MEMBERSHIP_REPORT:
+		nss_me_ip4(if_num, mac, igmp_hdr(skb)->group, true);
+		return;
+	case IGMP_HOST_LEAVE_MESSAGE:
+		nss_me_ip4(if_num, mac, igmp_hdr(skb)->group, false);
+		return;
+	case IGMPV3_HOST_MEMBERSHIP_REPORT:
+		break;
+	default:
+		return;
+	}
+
+	/* Sources are not tracked: only an empty include list leaves. */
+	r = igmpv3_report_hdr(skb);
+	n = ntohs(r->ngrec);
+	len = skb_transport_offset(skb) + sizeof(*r);
+	for (i = 0; i < n; i++) {
+		len += sizeof(*g);
+		if (!ip_mc_may_pull(skb, len))
+			return;
+		g = (void *)(skb->data + len - sizeof(*g));
+		len += ntohs(g->grec_nsrcs) * 4;
+		if (!ip_mc_may_pull(skb, len))
+			return;
+		nss_me_ip4(if_num, mac, g->grec_mca,
+			   !((g->grec_type == IGMPV3_MODE_IS_INCLUDE ||
+			      g->grec_type == IGMPV3_CHANGE_TO_INCLUDE) &&
+			     !g->grec_nsrcs));
+	}
+}
+
+static void nss_me_mld(int if_num, struct sk_buff *skb)
+{
+	const u8 *mac = eth_hdr(skb)->h_source;
+	struct mld_msg *m;
+	struct mld2_grec *g;
+	unsigned int len;
+	int i, n;
+
+	if (ipv6_mc_check_mld(skb))
+		return;
+
+	m = (struct mld_msg *)skb_transport_header(skb);
+	switch (m->mld_type) {
+	case ICMPV6_MGM_REPORT:
+		nss_me_ip6(if_num, mac, &m->mld_mca, true);
+		return;
+	case ICMPV6_MGM_REDUCTION:
+		nss_me_ip6(if_num, mac, &m->mld_mca, false);
+		return;
+	case ICMPV6_MLD2_REPORT:
+		break;
+	default:
+		return;
+	}
+
+	n = ntohs(((struct mld2_report *)m)->mld2r_ngrec);
+	len = skb_transport_offset(skb) + sizeof(struct icmp6hdr);
+	for (i = 0; i < n; i++) {
+		len += sizeof(*g);
+		if (!ipv6_mc_may_pull(skb, len))
+			return;
+		g = (void *)(skb->data + len - sizeof(*g));
+		len += ntohs(g->grec_nsrcs) * sizeof(struct in6_addr);
+		if (!ipv6_mc_may_pull(skb, len))
+			return;
+		nss_me_ip6(if_num, mac, &g->grec_mca,
+			   !((g->grec_type == MLD2_MODE_IS_INCLUDE ||
+			      g->grec_type == MLD2_CHANGE_TO_INCLUDE) &&
+			     !g->grec_nsrcs));
+	}
+}
+
+/* From the receive poll, for a frame a vdev handed up. The firmware hands up
+ * frames the hardware did not decapsulate, such as a block ack request, the
+ * same way as ethernet; only the receive descriptor ahead of the frame tells
+ * them apart, so the WLAN driver is asked first.
+ */
+bool nss_wifili_rx_80211(u32 if_num, struct net_device *dev,
+			 struct sk_buff *skb, struct napi_struct *napi)
+{
+	bool (*rx)(void *priv, struct net_device *dev, struct sk_buff *skb,
+		   struct napi_struct *napi);
+
+	if (!test_bit(if_num, nss_wifili_vdev_on))
+		return false;
+
+	rx = READ_ONCE(nss_wifili_soc.rx_80211);
+
+	return rx && rx(nss_wifili_soc.priv, dev, skb, napi);
+}
+
+/* From the receive poll, for a multicast frame a vdev handed up. */
+void nss_wifili_me_snoop(u32 if_num, struct sk_buff *skb)
+{
+	if (!test_bit(if_num, nss_me_on))
+		return;
+
+	skb_reset_network_header(skb);
+	if (skb->protocol == htons(ETH_P_IP))
+		nss_me_igmp(if_num, skb);
+	else if (skb->protocol == htons(ETH_P_IPV6))
+		nss_me_mld(if_num, skb);
+}
+
+/* The snoop-table messages share one layout up to the member address. */
+static void nss_me_msg_fill(struct nss_wifi_vdev_me_snptbl_grp_mbr_add_msg *a,
+			    const struct nss_me_mbr *m)
+{
+	a->ether_type = m->proto;
+	if (m->proto == ETH_P_IP) {
+		a->u.grpaddr_ip4 = (__force u32)m->grp.ip4;
+		ip_eth_mc_map(m->grp.ip4, a->grp_addr);
+	} else {
+		memcpy(a->u.grpaddr_ip6, &m->grp.ip6, sizeof(m->grp.ip6));
+		ipv6_eth_mc_map(&m->grp.ip6, a->grp_addr);
+	}
+	ether_addr_copy(a->grp_member_addr, m->mac);
+}
+
+static int nss_me_peer_id(int if_num, const u8 *mac)
+{
+	int i, v;
+
+	for (v = 0; v < ARRAY_SIZE(nss_wifili_vdev_tbl); v++)
+		if (nss_wifili_vdev_tbl[v].dev &&
+		    nss_wifili_vdev_tbl[v].if_num == if_num)
+			break;
+	if (v == ARRAY_SIZE(nss_wifili_vdev_tbl))
+		return -ENODEV;
+
+	for (i = 0; i < ARRAY_SIZE(nss_wifili_peer_tbl); i++)
+		if (nss_wifili_peer_tbl[i].mem &&
+		    nss_wifili_peer_tbl[i].vdev_id == nss_wifili_vdev_tbl[v].vdev_id &&
+		    ether_addr_equal(nss_wifili_peer_tbl[i].mac, mac))
+			return nss_wifili_peer_tbl[i].peer_id;
+
+	return -ENOENT;
+}
+
+/* Every refusal is counted by its reason: host side, or the firmware's code. */
+static int nss_me_msg(struct nss_core *core, int if_num, u32 type,
+		      const void *body, size_t len, u32 ok_error)
+{
+	u32 error = 0;
+	int ret;
+
+	ret = __nss_wifili_vdev_msg(core, if_num, type, body, len, &error);
+	if (!ret || (error && error == ok_error))
+		return 0;
+
+	/* Error 0 here is a firmware refusal that carried no code. */
+	if (!error && ret != -EPROTO)
+		nss_me_cnt.host_err++;
+	else
+		nss_me_cnt.fw_err[min(error, NSS_ME_ERRS - 1)]++;
+	return ret;
+}
+
+/* A group goes in before its first member and out with its last. A list or
+ * member the firmware already holds is what was asked for.
+ */
+static bool nss_me_fw_add(struct nss_core *core, const struct nss_me_mbr *m,
+			  bool first)
+{
+	struct nss_wifi_vdev_me_snptbl_grp_mbr_add_msg a = {};
+	struct nss_wifi_vdev_me_snptbl_grp_create_msg c = {};
+	int peer_id = nss_me_peer_id(m->if_num, m->mac);
+
+	if (peer_id < 0) {
+		nss_me_cnt.no_peer++;
+		return false;
+	}
+
+	nss_me_msg_fill(&a, m);
+	a.peer_id = peer_id;
+	c.ether_type = a.ether_type;
+	memcpy(&c.u, &a.u, sizeof(c.u));
+	ether_addr_copy(c.grp_addr, a.grp_addr);
+
+	if (first &&
+	    nss_me_msg(core, m->if_num,
+		       NSS_WIFI_VDEV_SNOOPLIST_GRP_LIST_CREATE_MSG, &c,
+		       sizeof(c), NSS_WIFI_VDEV_SNOOPTABLE_GRP_LIST_EXIST))
+		return false;
+
+	if (!nss_me_msg(core, m->if_num,
+			NSS_WIFI_VDEV_SNOOPLIST_GRP_MEMBER_ADD_MSG, &a,
+			sizeof(a), NSS_WIFI_VDEV_SNOOPTABLE_GRP_MEMBER_EXIST))
+		return true;
+
+	if (first)
+		nss_me_msg(core, m->if_num,
+			   NSS_WIFI_VDEV_SNOOPLIST_GRP_LIST_DELETE_MSG, &c,
+			   sizeof(c), 0);
+	return false;
+}
+
+static void nss_me_fw_del(struct nss_core *core, const struct nss_me_mbr *m,
+			  bool last)
+{
+	struct nss_wifi_vdev_me_snptbl_grp_mbr_add_msg a = {};
+	struct nss_wifi_vdev_me_snptbl_grp_mbr_delete_msg d = {};
+	struct nss_wifi_vdev_me_snptbl_grp_delete_msg g = {};
+
+	nss_me_msg_fill(&a, m);
+	if (last) {
+		g.ether_type = a.ether_type;
+		memcpy(&g.u, &a.u, sizeof(g.u));
+		ether_addr_copy(g.grp_addr, a.grp_addr);
+		nss_me_msg(core, m->if_num,
+			   NSS_WIFI_VDEV_SNOOPLIST_GRP_LIST_DELETE_MSG, &g,
+			   sizeof(g), 0);
+		return;
+	}
+
+	d.ether_type = a.ether_type;
+	memcpy(&d.u, &a.u, sizeof(d.u));
+	ether_addr_copy(d.grp_addr, a.grp_addr);
+	ether_addr_copy(d.grp_member_addr, a.grp_member_addr);
+	nss_me_msg(core, m->if_num,
+		   NSS_WIFI_VDEV_SNOOPLIST_GRP_MEMBER_REMOVE_MSG, &d,
+		   sizeof(d), 0);
+}
+
+/* Whether another member of the same group on the same vdev is installed. */
+static bool nss_me_shared(const struct nss_me_mbr *m)
+{
+	const struct nss_me_mbr *e;
+
+	for (e = nss_me_tbl; e < nss_me_tbl + NSS_ME_MAX; e++)
+		if (e != m && e->proto == m->proto && e->in_fw &&
+		    e->if_num == m->if_num &&
+		    !memcmp(&e->grp, &m->grp, sizeof(m->grp)))
+			return true;
+
+	return false;
+}
+
+/* Whether an entry needs a message, with a copy of it to send from. */
+static bool nss_me_pending(struct nss_me_mbr *e, struct nss_me_mbr *m,
+			   bool *shared, bool *busy)
+{
+	guard(spinlock_bh)(&nss_me_lock);
+
+	if (e->proto && e->want && time_after(jiffies, e->expires)) {
+		e->want = false;
+		nss_me_cnt.expired++;
+	}
+	if (e->proto && !e->want && !e->in_fw)
+		e->proto = 0;
+	*busy |= !!e->proto;
+	if (!e->proto || e->want == e->in_fw)
+		return false;
+
+	*m = *e;
+	*shared = nss_me_shared(e);
+	return true;
+}
+
+/* Bring the firmware's tables to what the host table wants. Only this work
+ * sets in_fw or frees an entry, and it holds the wifili lock throughout, so
+ * no vdev goes away under a message.
+ */
+static void nss_me_sync(struct work_struct *work)
+{
+	struct nss_me_mbr *e, m;
+	struct nss_core *core;
+	bool shared, ok, busy = false;
+
+	guard(mutex)(&nss_wifili_lock);
+	core = nss_wifili_core;
+
+	for (e = nss_me_tbl; e < nss_me_tbl + NSS_ME_MAX; e++) {
+		if (!nss_me_pending(e, &m, &shared, &busy))
+			continue;
+
+		ok = false;
+		if (!core) {
+			nss_me_cnt.no_core++;
+		} else if (m.want) {
+			ok = nss_me_fw_add(core, &m, !shared);
+			nss_me_cnt.added += ok;
+		} else {
+			nss_me_fw_del(core, &m, !shared);
+			nss_me_cnt.removed++;
+		}
+
+		/* A refused member is forgotten; the next report retries. */
+		scoped_guard(spinlock_bh, &nss_me_lock) {
+			e->in_fw = ok;
+			if (!ok && m.want)
+				e->proto = 0;
+		}
+	}
+
+	if (busy)
+		mod_delayed_work(system_wq, &nss_me_work, NSS_ME_SCAN);
+}
+
+/* Without a firmware message: the vdev, or the whole core, is going. */
+static void nss_me_drop(int if_num)
+{
+	struct nss_me_mbr *e;
+
+	guard(spinlock_bh)(&nss_me_lock);
+
+	for (e = nss_me_tbl; e < nss_me_tbl + NSS_ME_MAX; e++)
+		if (if_num < 0 || e->if_num == if_num)
+			e->proto = 0;
+
+	if (if_num < 0)
+		bitmap_zero(nss_me_on, NSS_INTERFACE_MAX);
+	else
+		clear_bit(if_num, nss_me_on);
+}
+
+static void nss_me_peer_gone(const u8 *mac)
+{
+	struct nss_me_mbr *e;
+
+	guard(spinlock_bh)(&nss_me_lock);
+
+	for (e = nss_me_tbl; e < nss_me_tbl + NSS_ME_MAX; e++) {
+		/* The station may still be associated on another vdev. */
+		if (!e->proto || !ether_addr_equal(e->mac, mac) ||
+		    nss_me_peer_id(e->if_num, mac) >= 0)
+			continue;
+		e->want = false;
+		mod_delayed_work(system_wq, &nss_me_work, 0);
+	}
+}
+
+void nss_wifili_me_exit(void)
+{
+	cancel_delayed_work_sync(&nss_me_work);
+}
+
+void nss_wifili_me_print(struct seq_file *s)
+{
+	const struct nss_me_mbr *e;
+	int i;
+
+	guard(spinlock_bh)(&nss_me_lock);
+
+	seq_printf(s, "joins %u leaves %u expired %u full %u added %u removed %u\n",
+		   nss_me_cnt.joins, nss_me_cnt.leaves, nss_me_cnt.expired,
+		   nss_me_cnt.full, nss_me_cnt.added, nss_me_cnt.removed);
+	seq_printf(s, "refused: no_core %u no_peer %u host %u\n",
+		   nss_me_cnt.no_core, nss_me_cnt.no_peer,
+		   nss_me_cnt.host_err);
+	for (i = 0; i < NSS_ME_ERRS; i++)
+		if (nss_me_cnt.fw_err[i])
+			seq_printf(s, "refused: firmware error %d: %u\n", i,
+				   nss_me_cnt.fw_err[i]);
+	seq_printf(s, "vdevs %*pbl\n", NSS_INTERFACE_MAX, nss_me_on);
+
+	for (e = nss_me_tbl; e < nss_me_tbl + NSS_ME_MAX; e++) {
+		if (!e->proto)
+			continue;
+		if (e->proto == ETH_P_IP)
+			seq_printf(s, "if %d %pI4", e->if_num, &e->grp.ip4);
+		else
+			seq_printf(s, "if %d %pI6c", e->if_num, &e->grp.ip6);
+		seq_printf(s, " %pM want %d fw %d expires %ds\n", e->mac,
+			   e->want, e->in_fw,
+			   (int)((long)(e->expires - jiffies) / HZ));
+	}
+}
 
 /* Hand one frame down, to see whether the firmware takes it.
  *
@@ -1461,6 +2010,7 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 	}
 	for (i = 0; i < ARRAY_SIZE(nss_wifili_vdev_tbl); i++)
 		nss_wifili_vdev_tbl[i].dev = NULL;
+	nss_me_drop(-1);
 
 	m = kzalloc(sizeof(*m), GFP_KERNEL);
 	w = kzalloc(sizeof(*w), GFP_KERNEL);

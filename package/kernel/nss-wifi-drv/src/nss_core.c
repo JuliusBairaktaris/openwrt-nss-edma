@@ -1038,6 +1038,13 @@ static int nss_mcast_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(nss_mcast);
 
+static int nss_wifi_me_show(struct seq_file *s, void *unused)
+{
+	nss_wifili_me_print(s);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(nss_wifi_me);
+
 static void nss_aux_clocks_put(void *data)
 {
 	struct nss_core *core = data;
@@ -1247,6 +1254,8 @@ static int nss_probe(struct platform_device *pdev)
 			    &nss_flows_fops);
 	debugfs_create_file("mcast", 0400, core->debugfs, core,
 			    &nss_mcast_fops);
+	debugfs_create_file("wifi_me", 0400, core->debugfs, core,
+			    &nss_wifi_me_fops);
 
 	return 0;
 }
@@ -1319,6 +1328,7 @@ module_init(nss_module_init);
 static void __exit nss_module_exit(void)
 {
 	platform_driver_unregister(&nss_driver);
+	nss_wifili_me_exit();
 	nss_mc_exit();
 	nss_flow_exit();
 }

@@ -469,6 +469,11 @@ void nss_wifili_vdev_notify(struct nss_core *core, const struct nss_cmn_msg *ncm
 void nss_wifili_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
 		       u32 len);
 void nss_wifili_bind(struct nss_core *core);
+void nss_wifili_me_snoop(u32 if_num, struct sk_buff *skb);
+bool nss_wifili_rx_80211(u32 if_num, struct net_device *dev,
+			 struct sk_buff *skb, struct napi_struct *napi);
+void nss_wifili_me_print(struct seq_file *s);
+void nss_wifili_me_exit(void);
 int nss_phys_arm(struct nss_core *core, unsigned long mask);
 int nss_phys_msg(struct nss_core *core, int if_num, u32 type,
 		 const void *body, size_t len);
