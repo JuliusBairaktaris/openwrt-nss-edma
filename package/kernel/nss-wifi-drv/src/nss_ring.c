@@ -138,7 +138,12 @@ static bool nss_data_recv(struct nss_core *core, struct napi_struct *napi,
 
 	skb_reserve(skb, desc->payload_offs);
 	skb_put(skb, desc->payload_len);
+	if (nss_wifili_rx_80211(desc->interface_num, dev, skb, napi))
+		return true;
+
 	skb->protocol = eth_type_trans(skb, dev);
+	if (skb->pkt_type == PACKET_MULTICAST)
+		nss_wifili_me_snoop(desc->interface_num, skb);
 
 	dev_sw_netstats_rx_add(dev, desc->payload_len);
 	napi_gro_receive(napi, skb);

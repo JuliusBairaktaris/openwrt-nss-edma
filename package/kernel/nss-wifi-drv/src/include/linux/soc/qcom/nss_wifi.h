@@ -81,6 +81,14 @@ struct nss_wifi_soc {
 	 * rings, so a firmware that stops is freed only behind this.
 	 */
 	void (*reset)(void *priv);
+
+	/*
+	 * A frame a virtual device handed up, before it is taken for
+	 * ethernet. Returns true if it took the frame. The hardware receive
+	 * descriptor is at skb->head. Called from softirq.
+	 */
+	bool (*rx_80211)(void *priv, struct net_device *dev,
+			 struct sk_buff *skb, struct napi_struct *napi);
 };
 
 #if IS_REACHABLE(CONFIG_NSS_WIFI_DRV)
