@@ -359,7 +359,12 @@ static void nss_core_halt(struct nss_core *core)
 	scoped_guard(mutex, &core->msg.lock)
 		core->running = false;
 	synchronize_net();
+	/* A core in reset cannot be asked to close its ports. */
+	core->phys_stale |= core->phys_armed;
 	core->phys_armed = 0;
+	if (core->phys_stale)
+		schedule_work(&core->arm);
+	nss_bridge_stop();
 	nss_flow_flush();
 
 	nss_log_shadow_stop(core);
@@ -708,6 +713,7 @@ static int nss_core_boot(struct nss_core *core)
 	nss_pool_configure(core);
 	nss_pbuf_pool_add(core, nss_pbuf_bytes);
 	nss_core_stats_off(core);
+	nss_bridge_start(core);
 
 	return 0;
 
@@ -1015,6 +1021,7 @@ DEFINE_DEBUGFS_ATTRIBUTE(nss_phys_fops, nss_phys_get, nss_phys_set, "%#llx\n");
 static int nss_flows_show(struct seq_file *s, void *unused)
 {
 	nss_flow_print(s);
+	nss_bridge_print(s);
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(nss_flows);

@@ -474,6 +474,26 @@ int nss_phys_msg(struct nss_core *core, int if_num, u32 type,
 		 const void *body, size_t len);
 void nss_phys_arm_ports(struct nss_core *core);
 void nss_flow_bind(struct nss_core *core);
+int nss_flow_ifnum(struct nss_core *core, int ifindex, u32 *mtu);
+
+struct nf_conn;
+
+/* One direction of a bridged connection, indexed by conntrack direction:
+ * the port its frames arrive on and the address they are sent to.
+ */
+struct nss_flow_br_dir {
+	int ifnum;
+	u32 mtu;
+	u8 dmac[ETH_ALEN];
+};
+
+int nss_flow_br_add(struct nf_conn *ct, const struct nss_flow_br_dir *dir,
+		    u32 priority);
+void nss_flow_br_del(const struct nf_conn *ct);
+unsigned long nss_flow_br_used(const struct nf_conn *ct);
+void nss_bridge_start(struct nss_core *core);
+void nss_bridge_stop(void);
+void nss_bridge_print(struct seq_file *s);
 void nss_flow_flush(void);
 void nss_flow_print(struct seq_file *s);
 int nss_flow_init(void);
