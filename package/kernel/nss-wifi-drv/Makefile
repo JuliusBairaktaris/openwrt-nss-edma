@@ -12,7 +12,8 @@ define KernelPackage/nss-wifi-drv
   CATEGORY:=Kernel modules
   SUBMENU:=Network Devices
   TITLE:=NSS firmware host driver for the Wi-Fi data plane
-  DEPENDS:=@TARGET_qualcommax +nss-firmware
+  DEPENDS:=@(TARGET_qualcommax_ipq807x||TARGET_qualcommax_ipq60xx) \
+	+nss-firmware +kmod-nft-bridge
   FILES:=$(PKG_BUILD_DIR)/nss-wifi-drv.ko
 endef
 

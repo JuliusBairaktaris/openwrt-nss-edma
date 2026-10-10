@@ -112,6 +112,7 @@ struct nss_flow_entry {
 	u8 protocol;
 	bool v6;
 	bool installed;
+	bool bridged;
 	struct nss_flow_pppoe *pppoe;
 	enum flow_offload_tuple_dir pppoe_dir;	/* the side that is PPPoE */
 	u64 lastused;
@@ -235,7 +236,7 @@ static enum flow_offload_tuple_dir nss_flow_dir_of(unsigned long cookie)
  * radio - so the number is where the device is found rather than anything
  * that has to be derived.
  */
-static int nss_flow_ifnum(struct nss_core *core, int ifindex, u32 *mtu)
+int nss_flow_ifnum(struct nss_core *core, int ifindex, u32 *mtu)
 {
 	int i;
 
@@ -578,7 +579,8 @@ static int nss_flow_send_v4(struct nss_core *core, struct nss_flow_entry *e,
 	c->nexthop_rule.flow_nexthop = c->conn_rule.flow_interface_num;
 	c->nexthop_rule.return_nexthop = c->conn_rule.return_interface_num;
 
-	c->rule_flags = NSS_IPV4_RULE_CREATE_FLAG_ROUTED;
+	c->rule_flags = e->bridged ? NSS_IPV4_RULE_CREATE_FLAG_BRIDGE_FLOW :
+				     NSS_IPV4_RULE_CREATE_FLAG_ROUTED;
 	c->valid_flags = NSS_IPV4_RULE_CREATE_CONN_VALID |
 			 NSS_IPV4_RULE_CREATE_QOS_VALID |
 			 NSS_IPV4_RULE_CREATE_NEXTHOP_VALID;
@@ -616,8 +618,8 @@ static int nss_flow_send_v4(struct nss_core *core, struct nss_flow_entry *e,
 		c->tcp_rule.return_max_end = ct->proto.tcp.seen[IP_CT_DIR_REPLY].td_maxend;
 		spin_unlock_bh(&ct->lock);
 		c->valid_flags |= NSS_IPV4_RULE_CREATE_TCP_VALID;
-		/* The kernel marked both directions liberal when it accepted
-		 * the flow, so a window snapshot from before the handoff must
+		/* Both directions are marked liberal when the flow is handed
+		 * over, so a window snapshot from before the handoff must
 		 * not be enforced against packets it never saw.
 		 */
 		c->rule_flags |= NSS_IPV4_RULE_CREATE_FLAG_NO_SEQ_CHECK;
@@ -700,7 +702,8 @@ static int nss_flow_send_v6(struct nss_core *core, struct nss_flow_entry *e,
 	c->nexthop_rule.flow_nexthop = c->conn_rule.flow_interface_num;
 	c->nexthop_rule.return_nexthop = c->conn_rule.return_interface_num;
 
-	c->rule_flags = NSS_IPV6_RULE_CREATE_FLAG_ROUTED;
+	c->rule_flags = e->bridged ? NSS_IPV6_RULE_CREATE_FLAG_BRIDGE_FLOW :
+				     NSS_IPV6_RULE_CREATE_FLAG_ROUTED;
 	c->valid_flags = NSS_IPV6_RULE_CREATE_CONN_VALID |
 			 NSS_IPV6_RULE_CREATE_QOS_VALID |
 			 NSS_IPV6_RULE_CREATE_NEXTHOP_VALID;
@@ -1130,6 +1133,15 @@ static void nss_flow_sweep_v6(struct nss_core *core)
  */
 static unsigned long nss_flow_swept;
 
+static void nss_flow_sweep(struct nss_core *core)
+{
+	if (time_after(jiffies, nss_flow_swept + HZ)) {
+		nss_flow_swept = jiffies;
+		nss_flow_sweep_v4(core);
+		nss_flow_sweep_v6(core);
+	}
+}
+
 static int nss_flow_stats(struct nss_core *core, struct flow_cls_offload *f)
 {
 	unsigned long key = (unsigned long)nss_flow_of(f->cookie);
@@ -1139,11 +1151,7 @@ static int nss_flow_stats(struct nss_core *core, struct flow_cls_offload *f)
 	if (!e || !e->installed)
 		return -ENOENT;
 
-	if (time_after(jiffies, nss_flow_swept + HZ)) {
-		nss_flow_swept = jiffies;
-		nss_flow_sweep_v4(core);
-		nss_flow_sweep_v6(core);
-	}
+	nss_flow_sweep(core);
 
 	flow_stats_update(&f->stats, 0, 0, 0, e->lastused,
 			  FLOW_ACTION_HW_STATS_DELAYED);
@@ -1230,6 +1238,95 @@ int nss_flow_setup_block(struct net_device *dev, struct flow_block_offload *f)
 }
 EXPORT_SYMBOL_GPL(nss_flow_setup_block);
 
+/* A bridged connection, keyed by its conntrack entry: nothing in it is
+ * translated and the frames keep their addresses.
+ */
+int nss_flow_br_add(struct nf_conn *ct, const struct nss_flow_br_dir *dir,
+		    u32 priority)
+{
+	struct nss_flow_entry *e;
+	u32 fw_err = 0;
+	int d, ret;
+
+	guard(mutex)(&nss_flow_lock);
+
+	if (!nss_flow_core || !nss_flow_core->running)
+		return -ENODEV;
+
+	e = kzalloc(sizeof(*e), GFP_KERNEL);
+	if (!e)
+		return -ENOMEM;
+
+	e->flow = (unsigned long)ct;
+	e->bridged = true;
+	e->protocol = nf_ct_protonum(ct);
+	e->v6 = nf_ct_l3num(ct) == NFPROTO_IPV6;
+	e->priority = priority;
+	for (d = 0; d < FLOW_OFFLOAD_DIR_MAX; d++) {
+		e->dir[d].ifnum = dir[d].ifnum;
+		e->dir[d].mtu = dir[d].mtu;
+		ether_addr_copy(e->dir[d].mac, dir[d].dmac);
+		e->dir[d].seen = true;
+	}
+
+	ret = rhashtable_insert_fast(&nss_flow_table, &e->node,
+				     nss_flow_ht_params);
+	if (ret) {
+		kfree(e);
+		return ret;
+	}
+
+	if (e->protocol == IPPROTO_TCP) {
+		spin_lock_bh(&ct->lock);
+		ct->proto.tcp.seen[0].flags |= IP_CT_TCP_FLAG_BE_LIBERAL;
+		ct->proto.tcp.seen[1].flags |= IP_CT_TCP_FLAG_BE_LIBERAL;
+		spin_unlock_bh(&ct->lock);
+	}
+
+	ret = e->v6 ? nss_flow_send_v6(nss_flow_core, e, ct, &fw_err) :
+		      nss_flow_send_v4(nss_flow_core, e, ct, &fw_err);
+	if (ret) {
+		nss_flow_forget(nss_flow_core, e);
+		return ret;
+	}
+
+	e->installed = true;
+	e->lastused = jiffies;
+
+	return 0;
+}
+
+void nss_flow_br_del(const struct nf_conn *ct)
+{
+	unsigned long key = (unsigned long)ct;
+	struct nss_flow_entry *e;
+
+	guard(mutex)(&nss_flow_lock);
+
+	e = rhashtable_lookup_fast(&nss_flow_table, &key, nss_flow_ht_params);
+	if (e && nss_flow_core)
+		nss_flow_forget(nss_flow_core, e);
+}
+
+/* When the firmware last reported traffic on a bridged connection, or 0
+ * when it holds no rule for it.
+ */
+unsigned long nss_flow_br_used(const struct nf_conn *ct)
+{
+	unsigned long key = (unsigned long)ct;
+	struct nss_flow_entry *e;
+
+	guard(mutex)(&nss_flow_lock);
+
+	if (!nss_flow_core || !nss_flow_core->running)
+		return 0;
+
+	nss_flow_sweep(nss_flow_core);
+	e = rhashtable_lookup_fast(&nss_flow_table, &key, nss_flow_ht_params);
+
+	return e && e->installed ? e->lastused : 0;
+}
+
 void nss_flow_print(struct seq_file *s)
 {
 	struct rhashtable_iter iter;
@@ -1265,8 +1362,9 @@ void nss_flow_print(struct seq_file *s)
 	while ((e = rhashtable_walk_next(&iter)) != NULL) {
 		if (IS_ERR(e))
 			continue;
-		seq_printf(s, "proto %u %s if %d/%d prio %u installed %d age %ums fw flow rx %llu tx %llu return rx %llu tx %llu\n",
+		seq_printf(s, "proto %u %s%s if %d/%d prio %u installed %d age %ums fw flow rx %llu tx %llu return rx %llu tx %llu\n",
 			   e->protocol, e->v6 ? "v6" : "v4",
+			   e->bridged ? " bridged" : "",
 			   e->dir[FLOW_OFFLOAD_DIR_ORIGINAL].ifnum,
 			   e->dir[FLOW_OFFLOAD_DIR_REPLY].ifnum,
 			   e->priority, e->installed,
