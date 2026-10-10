@@ -1041,6 +1041,13 @@ static int nss_wifi_me_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(nss_wifi_me);
 
+static int nss_mesh_show(struct seq_file *s, void *unused)
+{
+	nss_mesh_print(s);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(nss_mesh);
+
 static void nss_aux_clocks_put(void *data)
 {
 	struct nss_core *core = data;
@@ -1252,6 +1259,8 @@ static int nss_probe(struct platform_device *pdev)
 			    &nss_mcast_fops);
 	debugfs_create_file("wifi_me", 0400, core->debugfs, core,
 			    &nss_wifi_me_fops);
+	debugfs_create_file("mesh", 0400, core->debugfs, core,
+			    &nss_mesh_fops);
 
 	return 0;
 }
@@ -1325,6 +1334,7 @@ static void __exit nss_module_exit(void)
 {
 	platform_driver_unregister(&nss_driver);
 	nss_wifili_me_exit();
+	nss_mesh_exit();
 	nss_mc_exit();
 	nss_flow_exit();
 }

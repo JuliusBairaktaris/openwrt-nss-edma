@@ -16,7 +16,12 @@
 #ifndef __LINUX_SOC_QCOM_NSS_WIFI_H__
 #define __LINUX_SOC_QCOM_NSS_WIFI_H__
 
+#include <linux/if_ether.h>
 #include <linux/types.h>
+
+struct napi_struct;
+struct net_device;
+struct sk_buff;
 
 struct flow_block_offload;
 
@@ -91,6 +96,58 @@ struct nss_wifi_soc {
 			 struct sk_buff *skb, struct napi_struct *napi);
 };
 
+/*
+ * 802.11s, on the firmware lines that forward it themselves. A mesh
+ * interface is a virtual device for its frames plus two firmware nodes that
+ * hold the path tables; the subsystem's path table is mirrored into them,
+ * and the firmware reports back what only it sees.
+ */
+enum nss_wifi_mesh_cmd {
+	NSS_WIFI_MESH_MPATH_ADD,
+	NSS_WIFI_MESH_MPATH_UPDATE,
+	NSS_WIFI_MESH_MPATH_DEL,
+	NSS_WIFI_MESH_MPP_ADD,
+	NSS_WIFI_MESH_MPP_UPDATE,
+	NSS_WIFI_MESH_MPP_DEL,
+};
+
+enum nss_wifi_mesh_event {
+	NSS_WIFI_MESH_EV_REFRESH,	/* path in use and due for a refresh */
+	NSS_WIFI_MESH_EV_NOT_FOUND,	/* no path to da; ta set if forwarded */
+	NSS_WIFI_MESH_EV_MPATH_DEL,
+	NSS_WIFI_MESH_EV_EXPIRY,
+	NSS_WIFI_MESH_EV_MPP_LEARN,
+	NSS_WIFI_MESH_EV_MPP_ADD,
+	NSS_WIFI_MESH_EV_MPP_UPDATE,	/* also: proxy still in use */
+};
+
+#define NSS_WIFI_MESH_PATH_ACTIVE	0x01
+#define NSS_WIFI_MESH_PATH_RESOLVING	0x02
+#define NSS_WIFI_MESH_PATH_RESOLVED	0x04
+#define NSS_WIFI_MESH_PATH_FIXED	0x08
+
+struct nss_wifi_mesh_path {
+	u8 mesh_da[ETH_ALEN];	/* path destination, or the proxy of da */
+	u8 da[ETH_ALEN];
+	u8 next_hop[ETH_ALEN];
+	u8 old_next_hop[ETH_ALEN];
+	u8 ta[ETH_ALEN];
+	u32 metric;
+	u32 exp_ms;
+	u8 hop_count;
+	u8 flags;		/* NSS_WIFI_MESH_PATH_* */
+	bool gate;
+};
+
+/* Both are called from softirq. rx gets an 802.11 frame at skb->data with
+ * the hardware receive descriptor at skb->head.
+ */
+struct nss_wifi_mesh_ops {
+	void (*event)(void *priv, enum nss_wifi_mesh_event ev,
+		      const struct nss_wifi_mesh_path *p);
+	void (*rx)(void *priv, struct sk_buff *skb, struct napi_struct *napi);
+};
+
 #if IS_REACHABLE(CONFIG_NSS_WIFI_DRV)
 int nss_wifi_soc_register(const struct nss_wifi_soc *soc);
 void nss_wifi_soc_unregister(void);
@@ -107,6 +164,12 @@ int nss_wifi_peer_security(u16 peer_id, bool group, u32 cipher,
 			   const u8 *mic_key);
 int nss_wifi_peer_authorize(u16 peer_id);
 int nss_flow_setup_block(struct net_device *dev, struct flow_block_offload *f);
+int nss_wifi_mesh_register(struct net_device *dev, u8 radio, u32 vdev_id,
+			   const u8 *mac, u8 mode,
+			   const struct nss_wifi_mesh_ops *ops, void *priv);
+int nss_wifi_mesh_path(int if_num, enum nss_wifi_mesh_cmd cmd,
+		       const struct nss_wifi_mesh_path *p);
+int nss_wifi_mesh_config(int if_num, u8 ttl, u32 refresh_ms, bool forward);
 #else
 static inline int nss_wifi_soc_register(const struct nss_wifi_soc *soc)
 {
@@ -167,6 +230,26 @@ static inline int nss_wifi_peer_authorize(u16 peer_id)
 
 static inline int nss_flow_setup_block(struct net_device *dev,
 				       struct flow_block_offload *f)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int nss_wifi_mesh_register(struct net_device *dev, u8 radio,
+					 u32 vdev_id, const u8 *mac, u8 mode,
+					 const struct nss_wifi_mesh_ops *ops,
+					 void *priv)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int nss_wifi_mesh_path(int if_num, enum nss_wifi_mesh_cmd cmd,
+				     const struct nss_wifi_mesh_path *p)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int nss_wifi_mesh_config(int if_num, u8 ttl, u32 refresh_ms,
+				       bool forward)
 {
 	return -EOPNOTSUPP;
 }

@@ -179,7 +179,7 @@ static void nss_notify_recv(struct nss_core *core,
 
 	if (NSS_INTERFACE_NUM_GET(ncm->interface) == NSS_INTERFACE_WIFILI)
 		nss_wifili_notify(core, ncm, desc->payload_len);
-	else
+	else if (!nss_mesh_notify(core, ncm, desc->payload_len))
 		nss_wifili_vdev_notify(core, ncm, desc->payload_len);
 }
 
@@ -781,7 +781,8 @@ static int nss_poll_n2h(struct napi_struct *napi, int budget)
 					goto next;
 				}
 				atomic_dec(&core->buffers_queued);
-				if (nss_data_recv(core, napi, desc, skb))
+				if (nss_mesh_recv(core, napi, desc, skb) ||
+				    nss_data_recv(core, napi, desc, skb))
 					goto next;
 				dma_unmap_single(core->dev, NSS_SKB_CB(skb)->dma,
 						 NSS_EMPTY_BUFFER_ALLOC,

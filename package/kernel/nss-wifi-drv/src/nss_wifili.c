@@ -777,14 +777,13 @@ static int __nss_wifili_vdev_msg(struct nss_core *core, int if_num, u32 type,
 	return ret;
 }
 
-static int nss_wifili_vdev_msg(struct nss_core *core, int if_num, u32 type,
-			       const void *body, size_t len)
+int nss_wifili_vdev_msg(struct nss_core *core, int if_num, u32 type,
+			const void *body, size_t len)
 {
 	return __nss_wifili_vdev_msg(core, if_num, type, body, len, NULL);
 }
 
-static int nss_wifili_vdev_cmd(struct nss_core *core, int if_num, u32 cmd,
-			       u32 value)
+int nss_wifili_vdev_cmd(struct nss_core *core, int if_num, u32 cmd, u32 value)
 {
 	struct nss_wifi_vdev_cmd_msg c = { .cmd = cmd, .value = value };
 
@@ -944,6 +943,106 @@ int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
 }
 EXPORT_SYMBOL_GPL(nss_wifi_vdev_register);
 
+#ifdef NSS_FIRMWARE_VERSION_11_4
+/* A mesh interface's virtual device. It carries 802.11 both ways, and what
+ * it receives goes on to the mesh decapsulation node rather than to the host,
+ * so the network device is bound to the mesh nodes, not to it.
+ */
+int nss_wifi_mesh_register(struct net_device *dev, u8 radio, u32 vdev_id,
+			   const u8 *mac, u8 mode,
+			   const struct nss_wifi_mesh_ops *ops, void *priv)
+{
+	struct nss_wifi_vdev_config_msg cfg = {};
+	struct nss_wifi_vdev_enable_msg up = {};
+	struct nss_dynamic_interface_msg d = {};
+	struct nss_core *core;
+	int if_num, ret, i;
+
+	guard(mutex)(&nss_wifili_lock);
+
+	core = nss_wifili_core;
+	if (!core || !core->wifili_started)
+		return -EAGAIN;
+	if (!core->mesh_capable)
+		return -EOPNOTSUPP;
+	if (radio >= nss_wifili_pdevs || nss_wifili_radio_if[radio] < 0)
+		return -ENODEV;
+
+	for (i = 0; i < ARRAY_SIZE(nss_wifili_vdev_tbl); i++)
+		if (!nss_wifili_vdev_tbl[i].dev)
+			break;
+	if (i == ARRAY_SIZE(nss_wifili_vdev_tbl))
+		return -ENOSPC;
+
+	d.cm.interface = NSS_INTERFACE_DYNAMIC;
+	d.cm.type = NSS_DYNAMIC_INTERFACE_ALLOC_NODE;
+	d.msg.alloc_node.type = NSS_DYNAMIC_INTERFACE_TYPE_VAP;
+	ret = nss_msg_send(core, &d, sizeof(d));
+	if (ret)
+		return ret;
+
+	if_num = d.msg.alloc_node.if_num;
+	if (if_num < 0 || if_num >= NSS_INTERFACE_MAX)
+		return -ERANGE;
+
+	/* The order is the vendor stack's on this firmware: the mesh nodes
+	 * exist before the device that feeds them is configured.
+	 */
+	ret = nss_mesh_add(core, dev, if_num, mac, ops, priv);
+	if (ret) {
+		nss_wifili_vdev_free(core, if_num);
+		return ret;
+	}
+
+	ether_addr_copy(cfg.mac_addr, mac);
+	cfg.radio_ifnum = nss_wifili_radio_if[radio];
+	cfg.vdev_id = vdev_id;
+	cfg.opmode = NSS_WIFI_VDEV_OPMODE_AP;
+	cfg.vap_ext_mode = WIFI_VDEV_EXT_MODE_MESH_LINK;
+
+	ret = nss_wifili_vdev_msg(core, if_num,
+				  NSS_WIFI_VDEV_INTERFACE_CONFIGURE_MSG,
+				  &cfg, sizeof(cfg));
+	if (!ret)
+		ret = nss_mesh_attach(core, if_num);
+	if (!ret)
+		ret = nss_wifili_vdev_cmd(core, if_num,
+					  NSS_WIFI_VDEV_ENCAP_TYPE_CMD, mode);
+	if (!ret)
+		ret = nss_wifili_vdev_cmd(core, if_num,
+					  NSS_WIFI_VDEV_DECAP_TYPE_CMD, mode);
+	if (!ret) {
+		ether_addr_copy(up.mac_addr, mac);
+		ret = nss_wifili_vdev_msg(core, if_num,
+					  NSS_WIFI_VDEV_INTERFACE_UP_MSG,
+					  &up, sizeof(up));
+	}
+	if (ret) {
+		nss_mesh_stop(core, if_num);
+		nss_wifili_vdev_free(core, if_num);
+		nss_mesh_del(core, if_num);
+		return ret;
+	}
+
+	nss_wifili_vdev_tbl[i].dev = dev;
+	nss_wifili_vdev_tbl[i].if_num = if_num;
+	nss_wifili_vdev_tbl[i].vdev_id = vdev_id;
+
+	dev_info(core->dev, "mesh vdev %u on radio %u is interface %d\n",
+		 vdev_id, radio, if_num);
+
+	return if_num;
+}
+#else
+int nss_wifi_mesh_register(struct net_device *dev, u8 radio, u32 vdev_id,
+			   const u8 *mac, u8 mode,
+			   const struct nss_wifi_mesh_ops *ops, void *priv)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+EXPORT_SYMBOL_GPL(nss_wifi_mesh_register);
+
 static void nss_wifili_peer_flush(struct nss_core *core, u32 vdev_id);
 
 void nss_wifi_vdev_unregister(struct net_device *dev)
@@ -980,6 +1079,7 @@ void nss_wifi_vdev_unregister(struct net_device *dev)
 		nss_wifili_vdev_tbl[i].if_num = -1;
 
 		nss_wifili_peer_flush(core, nss_wifili_vdev_tbl[i].vdev_id);
+		nss_mesh_stop(core, if_num);
 
 		/* Down before the node goes: a virtual device released while
 		 * it is still up faults the firmware.
@@ -988,6 +1088,7 @@ void nss_wifi_vdev_unregister(struct net_device *dev)
 				    NSS_WIFI_VDEV_INTERFACE_DOWN_MSG, NULL,
 				    sizeof(struct nss_wifi_vdev_disable_msg));
 		nss_wifili_vdev_free(core, if_num);
+		nss_mesh_del(core, if_num);
 	}
 }
 EXPORT_SYMBOL_GPL(nss_wifi_vdev_unregister);
@@ -2055,6 +2156,7 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 	for (i = 0; i < ARRAY_SIZE(nss_wifili_vdev_tbl); i++)
 		nss_wifili_vdev_tbl[i].dev = NULL;
 	nss_me_drop(-1);
+	nss_mesh_reset();
 
 	m = kzalloc(sizeof(*m), GFP_KERNEL);
 	w = kzalloc(sizeof(*w), GFP_KERNEL);
@@ -2296,6 +2398,8 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 		   m->cm.response, m->cm.error);
 	if (!ret) {
 		core->wifili_started = true;
+		core->mesh_capable = nss_mesh_probe(core);
+		core->wifi_on = true;
 
 		ret = nss_wifili_vdev_next_hop(core);
 		seq_printf(s, "%-14s rc %d\n", "next hop:", ret);

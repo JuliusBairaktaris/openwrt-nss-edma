@@ -245,6 +245,15 @@ int nss_flow_ifnum(struct nss_core *core, int ifindex, u32 *mtu)
 
 	guard(rcu)();
 
+	/* A mesh device is bound to two nodes; flows go to the one that
+	 * builds the mesh header.
+	 */
+	i = nss_mesh_ifnum(ifindex);
+	if (i >= 0) {
+		*mtu = rcu_dereference(core->iface[i])->mtu;
+		return i;
+	}
+
 	for (i = 0; i < NSS_INTERFACE_MAX; i++) {
 		struct net_device *dev = rcu_dereference(core->iface[i]);
 
