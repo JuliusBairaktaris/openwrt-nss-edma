@@ -368,6 +368,7 @@ static void nss_core_halt(struct nss_core *core)
 		schedule_work(&core->arm);
 	nss_bridge_stop();
 	nss_flow_flush();
+	nss_mc_flush();
 
 	nss_log_shadow_stop(core);
 	nss_rings_stop(core);
@@ -1030,6 +1031,13 @@ static int nss_flows_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(nss_flows);
 
+static int nss_mcast_show(struct seq_file *s, void *unused)
+{
+	nss_mc_print(s);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(nss_mcast);
+
 static void nss_aux_clocks_put(void *data)
 {
 	struct nss_core *core = data;
@@ -1217,6 +1225,7 @@ static int nss_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, core);
 	nss_wifili_bind(core);
 	nss_flow_bind(core);
+	nss_mc_bind(core);
 
 	core->debugfs = debugfs_create_dir(dev_name(dev), NULL);
 	debugfs_create_file("boot", 0600, core->debugfs, core, &nss_boot_fops);
@@ -1236,6 +1245,8 @@ static int nss_probe(struct platform_device *pdev)
 			    &nss_phys_fops);
 	debugfs_create_file("flows", 0400, core->debugfs, core,
 			    &nss_flows_fops);
+	debugfs_create_file("mcast", 0400, core->debugfs, core,
+			    &nss_mcast_fops);
 
 	return 0;
 }
@@ -1246,6 +1257,7 @@ static void nss_remove(struct platform_device *pdev)
 
 	nss_wifili_bind(NULL);
 	nss_flow_bind(NULL);
+	nss_mc_bind(NULL);
 	debugfs_remove_recursive(core->debugfs);
 	WRITE_ONCE(core->up, false);
 	scoped_guard(mutex, &core->lock)
@@ -1285,9 +1297,20 @@ static int __init nss_module_init(void)
 	if (ret)
 		return ret;
 
+	ret = nss_mc_init();
+	if (ret)
+		goto flow;
+
 	ret = platform_driver_register(&nss_driver);
 	if (ret)
-		nss_flow_exit();
+		goto mc;
+
+	return 0;
+
+mc:
+	nss_mc_exit();
+flow:
+	nss_flow_exit();
 
 	return ret;
 }
@@ -1296,6 +1319,7 @@ module_init(nss_module_init);
 static void __exit nss_module_exit(void)
 {
 	platform_driver_unregister(&nss_driver);
+	nss_mc_exit();
 	nss_flow_exit();
 }
 module_exit(nss_module_exit);

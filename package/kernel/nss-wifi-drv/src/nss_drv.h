@@ -475,15 +475,22 @@ int nss_phys_msg(struct nss_core *core, int if_num, u32 type,
 void nss_phys_arm_ports(struct nss_core *core);
 void nss_flow_bind(struct nss_core *core);
 int nss_flow_ifnum(struct nss_core *core, int ifindex, u32 *mtu);
+int nss_flow_port(struct nss_core *core, int ifindex, u16 flow_vid, u32 *mtu,
+		  u16 *vid);
+int nss_flow_pppoe_hold(struct nss_core *core, u16 sid, const u8 *server,
+			const u8 *local, int port, u32 mtu, u32 tag);
+void nss_flow_pppoe_drop(struct nss_core *core, int if_num);
 
 struct nf_conn;
 
 /* One direction of a bridged connection, indexed by conntrack direction:
- * the port its frames arrive on and the address they are sent to.
+ * the port its frames arrive on, with its conduit tag, and the address they
+ * are sent to.
  */
 struct nss_flow_br_dir {
 	int ifnum;
 	u32 mtu;
+	u16 vid;
 	u8 dmac[ETH_ALEN];
 };
 
@@ -499,6 +506,11 @@ void nss_flow_notify(const struct nss_cmn_msg *ncm, u32 len);
 void nss_flow_print(struct seq_file *s);
 int nss_flow_init(void);
 void nss_flow_exit(void);
+void nss_mc_bind(struct nss_core *core);
+void nss_mc_flush(void);
+void nss_mc_print(struct seq_file *s);
+int nss_mc_init(void);
+void nss_mc_exit(void);
 int nss_log_show_ring(struct nss_core *core, struct seq_file *s);
 void nss_log_dump(struct nss_core *core, const char *why);
 int nss_log_shadow_init(struct nss_core *core);
