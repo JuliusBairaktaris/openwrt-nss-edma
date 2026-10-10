@@ -5,6 +5,8 @@ PKG_NAME:=nss-wifi-drv
 PKG_RELEASE:=1
 PKG_LICENSE:=GPL-2.0-only
 
+PKG_CONFIG_DEPENDS:=CONFIG_NSS_FIRMWARE_VERSION_11_4
+
 include $(INCLUDE_DIR)/package.mk
 
 define KernelPackage/nss-wifi-drv
@@ -37,7 +39,9 @@ define Build/Prepare
 endef
 
 define Build/Compile
-	+$(KERNEL_MAKE) M="$(PKG_BUILD_DIR)" modules
+	+$(KERNEL_MAKE) M="$(PKG_BUILD_DIR)" \
+		CONFIG_NSS_FIRMWARE_VERSION_11_4=$(CONFIG_NSS_FIRMWARE_VERSION_11_4) \
+		modules
 endef
 
 # The WLAN driver describes its rings through this, and is built by another
