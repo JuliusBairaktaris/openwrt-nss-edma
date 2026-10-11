@@ -336,8 +336,11 @@ struct nss_msg_seen {
 	u32 last[256];
 };
 
+struct nss_soc;
+
 struct nss_core {
 	struct device *dev;
+	const struct nss_soc *soc;
 	void __iomem *nphys;
 	void __iomem *qgic;
 	void __iomem *imem;

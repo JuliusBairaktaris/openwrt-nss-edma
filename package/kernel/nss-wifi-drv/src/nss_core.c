@@ -75,7 +75,7 @@
  * and stay on, because the switch sits behind them and a wired data plane
  * that has nothing to do with this driver goes down when they do.
  */
-static const struct nss_clk_cfg nss_clk_tbl[] = {
+static const struct nss_clk_cfg nss_clk_ipq8074[] = {
 	{ "nss-noc-clk",		461500000 },
 	{ "nss-ptp-ref-clk",		150000000 },
 	{ "nss-csr-clk",		200000000 },
@@ -97,28 +97,71 @@ static const struct nss_clk_cfg nss_clk_tbl[] = {
 	{ "nss-nc-axi-clk",		461500000 },
 };
 
-#define NSS_CLK_COUNT	ARRAY_SIZE(nss_clk_tbl)
+/* The rates qca-nss-drv's ipq60xx hal sets. */
+static const struct nss_clk_cfg nss_clk_ipq6018[] = {
+	{ "nss-noc-clk",		266670000 },
+	{ "nss-ptp-ref-clk",		150000000 },
+	{ "nss-csr-clk",		200000000 },
+	{ "nss-cfg-clk",		100000000 },
+	{ "nss-nssnoc-qosgen-ref-clk",	 24000000 },
+	{ "nss-nssnoc-snoc-clk",	266600000 },
+	{ "nss-snoc-nssnoc-clk",	266670000 },
+	{ "nss-nssnoc-timeout-ref-clk",	  6000000 },
+	{ "nss-ce-axi-clk",		200000000 },
+	{ "nss-ce-apb-clk",		200000000 },
+	{ "nss-nssnoc-ce-axi-clk",	200000000 },
+	{ "nss-nssnoc-ce-apb-clk",	200000000 },
+	{ "nss-mem-noc-ubi32-clk",	533330000 },
+	{ "nss-nssnoc-ahb-clk",		200000000 },
+	{ "nss-core-clk",			0 },
+	{ "nss-ahb-clk",		200000000 },
+	{ "nss-axi-clk",		533330000 },
+	{ "nss-nc-axi-clk",		266670000 },
+	{ "nss-utcm-clk",		266670000 },
+};
+
+struct nss_soc {
+	const struct nss_clk_cfg *clk;
+	/* Program the copy engine and core-to-core interrupts as level
+	 * sensitive. qca-nss-drv leaves them at reset on the single-core
+	 * IPQ6018.
+	 */
+	bool level_irqs;
+};
+
+static const struct nss_soc nss_ipq8074 = {
+	.clk = nss_clk_ipq8074,
+	.level_irqs = true,
+};
+
+static const struct nss_soc nss_ipq6018 = {
+	.clk = nss_clk_ipq6018,
+};
+
+#define NSS_CLK_COUNT	ARRAY_SIZE(nss_clk_ipq8074)
 #define NSS_CLK_FABRIC	13
 #define NSS_CLK_OWN	(NSS_CLK_COUNT - NSS_CLK_FABRIC)
+
+static_assert(ARRAY_SIZE(nss_clk_ipq6018) == NSS_CLK_COUNT);
 
 static int nss_clocks_get(struct nss_core *core)
 {
 	int i, ret;
 
 	for (i = 0; i < NSS_CLK_COUNT; i++)
-		core->clks[i].id = nss_clk_tbl[i].name;
+		core->clks[i].id = core->soc->clk[i].name;
 
 	ret = devm_clk_bulk_get(core->dev, NSS_CLK_COUNT, core->clks);
 	if (ret)
 		return dev_err_probe(core->dev, ret, "clocks\n");
 
 	for (i = 0; i < NSS_CLK_COUNT; i++) {
-		unsigned long rate = nss_clk_tbl[i].rate ? : core->core_rate;
+		unsigned long rate = core->soc->clk[i].rate ? : core->core_rate;
 
 		ret = clk_set_rate(core->clks[i].clk, rate);
 		if (ret)
 			return dev_err_probe(core->dev, ret, "%s rate\n",
-					     nss_clk_tbl[i].name);
+					     core->clks[i].id);
 	}
 
 	return 0;
@@ -311,8 +354,12 @@ static void nss_core_release(struct nss_core *core)
 	writel(NSS_CORE_BAR_ADDR, core->nphys + NSS_CORE_BAR);
 	writel(core->load_addr, core->nphys + NSS_CORE_BOOT_ADDR);
 
-	writel(NSS_CORE_INT_STAT2_LEVEL, core->nphys + NSS_CORE_INT_STAT2_TYPE);
-	writel(NSS_CORE_INT_STAT3_LEVEL, core->nphys + NSS_CORE_INT_STAT3_TYPE);
+	if (core->soc->level_irqs) {
+		writel(NSS_CORE_INT_STAT2_LEVEL,
+		       core->nphys + NSS_CORE_INT_STAT2_TYPE);
+		writel(NSS_CORE_INT_STAT3_LEVEL,
+		       core->nphys + NSS_CORE_INT_STAT3_TYPE);
+	}
 
 	writel(NSS_CORE_IFETCH_RANGE_ADDR, core->nphys + NSS_CORE_IFETCH_RANGE);
 
@@ -1147,6 +1194,8 @@ static int nss_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	core->dev = dev;
+	core->soc = of_machine_is_compatible("qcom,ipq6018") ? &nss_ipq6018 :
+							       &nss_ipq8074;
 	INIT_LIST_HEAD(&core->allocs);
 	init_completion(&core->booted);
 	init_completion(&core->resumed);
@@ -1195,15 +1244,15 @@ static int nss_probe(struct platform_device *pdev)
 	if (!core->qgic)
 		return -ENOMEM;
 
+	/* IPQ6018 has no instruction memory. */
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "vphys");
-	if (!res)
-		return -ENODEV;
-
-	core->imem_base = res->start;
-	core->imem_size = resource_size(res);
-	core->imem = devm_ioremap_resource(dev, res);
-	if (IS_ERR(core->imem))
-		return PTR_ERR(core->imem);
+	if (res) {
+		core->imem_base = res->start;
+		core->imem_size = resource_size(res);
+		core->imem = devm_ioremap_resource(dev, res);
+		if (IS_ERR(core->imem))
+			return PTR_ERR(core->imem);
+	}
 
 	ret = nss_clocks_get(core);
 	if (ret)
