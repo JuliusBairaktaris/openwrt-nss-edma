@@ -27,10 +27,8 @@ associates. No data crosses the air while the offload is on.
 
 Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 ---
-Index: backports-7.2/drivers/net/wireless/ath/ath11k/core.c
-===================================================================
---- backports-7.2.orig/drivers/net/wireless/ath/ath11k/core.c
-+++ backports-7.2/drivers/net/wireless/ath/ath11k/core.c
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
 @@ -38,6 +38,22 @@ bool ath11k_ftm_mode;
  module_param_named(ftm_mode, ath11k_ftm_mode, bool, 0444);
  MODULE_PARM_DESC(ftm_mode, "Boots up in factory test mode");
@@ -54,7 +52,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/core.c
  static struct ath11k_hw_params ath11k_hw_params[] = {
  	{
  		.hw_rev = ATH11K_HW_IPQ8074,
-@@ -2694,6 +2710,27 @@ static int ath11k_init_hw_params(struct
+@@ -2694,6 +2710,28 @@ static int ath11k_init_hw_params(struct
  
  	ab->hw_params = *hw_params;
  
@@ -68,7 +66,8 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/core.c
 +	 * stops receiving, so a station's frames go unacknowledged.
 +	 */
 +	ab->nss_offload = ath11k_nss_offload &&
-+			  ab->hw_rev == ATH11K_HW_IPQ8074;
++			  (ab->hw_rev == ATH11K_HW_IPQ8074 ||
++			   ab->hw_rev == ATH11K_HW_IPQ6018_HW10);
 +	if (ab->nss_offload && !ath11k_nss_keep_mask) {
 +		const struct ath11k_hw_ring_mask *m = ab->hw_params.ring_mask;
 +
@@ -82,10 +81,8 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/core.c
  	ret = of_property_read_u32(ab->dev->of_node,
  				   "qcom,ath11k-fw-memory-mode",
  				   &fw_mem_mode);
-Index: backports-7.2/drivers/net/wireless/ath/ath11k/core.h
-===================================================================
---- backports-7.2.orig/drivers/net/wireless/ath/ath11k/core.h
-+++ backports-7.2/drivers/net/wireless/ath/ath11k/core.h
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
 @@ -63,6 +63,10 @@
  
  extern unsigned int ath11k_frame_mode;
@@ -111,11 +108,9 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/core.h
  	const struct firmware *cal_file;
  
  	/* Below regd's are protected by ab->data_lock */
-Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp.c
-===================================================================
---- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp.c
-+++ backports-7.2/drivers/net/wireless/ath/ath11k/dp.c
-@@ -61,9 +61,17 @@ int ath11k_dp_peer_setup(struct ath11k *
+--- a/drivers/net/wireless/ath/ath11k/dp.c
++++ b/drivers/net/wireless/ath/ath11k/dp.c
+@@ -62,9 +62,17 @@ int ath11k_dp_peer_setup(struct ath11k *
  
  	/* NOTE: reo_dest ring id starts from 1 unlike mac_id which starts from 0 */
  	reo_dest = ar->dp.mac_id + 1;
@@ -134,10 +129,8 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp.c
  
  	if (ret) {
  		ath11k_warn(ab, "failed to set default routing %d peer :%pM vdev_id :%d\n",
-Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp_rx.c
-===================================================================
---- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp_rx.c
-+++ backports-7.2/drivers/net/wireless/ath/ath11k/dp_rx.c
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
 @@ -499,7 +499,11 @@ static int ath11k_dp_rxdma_pdev_buf_setu
  	struct dp_rxdma_ring *rx_ring = &dp->rx_refill_buf_ring;
  	int i;
@@ -151,10 +144,8 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp_rx.c
  
  	if (ar->ab->hw_params.rxdma1_enable) {
  		rx_ring = &dp->rxdma_mon_buf_ring;
-Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
-===================================================================
---- backports-7.2.orig/drivers/net/wireless/ath/ath11k/mac.c
-+++ backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
 @@ -6546,6 +6546,17 @@ static void ath11k_mac_op_tx(struct ieee
  		return;
  	}
@@ -173,10 +164,8 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  	if (control->sta)
  		arsta = ath11k_sta_to_arsta(control->sta);
  
-Index: backports-7.2/drivers/net/wireless/ath/ath11k/hw.c
-===================================================================
---- backports-7.2.orig/drivers/net/wireless/ath/ath11k/hw.c
-+++ backports-7.2/drivers/net/wireless/ath/ath11k/hw.c
+--- a/drivers/net/wireless/ath/ath11k/hw.c
++++ b/drivers/net/wireless/ath/ath11k/hw.c
 @@ -115,6 +115,15 @@ static void ath11k_hw_ipq8074_reo_setup(
  		HAL_HASH_ROUTING_RING_SW2 << 15 |
  		HAL_HASH_ROUTING_RING_SW3 << 18 |

@@ -275,7 +275,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp.c
 ===================================================================
 --- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp.c
 +++ backports-7.2/drivers/net/wireless/ath/ath11k/dp.c
-@@ -989,6 +989,7 @@ static void ath11k_nss_wifi_describe(str
+@@ -1001,6 +1001,7 @@ static void ath11k_nss_wifi_describe(str
  	soc->priv = ab;
  	soc->reset = ath11k_nss_reset;
  	soc->link_desc_return = ath11k_nss_link_desc_return;

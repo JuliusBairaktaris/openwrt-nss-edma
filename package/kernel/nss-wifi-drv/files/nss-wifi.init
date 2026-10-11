@@ -43,9 +43,10 @@ start_service() {
 		return 0
 	}
 
-	# ath11k offloads only IPQ8074 radios; elsewhere none would ever hand
-	# its rings over and the wait below would only delay the boot.
-	grep -qs 'qcom,ipq8074-wifi' /proc/device-tree/soc*/wifi@*/compatible || {
+	# ath11k offloads only the IPQ8074 and IPQ6018 radios; elsewhere none
+	# would ever hand its rings over and the wait below would only delay
+	# the boot.
+	grep -qsE 'qcom,ipq(8074|6018)-wifi' /proc/device-tree/soc*/wifi@*/compatible || {
 		wifi_load_host
 		return 0
 	}
