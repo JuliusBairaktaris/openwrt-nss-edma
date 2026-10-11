@@ -19,7 +19,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
 ===================================================================
 --- backports-7.2.orig/drivers/net/wireless/ath/ath11k/mac.c
 +++ backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
-@@ -10244,6 +10244,53 @@ static int ath11k_mac_op_sta_state(struc
+@@ -10254,6 +10254,53 @@ static int ath11k_mac_op_sta_state(struc
  	return ret;
  }
  
@@ -73,7 +73,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  static const struct ieee80211_ops ath11k_ops = {
  	.tx				= ath11k_mac_op_tx,
  	.wake_tx_queue			= ieee80211_handle_wake_tx_queue,
-@@ -10281,6 +10328,8 @@ static const struct ieee80211_ops ath11k
+@@ -10291,6 +10338,8 @@ static const struct ieee80211_ops ath11k
  	.flush				= ath11k_mac_op_flush,
  	.flush_sta			= ath11k_mac_op_flush_sta,
  	.sta_statistics			= ath11k_mac_op_sta_statistics,

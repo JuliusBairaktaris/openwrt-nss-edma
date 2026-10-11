@@ -85,7 +85,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  		     HTT_RX_FILTER_TLV_FLAGS_PPDU_END_STATUS_DONE,
  	.pkt_filter_flags0 = HTT_RX_FP_MGMT_FILTER_FLAGS0,
  	.pkt_filter_flags1 = HTT_RX_FP_MGMT_FILTER_FLAGS1,
-@@ -6536,14 +6538,57 @@ static void ath11k_mac_op_tx(struct ieee
+@@ -6546,14 +6548,57 @@ static void ath11k_mac_op_tx(struct ieee
  		return;
  	}
  
@@ -151,7 +151,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  		return;
  	}
  
-@@ -6871,6 +6916,56 @@ static int ath11k_mac_setup_vdev_create_
+@@ -6881,6 +6926,56 @@ static int ath11k_mac_setup_vdev_create_
  	return 0;
  }
  
@@ -208,7 +208,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  static void ath11k_mac_op_update_vif_offload(struct ieee80211_hw *hw,
  					     struct ieee80211_vif *vif)
  {
-@@ -7117,6 +7212,7 @@ static int ath11k_mac_op_add_interface(s
+@@ -7127,6 +7222,7 @@ static int ath11k_mac_op_add_interface(s
  
  	arvif->ar = ar;
  	arvif->vif = vif;
@@ -216,7 +216,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  
  	INIT_LIST_HEAD(&arvif->list);
  	INIT_WORK(&arvif->bcn_tx_work, ath11k_mac_bcn_tx_work);
-@@ -7202,6 +7298,9 @@ static int ath11k_mac_op_add_interface(s
+@@ -7212,6 +7308,9 @@ static int ath11k_mac_op_add_interface(s
  
  	ath11k_mac_op_update_vif_offload(hw, vif);
  
@@ -226,7 +226,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  	nss = get_num_chains(ar->cfg_tx_chainmask) ? : 1;
  	ret = ath11k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id,
  					    WMI_VDEV_PARAM_NSS, nss);
-@@ -7384,6 +7483,17 @@ static void ath11k_mac_op_remove_interfa
+@@ -7394,6 +7493,17 @@ static void ath11k_mac_op_remove_interfa
  				    arvif->vdev_id, ret);
  	}
  
@@ -244,7 +244,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  	ret = ath11k_mac_vdev_delete(ar, arvif);
  	if (ret) {
  		ath11k_warn(ab, "failed to delete vdev %d: %d\n",
-@@ -9459,6 +9569,11 @@ static void ath11k_mac_op_sta_statistics
+@@ -9469,6 +9579,11 @@ static void ath11k_mac_op_sta_statistics
  		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BITRATE);
  	}
  
