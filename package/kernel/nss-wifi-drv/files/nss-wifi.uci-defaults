@@ -1,0 +1,13 @@
+#!/bin/sh
+# Put the modem's raw-IP devices in fw4's flow table (see the include).
+
+uci -q get firewall.nss_wifi_flowtable >/dev/null && exit 0
+
+uci -q batch <<-EOT
+	set firewall.nss_wifi_flowtable=include
+	set firewall.nss_wifi_flowtable.type='script'
+	set firewall.nss_wifi_flowtable.path='/usr/share/nss-wifi/flowtable.sh'
+	commit firewall
+EOT
+
+exit 0

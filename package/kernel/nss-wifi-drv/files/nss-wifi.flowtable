@@ -1,0 +1,33 @@
+#!/bin/sh
+# fw4 include, run after every firewall (re)load.
+#
+# fw4 fills its flow table from each interface's main device, and a modem
+# interface has none: its raw-IP device is only the layer-3 device. Without
+# the device in the table, the kernel offers none of its connections for
+# offload. nss-wifi-drv takes the device's flow block, and the firmware
+# carries the connections it can route; without the driver the device only
+# joins the software fast path.
+
+ft=$(nft list flowtable inet fw4 ft 2>/dev/null) || exit 0
+case "$ft" in
+*"flags offload"*) ;;
+*) exit 0 ;;
+esac
+counter=
+case "$ft" in
+*counter*) counter="counter;" ;;
+esac
+
+for dev in $(ubus call network.interface dump 2>/dev/null |
+	     jsonfilter -e '@.interface[@.up=true].l3_device' | sort -u); do
+	[ "$(cat "/sys/class/net/$dev/type" 2>/dev/null)" = 519 ] || continue
+	case "$ft" in
+	*"\"$dev\""*) continue ;;
+	esac
+	# An update replaces the table's flags with the ones it names.
+	nft add flowtable inet fw4 ft \
+		"{ hook ingress priority filter; devices = { \"$dev\" }; flags offload; $counter }" ||
+		logger -t nss-wifi "flow table refused $dev"
+done
+
+exit 0
