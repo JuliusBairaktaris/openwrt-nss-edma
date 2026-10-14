@@ -416,6 +416,7 @@ static void nss_core_halt(struct nss_core *core)
 	nss_bridge_stop();
 	nss_flow_flush();
 	nss_mc_flush();
+	nss_rawip_halt(core);
 
 	nss_log_shadow_stop(core);
 	nss_rings_stop(core);
@@ -1092,6 +1093,13 @@ static int nss_wifi_me_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(nss_wifi_me);
 
+static int nss_rawip_show(struct seq_file *s, void *unused)
+{
+	nss_rawip_print(s);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(nss_rawip);
+
 static int nss_mesh_show(struct seq_file *s, void *unused)
 {
 	nss_mesh_print(s);
@@ -1289,6 +1297,7 @@ static int nss_probe(struct platform_device *pdev)
 	nss_wifili_bind(core);
 	nss_flow_bind(core);
 	nss_mc_bind(core);
+	nss_rawip_bind(core);
 
 	core->debugfs = debugfs_create_dir(dev_name(dev), NULL);
 	debugfs_create_file("boot", 0600, core->debugfs, core, &nss_boot_fops);
@@ -1314,6 +1323,8 @@ static int nss_probe(struct platform_device *pdev)
 			    &nss_wifi_me_fops);
 	debugfs_create_file("mesh", 0400, core->debugfs, core,
 			    &nss_mesh_fops);
+	debugfs_create_file("rawip", 0400, core->debugfs, core,
+			    &nss_rawip_fops);
 
 	return 0;
 }
@@ -1333,6 +1344,8 @@ static void nss_remove(struct platform_device *pdev)
 	complete_all(&core->resumed);
 	flush_work(&core->arm);
 	flush_work(&core->edma_reset);
+	/* After the halt, which forgets the bound core's node pairs. */
+	nss_rawip_bind(NULL);
 	dev_put(core->conduit);
 	nss_clocks_disable(core);
 }
@@ -1368,12 +1381,18 @@ static int __init nss_module_init(void)
 	if (ret)
 		goto flow;
 
-	ret = platform_driver_register(&nss_driver);
+	ret = nss_rawip_init();
 	if (ret)
 		goto mc;
 
+	ret = platform_driver_register(&nss_driver);
+	if (ret)
+		goto rawip;
+
 	return 0;
 
+rawip:
+	nss_rawip_exit();
 mc:
 	nss_mc_exit();
 flow:
@@ -1386,6 +1405,7 @@ module_init(nss_module_init);
 static void __exit nss_module_exit(void)
 {
 	platform_driver_unregister(&nss_driver);
+	nss_rawip_exit();
 	nss_wifili_me_exit();
 	nss_mesh_exit();
 	nss_mc_exit();

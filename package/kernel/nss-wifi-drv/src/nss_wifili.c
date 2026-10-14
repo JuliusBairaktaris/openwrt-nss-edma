@@ -1410,7 +1410,7 @@ int nss_wifi_vdev_tx(int if_num, struct sk_buff *skb)
 	if (!core || if_num < 0)
 		return -ENODEV;
 
-	return nss_data_send(core, skb, if_num);
+	return nss_data_send(core, skb, if_num, 0);
 }
 EXPORT_SYMBOL_GPL(nss_wifi_vdev_tx);
 
@@ -1991,7 +1991,7 @@ int nss_wifili_tx(struct seq_file *s)
 		skb->data[12] = 0x88;
 		skb->data[13] = 0xb5;
 
-		ret = nss_data_send(core, skb, if_num);
+		ret = nss_data_send(core, skb, if_num, 0);
 		if (ret) {
 			dev_kfree_skb_any(skb);
 			seq_printf(s, "post %d: rc %d\n", i, ret);

@@ -196,6 +196,11 @@ MODULE_PARM_DESC(tx_reusable, "offer the firmware the buffer a frame arrives in"
 static int nss_lent_take(struct nss_core *core, struct sk_buff *skb);
 static void nss_lent_put(struct nss_core *core, u32 slot);
 
+static enum dma_data_direction nss_tx_dir(const struct sk_buff *skb)
+{
+	return NSS_SKB_CB(skb)->bidir ? DMA_BIDIRECTIONAL : DMA_TO_DEVICE;
+}
+
 /* Hand a frame down to the firmware to place.
  *
  * The same descriptor the message layer fills, on the data queue rather than
@@ -203,17 +208,26 @@ static void nss_lent_put(struct nss_core *core, u32 slot);
  * buffer is the host's until the firmware gives it back on a receive ring
  * carrying the address handed out here, so it is marked to say which of the
  * two kinds of buffer it is: a donated one is replaced when it returns, a
- * transmitted one is simply freed.
+ * transmitted one is freed, unless it carries a packet the firmware gave
+ * back to the host.
  *
  * One descriptor, so one segment: a frame arriving in pieces is linearised
  * rather than described piecewise, because nothing here yet has a reason to
  * chain them and a chain the firmware reads wrongly is a fault rather than a
  * dropped frame.
+ *
+ * A frame handed to a host-side node with the virtual flag is routed by the
+ * firmware as if it had arrived on that node's device, and one it does not
+ * route comes back to the host in the same buffer. So the buffer is mapped
+ * both ways: what the host reads back is what the firmware left there.
  */
-int nss_data_send(struct nss_core *core, struct sk_buff *skb, u32 if_num)
+int nss_data_send(struct nss_core *core, struct sk_buff *skb, u32 if_num,
+		  u16 flags)
 {
 	struct nss_h2n_ring *ring = &core->h2n[NSS_H2N_RING_DATA];
 	struct nss_if_mem_map *map = core->if_map;
+	bool bidir = flags & NSS_H2N_FLAG_VIRTUAL_BUFFER;
+	enum dma_data_direction dir = bidir ? DMA_BIDIRECTIONAL : DMA_TO_DEVICE;
 	struct h2n_descriptor *desc;
 	dma_addr_t dma;
 	u32 next, shift;
@@ -245,7 +259,7 @@ int nss_data_send(struct nss_core *core, struct sk_buff *skb, u32 if_num)
 	}
 
 	dma = dma_map_single(core->dev, skb->head,
-			     skb_end_pointer(skb) - skb->head, DMA_TO_DEVICE);
+			     skb_end_pointer(skb) - skb->head, dir);
 	if (dma_mapping_error(core->dev, dma))
 		return -ENOMEM;
 
@@ -253,18 +267,18 @@ int nss_data_send(struct nss_core *core, struct sk_buff *skb, u32 if_num)
 	slot = nss_lent_take(core, skb);
 	if (slot < 0) {
 		dma_unmap_single(core->dev, dma, skb_end_pointer(skb) - skb->head,
-				 DMA_TO_DEVICE);
+				 dir);
 		return -ENOBUFS;
 	}
 	NSS_SKB_CB(skb)->slot = slot;
+	NSS_SKB_CB(skb)->bidir = bidir;
 
 	scoped_guard(spinlock_bh, &ring->lock) {
 		next = (ring->hlos_index + 1) & (NSS_RING_ENTRIES - 1);
 		if (next == READ_ONCE(map->h2n_nss_index[NSS_H2N_RING_DATA])) {
 			nss_lent_put(core, slot);
 			dma_unmap_single(core->dev, dma,
-					 skb_end_pointer(skb) - skb->head,
-					 DMA_TO_DEVICE);
+					 skb_end_pointer(skb) - skb->head, dir);
 			return -EBUSY;
 		}
 
@@ -286,8 +300,9 @@ int nss_data_send(struct nss_core *core, struct sk_buff *skb, u32 if_num)
 		desc->qos_tag = 0;
 		desc->buffer_type = NSS_H2N_BUFFER_PACKET;
 		desc->bit_flags = NSS_H2N_FLAG_FIRST_SEGMENT |
-				  NSS_H2N_FLAG_LAST_SEGMENT |
-				  (nss_tx_reusable ? NSS_H2N_FLAG_BUFFER_REUSABLE : 0);
+				  NSS_H2N_FLAG_LAST_SEGMENT | flags |
+				  (nss_tx_reusable && !bidir ?
+				   NSS_H2N_FLAG_BUFFER_REUSABLE : 0);
 		if (skb->ip_summed == CHECKSUM_PARTIAL)
 			desc->bit_flags |= NSS_H2N_FLAG_GEN_IP_CHECKSUM |
 					   NSS_H2N_FLAG_GEN_L4_CHECKSUM;
@@ -525,7 +540,7 @@ static void nss_lent_reclaim(struct nss_core *core)
 		if (NSS_SKB_CB(skb)->tx)
 			dma_unmap_single(core->dev, NSS_SKB_CB(skb)->dma,
 					 skb_end_pointer(skb) - skb->head,
-					 DMA_TO_DEVICE);
+					 nss_tx_dir(skb));
 		else
 			dma_unmap_single(core->dev, NSS_SKB_CB(skb)->dma,
 					 NSS_EMPTY_BUFFER_ALLOC, DMA_FROM_DEVICE);
@@ -750,10 +765,16 @@ static int nss_poll_n2h(struct napi_struct *napi, int budget)
 							     desc->interface_num);
 					goto next;
 				}
+				core->tx_done++;
+				/* A frame sent to a host-side node that the
+				 * firmware did not route comes back in its own
+				 * buffer, as a packet rather than a completion.
+				 */
+				if (nss_rawip_recv(core, desc, skb))
+					goto next;
 				dma_unmap_single(core->dev, NSS_SKB_CB(skb)->dma,
 						 skb_end_pointer(skb) - skb->head,
-						 DMA_TO_DEVICE);
-				core->tx_done++;
+						 nss_tx_dir(skb));
 				dev_kfree_skb_any(skb);
 			} else {
 				/* Before the stack owns the buffer and its cb. */
@@ -762,7 +783,8 @@ static int nss_poll_n2h(struct napi_struct *napi, int budget)
 					goto next;
 				}
 				atomic_dec(&core->buffers_queued);
-				if (nss_mesh_recv(core, napi, desc, skb) ||
+				if (nss_rawip_recv(core, desc, skb) ||
+				    nss_mesh_recv(core, napi, desc, skb) ||
 				    nss_data_recv(core, napi, desc, skb))
 					goto next;
 				dma_unmap_single(core->dev, NSS_SKB_CB(skb)->dma,

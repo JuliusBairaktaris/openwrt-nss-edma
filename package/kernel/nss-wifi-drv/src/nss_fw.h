@@ -125,6 +125,17 @@ struct nss_if_msg {
 #endif
 };
 
+/* The configuration of each node of a generic redirect pair. */
+
+#define NSS_VIRT_IF_TX_CONFIG_MSG	10000
+
+struct nss_virt_if_config_msg {
+	u32 flags;
+	u32 sibling;
+	u32 nexthop;
+	u8 mac_addr[ETH_ALEN];
+};
+
 /* IPv4 and IPv6 connection rules. Addresses and ports are in host order. */
 
 #define NSS_IPV4_TX_CREATE_RULE_MSG		0
