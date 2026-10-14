@@ -57,6 +57,7 @@
 struct nss_flow_dir {
 	u8 mac[ETH_ALEN];	/* address the other direction delivers to */
 	u8 smac[ETH_ALEN];
+	int ifindex;		/* the device this direction arrives on */
 	int ifnum;
 	u32 mtu;
 	u16 cvid;		/* the ingress port's VLAN on its conduit, or 0 */
@@ -389,6 +390,7 @@ static int nss_flow_take_dir(struct nss_core *core, struct nss_flow_entry *e,
 	}
 
 	flow_rule_match_meta(rule, &meta);
+	d->ifindex = meta.key->ingress_ifindex;
 	d->ifnum = nss_flow_port(core, meta.key->ingress_ifindex, kvid, &d->mtu,
 				 &d->cvid);
 	if (d->ifnum < 0) {
@@ -1379,6 +1381,8 @@ static int nss_flow_block_cb(enum tc_setup_type type, void *type_data,
  * the driver of the radio asks for this, and nothing in the subsystem has to
  * change to let it.
  */
+static void nss_flow_unbind_dev(const struct net_device *dev);
+
 int nss_flow_setup_block(struct net_device *dev, struct flow_block_offload *f)
 {
 	struct flow_block_cb *block_cb;
@@ -1414,6 +1418,7 @@ int nss_flow_setup_block(struct net_device *dev, struct flow_block_offload *f)
 			return -ENOENT;
 
 		if (!flow_block_cb_decref(block_cb)) {
+			nss_flow_unbind_dev(dev);
 			flow_block_cb_remove(block_cb, f);
 			list_del(&block_cb->driver_list);
 		}
@@ -1562,6 +1567,67 @@ void nss_flow_print(struct seq_file *s)
 	}
 	rhashtable_walk_stop(&iter);
 	rhashtable_walk_exit(&iter);
+}
+
+static bool nss_flow_through(const struct nss_flow_entry *e, int ifindex)
+{
+	return !e->bridged && (e->dir[0].ifindex == ifindex ||
+			       e->dir[1].ifindex == ifindex);
+}
+
+/* Forget, and withdraw from @core if it runs, every entry @match takes. Under
+ * the flow table's lock.
+ */
+static void nss_flow_forget_all(struct nss_core *core,
+				bool (*match)(const struct nss_flow_entry *, int),
+				int arg)
+{
+	struct rhashtable_iter iter;
+	struct nss_flow_entry *e;
+	bool again = true;
+
+	lockdep_assert_held(&nss_flow_lock);
+
+	/* A withdrawal waits for the firmware, which the walk may not. */
+	while (again) {
+		again = false;
+		rhashtable_walk_enter(&nss_flow_table, &iter);
+		rhashtable_walk_start(&iter);
+		while ((e = rhashtable_walk_next(&iter)) != NULL) {
+			if (IS_ERR(e))
+				continue;
+			if (match(e, arg)) {
+				again = true;
+				break;
+			}
+		}
+		rhashtable_walk_stop(&iter);
+		rhashtable_walk_exit(&iter);
+		if (!again)
+			break;
+		if (core && core->running) {
+			nss_flow_forget(core, e);
+		} else {
+			/* Nothing to withdraw from; the halt flushes the
+			 * rest of what the entry holds.
+			 */
+			rhashtable_remove_fast(&nss_flow_table, &e->node,
+					       nss_flow_ht_params);
+			kfree_rcu(e, rcu);
+		}
+	}
+}
+
+/* The flow table lets go of @dev's block. It does so before it destroys the
+ * connections it offloaded, and the destroys then reach no block, so every
+ * rule through @dev is withdrawn here; the connections come back as new
+ * offers to whichever table binds next.
+ */
+static void nss_flow_unbind_dev(const struct net_device *dev)
+{
+	guard(mutex)(&nss_flow_lock);
+
+	nss_flow_forget_all(nss_flow_core, nss_flow_through, dev->ifindex);
 }
 
 /* Halting a core takes every rule it held with it, so the entries only
