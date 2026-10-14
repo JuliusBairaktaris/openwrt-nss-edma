@@ -56,6 +56,18 @@ define KernelPackage/nss-wifi-drv/install
 	$(INSTALL_DIR) $(1)/etc/config $(1)/etc/init.d
 	$(INSTALL_CONF) ./files/nss-wifi.config $(1)/etc/config/nss-wifi
 	$(INSTALL_BIN) ./files/nss-wifi.init $(1)/etc/init.d/nss-wifi
+	$(INSTALL_DIR) $(1)/etc/uci-defaults $(1)/usr/share/nss-wifi
+	$(INSTALL_BIN) ./files/nss-wifi.uci-defaults $(1)/etc/uci-defaults/90-nss-wifi-flowtable
+	$(INSTALL_BIN) ./files/nss-wifi.flowtable $(1)/usr/share/nss-wifi/flowtable.sh
+endef
+
+# The firewall include the uci-defaults script adds goes with the package,
+# or every reload would warn about a missing script.
+define Package/kmod-nss-wifi-drv/prerm
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] && exit 0
+uci -q delete firewall.nss_wifi_flowtable && uci -q commit firewall
+exit 0
 endef
 
 $(eval $(call KernelPackage,nss-wifi-drv))
