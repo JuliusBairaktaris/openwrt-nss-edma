@@ -57,6 +57,7 @@
 struct nss_flow_dir {
 	u8 mac[ETH_ALEN];	/* address the other direction delivers to */
 	u8 smac[ETH_ALEN];
+	int ifindex;		/* the device this direction arrives on */
 	int ifnum;
 	u32 mtu;
 	u16 cvid;		/* the ingress port's VLAN on its conduit, or 0 */
@@ -389,6 +390,7 @@ static int nss_flow_take_dir(struct nss_core *core, struct nss_flow_entry *e,
 	}
 
 	flow_rule_match_meta(rule, &meta);
+	d->ifindex = meta.key->ingress_ifindex;
 	d->ifnum = nss_flow_port(core, meta.key->ingress_ifindex, kvid, &d->mtu,
 				 &d->cvid);
 	if (d->ifnum < 0) {
@@ -1372,6 +1374,39 @@ static int nss_flow_block_cb(enum tc_setup_type type, void *type_data,
 	}
 }
 
+/* Withdraw every routed rule through @dev. The flow table lets go of a
+ * device's block before it destroys the connections it offloaded, so those
+ * destroys reach no block; the live connections are offered again. A halted
+ * core holds no rules, and its halt flushes the table.
+ */
+static void nss_flow_withdraw_dev(const struct net_device *dev)
+{
+	struct rhashtable_iter iter;
+	struct nss_flow_entry *e;
+
+	guard(mutex)(&nss_flow_lock);
+
+	if (!nss_flow_core || !nss_flow_core->running)
+		return;
+
+	/* The withdrawal sleeps and a walk resumed after a removal may skip
+	 * entries, so each one starts the walk again.
+	 */
+	do {
+		rhashtable_walk_enter(&nss_flow_table, &iter);
+		rhashtable_walk_start(&iter);
+		while ((e = rhashtable_walk_next(&iter)) != NULL)
+			if (!IS_ERR(e) && !e->bridged &&
+			    (e->dir[0].ifindex == dev->ifindex ||
+			     e->dir[1].ifindex == dev->ifindex))
+				break;
+		rhashtable_walk_stop(&iter);
+		rhashtable_walk_exit(&iter);
+		if (e)
+			nss_flow_forget(nss_flow_core, e);
+	} while (e);
+}
+
 /* Take the flow table's block on a wireless device.
  *
  * The kernel offers the block through the device's own traffic-control entry
@@ -1414,6 +1449,7 @@ int nss_flow_setup_block(struct net_device *dev, struct flow_block_offload *f)
 			return -ENOENT;
 
 		if (!flow_block_cb_decref(block_cb)) {
+			nss_flow_withdraw_dev(dev);
 			flow_block_cb_remove(block_cb, f);
 			list_del(&block_cb->driver_list);
 		}
