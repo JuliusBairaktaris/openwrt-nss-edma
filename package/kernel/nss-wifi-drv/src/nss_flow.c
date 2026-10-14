@@ -25,6 +25,7 @@
 #include <linux/cleanup.h>
 #include <linux/dsa/8021q.h>
 #include <linux/etherdevice.h>
+#include <linux/if_arp.h>
 #include <linux/if_bridge.h>
 #include <linux/if_vlan.h>
 #include <linux/mutex.h>
@@ -140,7 +141,7 @@ static struct nss_core *nss_flow_core;
  * for the first, so each is counted where it is decided.
  */
 enum nss_flow_reject {
-	NSS_FLOW_REJECT_NOT_WIRELESS,
+	NSS_FLOW_REJECT_NOT_OURS,
 	NSS_FLOW_REJECT_KEY,
 	NSS_FLOW_REJECT_INTERFACE,
 	NSS_FLOW_REJECT_ACTION,
@@ -151,7 +152,7 @@ enum nss_flow_reject {
 };
 
 static const char *const nss_flow_reject_name[] = {
-	"not-wireless", "key", "interface", "action", "no-mac", "no-ct",
+	"not-ours", "key", "interface", "action", "no-mac", "no-ct",
 	"firmware",
 };
 
@@ -360,6 +361,14 @@ static bool nss_flow_is_wireless(int ifindex)
 	return dev && dev->ieee80211_ptr;
 }
 
+/* A connection this firmware may carry has a station or a modem at one end;
+ * between two switch ports the switch carries it.
+ */
+static bool nss_flow_is_ours(int ifindex)
+{
+	return nss_flow_is_wireless(ifindex) || nss_rawip_bound(ifindex);
+}
+
 /* Everything the firmware is told about one direction, out of that
  * direction's own offer.
  */
@@ -371,6 +380,7 @@ static int nss_flow_take_dir(struct nss_core *core, struct nss_flow_entry *e,
 	struct nss_flow_dir *d = &e->dir[dir];
 	struct flow_match_meta meta;
 	struct flow_action_entry *act;
+	struct net_device *out = NULL;
 	struct ethhdr eth = {};
 	u16 kvid = 0;
 	int i;
@@ -433,8 +443,10 @@ static int nss_flow_take_dir(struct nss_core *core, struct nss_flow_entry *e,
 			d->sid = act->pppoe.sid;
 			d->pppoe = true;
 			break;
-		case FLOW_ACTION_VLAN_POP:
 		case FLOW_ACTION_REDIRECT:
+			out = act->dev;
+			break;
+		case FLOW_ACTION_VLAN_POP:
 		case FLOW_ACTION_CSUM:
 			break;
 		default:
@@ -449,6 +461,18 @@ static int nss_flow_take_dir(struct nss_core *core, struct nss_flow_entry *e,
 			return nss_flow_reject_at(NSS_FLOW_REJECT_ACTION,
 						  -EOPNOTSUPP, f, act->id);
 		}
+	}
+
+	/* A modem's device has no header to build, so its neighbours carry
+	 * no address. The frame the firmware builds for it is taken off
+	 * before the modem sees the packet; the device's own address is as
+	 * good as any.
+	 */
+	if (!is_valid_ether_addr(eth.h_dest) && out &&
+	    nss_rawip_bound(out->ifindex)) {
+		ether_addr_copy(eth.h_dest, out->dev_addr);
+		if (!is_valid_ether_addr(eth.h_source))
+			ether_addr_copy(eth.h_source, out->dev_addr);
 	}
 
 	if (!is_valid_ether_addr(eth.h_dest))
@@ -1000,21 +1024,22 @@ static int nss_flow_replace(struct nss_core *core, struct flow_cls_offload *f)
 
 	e = rhashtable_lookup_fast(&nss_flow_table, &key, nss_flow_ht_params);
 	if (!e) {
-		/* Only a connection a station is one end of belongs here. The
-		 * switch carries everything else, and a flow claimed by both
-		 * would be forwarded twice. Either direction may be the
-		 * wireless one, and the offer in hand names only its own
-		 * ingress, so the other direction's is read off the flow.
+		/* Only a connection a station or a modem is one end of
+		 * belongs here. The switch carries everything else, and a
+		 * flow claimed by both would be forwarded twice. Either
+		 * direction may be that end, and the offer in hand names only
+		 * its own ingress, so the other direction's is read off the
+		 * flow.
 		 */
 		flow_rule_match_meta(rule, &meta);
-		if (!nss_flow_is_wireless(meta.key->ingress_ifindex) &&
-		    !nss_flow_is_wireless(flow->tuplehash[!dir].tuple.iifidx)) {
+		if (!nss_flow_is_ours(meta.key->ingress_ifindex) &&
+		    !nss_flow_is_ours(flow->tuplehash[!dir].tuple.iifidx)) {
 			nss_flow_last_ifindex = meta.key->ingress_ifindex;
 			dev_dbg_ratelimited(core->dev,
-					    "flow not wireless: ingress %d, other %d\n",
+					    "flow not ours: ingress %d, other %d\n",
 					    meta.key->ingress_ifindex,
 					    flow->tuplehash[!dir].tuple.iifidx);
-			return nss_flow_reject_at(NSS_FLOW_REJECT_NOT_WIRELESS,
+			return nss_flow_reject_at(NSS_FLOW_REJECT_NOT_OURS,
 						  -EOPNOTSUPP, f,
 						  meta.key->ingress_ifindex);
 		}
@@ -1429,6 +1454,73 @@ int nss_flow_setup_block(struct net_device *dev, struct flow_block_offload *f)
 }
 EXPORT_SYMBOL_GPL(nss_flow_setup_block);
 
+/* Nothing to give back: the block's private data is the device, which the
+ * flow table holds. The function only names the blocks bound here.
+ */
+static void nss_flow_indr_release(void *cb_priv)
+{
+}
+
+/* Take the flow table's block on a modem's raw-IP device.
+ *
+ * Such a device has no traffic-control entry point, so the kernel offers its
+ * block to whoever registered for devices that have none. Every raw-IP device
+ * is taken, paired or not: a core restart unpairs a device for a while, and
+ * the table binds only when the firewall is loaded. Whether the firmware can
+ * reach the device is decided per connection.
+ */
+static int nss_flow_indr_cb(struct net_device *dev, struct Qdisc *sch,
+			    void *cb_priv, enum tc_setup_type type,
+			    void *type_data, void *data,
+			    void (*cleanup)(struct flow_block_cb *block_cb))
+{
+	struct flow_block_offload *f = type_data;
+	struct flow_block_cb *block_cb;
+
+	if (!dev || type != TC_SETUP_FT || dev->type != ARPHRD_RAWIP ||
+	    f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
+		return -EOPNOTSUPP;
+
+	f->driver_block_list = &nss_flow_blocks;
+
+	switch (f->command) {
+	case FLOW_BLOCK_BIND:
+		block_cb = flow_block_cb_lookup(f->block, nss_flow_block_cb,
+						dev);
+		if (block_cb) {
+			flow_block_cb_incref(block_cb);
+			return 0;
+		}
+
+		block_cb = flow_indr_block_cb_alloc(nss_flow_block_cb, dev, dev,
+						    nss_flow_indr_release, f,
+						    dev, sch, data, cb_priv,
+						    cleanup);
+		if (IS_ERR(block_cb))
+			return PTR_ERR(block_cb);
+
+		flow_block_cb_incref(block_cb);
+		flow_block_cb_add(block_cb, f);
+		list_add_tail(&block_cb->driver_list, &nss_flow_blocks);
+		nss_flow_bound++;
+		return 0;
+	case FLOW_BLOCK_UNBIND:
+		block_cb = flow_block_cb_lookup(f->block, nss_flow_block_cb,
+						dev);
+		if (!block_cb)
+			return -ENOENT;
+
+		if (!flow_block_cb_decref(block_cb)) {
+			nss_flow_unbind_dev(dev);
+			flow_indr_block_cb_remove(block_cb, f);
+			list_del(&block_cb->driver_list);
+		}
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
 /* A bridged connection, keyed by its conntrack entry: nothing in it is
  * translated and the frames keep their addresses.
  */
@@ -1569,6 +1661,11 @@ void nss_flow_print(struct seq_file *s)
 	rhashtable_walk_exit(&iter);
 }
 
+static bool nss_flow_toward(const struct nss_flow_entry *e, int ifnum)
+{
+	return e->dir[0].ifnum == ifnum || e->dir[1].ifnum == ifnum;
+}
+
 static bool nss_flow_through(const struct nss_flow_entry *e, int ifindex)
 {
 	return !e->bridged && (e->dir[0].ifindex == ifindex ||
@@ -1618,6 +1715,18 @@ static void nss_flow_forget_all(struct nss_core *core,
 	}
 }
 
+/* Withdraw every rule that sends towards @ifnum, a node about to be given
+ * back. The flow table still thinks them offloaded; its destroy finds
+ * nothing and the packets meanwhile take the host's path. Under the core's
+ * lock, which comes before this one as on the halt.
+ */
+void nss_flow_withdraw_ifnum(struct nss_core *core, int ifnum)
+{
+	guard(mutex)(&nss_flow_lock);
+
+	nss_flow_forget_all(core, nss_flow_toward, ifnum);
+}
+
 /* The flow table lets go of @dev's block. It does so before it destroys the
  * connections it offloaded, and the destroys then reach no block, so every
  * rule through @dev is withdrawn here; the connections come back as new
@@ -1663,6 +1772,12 @@ int nss_flow_init(void)
 	if (ret)
 		return ret;
 
+	ret = flow_indr_dev_register(nss_flow_indr_cb, &nss_flow_blocks);
+	if (ret) {
+		rhashtable_destroy(&nss_flow_table);
+		return ret;
+	}
+
 	nss_flow_ready = true;
 
 	return 0;
@@ -1678,6 +1793,8 @@ void nss_flow_exit(void)
 	if (!nss_flow_ready)
 		return;
 
+	flow_indr_dev_unregister(nss_flow_indr_cb, &nss_flow_blocks,
+				 nss_flow_indr_release);
 	rhashtable_free_and_destroy(&nss_flow_table, nss_flow_free, NULL);
 	nss_flow_ready = false;
 }

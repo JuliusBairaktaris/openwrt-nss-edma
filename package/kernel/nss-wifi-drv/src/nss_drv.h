@@ -50,6 +50,10 @@
 #define NSS_N2H_BUFFER_EMPTY	1
 #define NSS_N2H_BUFFER_PACKET	3
 #define NSS_N2H_BUFFER_STATUS	6
+/* A frame the firmware transmits through a host-side node, for the host to
+ * send on that node's device.
+ */
+#define NSS_N2H_BUFFER_PACKET_VIRTUAL	10
 #define NSS_N2H_BUFFER_PACKET_EXT	13
 
 /* The hardware fills the named checksum on the way out; without these a
@@ -60,6 +64,10 @@
 #define NSS_H2N_FLAG_GEN_L4_CHECKSUM	0x0002
 #define NSS_H2N_FLAG_FIRST_SEGMENT	0x0004
 #define NSS_H2N_FLAG_LAST_SEGMENT	0x0008
+/* A frame handed to a host-side node, to be routed as if it had arrived on
+ * that node's device.
+ */
+#define NSS_H2N_FLAG_VIRTUAL_BUFFER	0x2000
 /* The buffer may be kept rather than handed straight back. */
 #define NSS_H2N_FLAG_BUFFER_REUSABLE	0x8000
 
@@ -248,6 +256,7 @@ static_assert(offsetof(struct nss_cmn_msg, cb) == 24);
 struct nss_skb_cb {
 	dma_addr_t dma;
 	bool tx;	/* a frame handed down, not a buffer handed over */
+	bool bidir;	/* mapped both ways: the firmware may hand it back filled */
 	u32 slot;	/* where the lent-buffer table holds this one */
 };
 
@@ -451,6 +460,8 @@ void nss_iface_unbind(struct nss_core *core);
 void nss_rings_stop(struct nss_core *core);
 void nss_rings_quiesce(struct nss_core *core);
 int nss_data_send(struct nss_core *core, struct sk_buff *skb, u32 if_num);
+int nss_data_send_flags(struct nss_core *core, struct sk_buff *skb, u32 if_num,
+			u16 flags);
 void nss_doorbell(struct nss_core *core, u32 intr);
 int nss_msg_init(struct nss_core *core);
 int nss_msg_send(struct nss_core *core, void *msg, size_t len);
@@ -554,10 +565,20 @@ void nss_bridge_start(struct nss_core *core);
 void nss_bridge_stop(void);
 void nss_bridge_print(struct seq_file *s);
 void nss_flow_flush(void);
+void nss_flow_withdraw_ifnum(struct nss_core *core, int ifnum);
 void nss_flow_notify(const struct nss_cmn_msg *ncm, u32 len);
 void nss_flow_print(struct seq_file *s);
 int nss_flow_init(void);
 void nss_flow_exit(void);
+bool nss_rawip_bound(int ifindex);
+bool nss_rawip_recv(struct nss_core *core, const struct n2h_descriptor *desc,
+		    struct sk_buff *skb);
+void nss_rawip_arm(struct nss_core *core);
+void nss_rawip_halt(struct nss_core *core);
+void nss_rawip_detach(struct nss_core *core);
+void nss_rawip_print(struct seq_file *s);
+int nss_rawip_init(void);
+void nss_rawip_exit(void);
 void nss_mc_bind(struct nss_core *core);
 void nss_mc_flush(void);
 void nss_mc_print(struct seq_file *s);
