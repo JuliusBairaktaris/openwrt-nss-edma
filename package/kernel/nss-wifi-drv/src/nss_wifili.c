@@ -331,14 +331,21 @@ void nss_wifili_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
 	/* The firmware counts its own receive path, and those counters are the
 	 * only place that separates a radio whose buffers were never filled
 	 * from one that fills and drops. They arrive unasked once statistics
-	 * are on, so the newest is kept whole and read out on demand.
+	 * are on, so the newest is kept and read out on demand.
 	 */
 	if (ncm->type == NSS_WIFILI_STATS_MSG &&
 	    len >= offsetof(struct nss_wifili_msg, msg) +
-		   sizeof(struct nss_wifili_stats_sync_msg)) {
+		   sizeof(struct nss_wifili_stats_sync_msg) -
+		   core->fw->soc_stats_skip) {
+		const size_t head = offsetof(struct nss_wifili_device_stats,
+					     rxreo_stats);
+
 		m = container_of_const(ncm, struct nss_wifili_msg, cm);
 		spin_lock_bh(&nss_wifili_stats_lock);
-		nss_wifili_stats = m->msg.wlsoc_stats.stats;
+		memcpy((u8 *)&nss_wifili_stats + head,
+		       (const u8 *)&m->msg.wlsoc_stats.stats + head -
+		       core->fw->soc_stats_skip,
+		       sizeof(nss_wifili_stats) - head);
 		nss_wifili_stats_seen++;
 		spin_unlock_bh(&nss_wifili_stats_lock);
 		return;
@@ -664,17 +671,18 @@ static struct {
  * the same breath, and it does so several times a second, so the newest
  * message on its own says only what happened since the last one and is almost
  * always zero. They are summed here to get a total. Every field is a 32-bit
- * count, so the sum is elementwise over the message.
+ * count, so the sum is elementwise over the message, skipping the word a
+ * line lacks.
  */
 void nss_wifili_vdev_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
 			    u32 len)
 {
+	const struct nss_fw_line *fw = core->fw;
 	const struct nss_wifi_vdev_msg *m;
 	int i;
 
 	if (ncm->type != NSS_WIFI_VDEV_STATS_MSG ||
-	    len < offsetof(struct nss_wifi_vdev_msg, msg) +
-		  sizeof(struct nss_wifi_vdev_stats_sync_msg))
+	    len < offsetof(struct nss_wifi_vdev_msg, msg) + fw->vdev_stats_len)
 		return;
 
 	m = container_of_const(ncm, struct nss_wifi_vdev_msg, cm);
@@ -690,8 +698,8 @@ void nss_wifili_vdev_notify(struct nss_core *core, const struct nss_cmn_msg *ncm
 		int w;
 
 		nss_wifili_vdev_stats[i].if_num = ncm->interface;
-		for (w = 0; w < sizeof(m->msg.vdev_stats) / sizeof(u32); w++)
-			acc[w] += in[w];
+		for (w = 0; w < fw->vdev_stats_len / sizeof(u32); w++)
+			acc[w + (w >= fw->vdev_stats_hole)] += in[w];
 		nss_wifili_vdev_stats[i].seen++;
 		return;
 	}
@@ -940,7 +948,6 @@ int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
 }
 EXPORT_SYMBOL_GPL(nss_wifi_vdev_register);
 
-#ifdef NSS_FIRMWARE_VERSION_11_4
 /* A mesh interface's virtual device. It carries 802.11 both ways, and what
  * it receives goes on to the mesh decapsulation node rather than to the host,
  * so the network device is bound to the mesh nodes, not to it.
@@ -1030,14 +1037,6 @@ int nss_wifi_mesh_register(struct net_device *dev, u8 radio, u32 vdev_id,
 
 	return if_num;
 }
-#else
-int nss_wifi_mesh_register(struct net_device *dev, u8 radio, u32 vdev_id,
-			   const u8 *mac, u8 mode,
-			   const struct nss_wifi_mesh_ops *ops, void *priv)
-{
-	return -EOPNOTSUPP;
-}
-#endif
 EXPORT_SYMBOL_GPL(nss_wifi_mesh_register);
 
 static void nss_wifili_peer_flush(struct nss_core *core, u32 vdev_id);
@@ -1246,7 +1245,7 @@ static int nss_wifili_soc_msg(struct nss_core *core, u32 type,
 static int nss_wifili_peer_msg(struct nss_core *core, u32 type,
 			       const struct nss_wifili_peer_msg *pm)
 {
-	return nss_wifili_soc_msg(core, type, pm, sizeof(*pm));
+	return nss_wifili_soc_msg(core, type, pm, core->fw->peer_msg_len);
 }
 
 static void nss_wifili_peer_release(struct nss_core *core, int i);
@@ -1300,12 +1299,10 @@ int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
 	pm.tx_ast_hash = tx_ast_hash;
 	pm.nss_peer_mem = dma;
 
-#ifndef NSS_FIRMWARE_VERSION_11_4
 	/* The working stack sends a size of 0. With a size declared, most
 	 * frames queued to the peer are dropped.
 	 */
 	pm.peer_memory_size = 0;
-#endif
 
 	ret = nss_wifili_peer_msg(core, NSS_WIFILI_PEER_CREATE_MSG, &pm);
 	if (ret) {
@@ -2395,7 +2392,7 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 		   m->cm.response, m->cm.error);
 	if (!ret) {
 		core->wifili_started = true;
-		core->mesh_capable = nss_mesh_probe(core);
+		core->mesh_capable = core->fw->mesh && nss_mesh_probe(core);
 		core->wifi_on = true;
 
 		ret = nss_wifili_vdev_next_hop(core);

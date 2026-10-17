@@ -24,8 +24,6 @@
 #include "nss_drv.h"
 #include <linux/soc/qcom/nss_wifi.h>
 
-#ifdef NSS_FIRMWARE_VERSION_11_4
-
 #define NSS_MESH_MAX		4
 #define NSS_MESH_TTL		31
 #define NSS_MESH_REFRESH_MS	1000
@@ -866,17 +864,3 @@ void nss_mesh_exit(void)
 	cancel_delayed_work_sync(&nss_mesh_age);
 	cancel_work_sync(&nss_mesh_work);
 }
-#else
-int nss_wifi_mesh_path(int if_num, enum nss_wifi_mesh_cmd cmd,
-		       const struct nss_wifi_mesh_path *p)
-{
-	return -EOPNOTSUPP;
-}
-EXPORT_SYMBOL_GPL(nss_wifi_mesh_path);
-
-int nss_wifi_mesh_config(int if_num, u8 ttl, u32 refresh_ms, bool forward)
-{
-	return -EOPNOTSUPP;
-}
-EXPORT_SYMBOL_GPL(nss_wifi_mesh_config);
-#endif

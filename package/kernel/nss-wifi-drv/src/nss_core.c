@@ -17,6 +17,7 @@
 
 #include <linux/cleanup.h>
 #include <linux/clk.h>
+#include <linux/ctype.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/firmware.h>
@@ -218,6 +219,60 @@ static void nss_clocks_disable(struct nss_core *core)
 	core->clocks_on = false;
 }
 
+static const struct nss_fw_line nss_fw_lines[] = {
+	{
+		.name = "12.5",
+		.peer_msg_len = sizeof(struct nss_wifili_peer_msg),
+		.vdev_stats_len = sizeof(struct nss_wifi_vdev_stats_sync_msg),
+		.vdev_stats_hole = sizeof(struct nss_wifi_vdev_stats_sync_msg) /
+				   sizeof(u32),
+	},
+	{
+		.name = "11.4",
+		.peer_msg_len = offsetof(struct nss_wifili_peer_msg,
+					 peer_memory_size),
+		.soc_stats_skip = 8 * sizeof(u32),
+		.vdev_stats_len = offsetof(struct nss_wifi_vdev_stats_sync_msg,
+					   addr4_exc_fail) - sizeof(u32),
+		.vdev_stats_hole = offsetof(struct nss_wifi_vdev_stats_sync_msg,
+					    wvmes.mcast_mbr_alloc_failed) /
+				   sizeof(u32),
+		.mesh = true,
+	},
+};
+
+static char nss_fw_name[16] = "12.5";
+module_param_string(firmware, nss_fw_name, sizeof(nss_fw_name), 0644);
+MODULE_PARM_DESC(firmware, "load qca-nss<core>-retail-<firmware>.bin");
+
+/* The line is read from the version string the image carries, such as
+ * "Version: NSS.FW.12.5-210-HK.R" or "Version: NSS.HK.11.4.0.5-6-R", so a
+ * file named for one line but holding another still gets its own layouts.
+ */
+static const struct nss_fw_line *nss_fw_line_find(const struct firmware *fw)
+{
+	static const char tag[] = "Version: NSS.";
+	const char *data = (const char *)fw->data;
+	const char *v = strnstr(data, tag, fw->size);
+	size_t off;
+	int i;
+
+	if (!v)
+		return NULL;
+
+	off = v - data + sizeof(tag) - 1 + 3;	/* "FW.", "HK." or "CP." */
+	for (i = 0; i < ARRAY_SIZE(nss_fw_lines); i++) {
+		size_t n = strlen(nss_fw_lines[i].name);
+
+		if (off + n < fw->size &&
+		    !memcmp(data + off, nss_fw_lines[i].name, n) &&
+		    !isdigit(data[off + n]))
+			return &nss_fw_lines[i];
+	}
+
+	return NULL;
+}
+
 /* The firmware is linked to run from a fixed address, so it is copied to that
  * address rather than anywhere within the region. The region the device tree
  * reserved is what bounds the copy: an image larger than the space between
@@ -229,14 +284,23 @@ static int nss_firmware_load(struct nss_core *core)
 			       core->load_addr;
 	const struct firmware *fw;
 	void __iomem *dst;
-	char name[32];
+	char name[48];
 	int ret;
 
-	snprintf(name, sizeof(name), "qca-nss%u-retail.bin", core->id);
+	snprintf(name, sizeof(name), "qca-nss%u-retail-%s.bin", core->id,
+		 nss_fw_name);
 
 	ret = request_firmware(&fw, name, core->dev);
 	if (ret)
 		return dev_err_probe(core->dev, ret, "no %s\n", name);
+
+	core->fw = nss_fw_line_find(fw);
+	if (!core->fw) {
+		dev_err(core->dev, "%s is not a firmware line this driver speaks\n",
+			name);
+		ret = -ENOEXEC;
+		goto out;
+	}
 
 	if (fw->size > room) {
 		dev_err(core->dev, "%s is %zu bytes, %pa of room\n", name,
@@ -254,8 +318,8 @@ static int nss_firmware_load(struct nss_core *core)
 	memcpy_toio(dst, fw->data, fw->size);
 	iounmap(dst);
 
-	dev_info(core->dev, "loaded %s, %zu bytes at %pa\n", name, fw->size,
-		 &core->load_addr);
+	dev_info(core->dev, "loaded %s, line %s, %zu bytes at %pa\n", name,
+		 core->fw->name, fw->size, &core->load_addr);
 out:
 	release_firmware(fw);
 

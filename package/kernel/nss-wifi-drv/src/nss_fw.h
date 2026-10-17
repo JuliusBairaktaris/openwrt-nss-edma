@@ -4,7 +4,8 @@
  * Every layout here is fixed by the firmware. Space the driver never reads or
  * writes is kept as reserved bytes, and a message union carries only the
  * messages the driver uses, sized so that the whole message keeps the size
- * the firmware's own union gives it.
+ * the firmware's own union gives it. The layouts are those of 12.5; struct
+ * nss_fw_line holds where 11.4 differs.
  */
 
 #ifndef __NSS_FW_H
@@ -118,11 +119,7 @@ struct nss_if_vsi_assign {
 
 struct nss_if_msg {
 	struct nss_cmn_msg cm;
-#ifdef NSS_FIRMWARE_VERSION_11_4
-	u8 msg[120];
-#else
 	u8 msg[56];
-#endif
 };
 
 /* The configuration of each node of a generic redirect pair. */
@@ -604,9 +601,7 @@ struct nss_wifili_peer_msg {
 	u32 tx_ast_hash;
 	u32 pext_stats_mem;
 	u32 flags;
-#ifndef NSS_FIRMWARE_VERSION_11_4
-	u32 peer_memory_size;
-#endif
+	u32 peer_memory_size;	/* not on 11.4 */
 };
 
 struct nss_wifili_peer_security_type_msg {
@@ -653,13 +648,9 @@ struct nss_wifili_rx_wbm_ring_stats {
 	u32 err_internal_codes[5];
 };
 
-/* The transmit counters that lead the block are shorter on 11.4. */
+/* The transmit counters that lead the block are 32 bytes shorter on 11.4. */
 struct nss_wifili_device_stats {
-#ifdef NSS_FIRMWARE_VERSION_11_4
-	u32 rsvd0[107];
-#else
 	u32 rsvd0[115];
-#endif
 	struct nss_wifili_rx_reo_ring_stats rxreo_stats[NSS_WIFILI_MAX_REO_DATA_RINGS_MSG];
 	struct nss_wifili_rx_sw_pool_stats rx_sw_pool_stats[NSS_WIFILI_MAX_PDEV_NUM_MSG];
 	u32 rsvd1[72];
@@ -756,11 +747,7 @@ struct nss_wifili_msg {
 		struct nss_wifili_radio_cfg_msg radiocfgmsg;
 		struct nss_wifili_soc_linkdesc_buf_info_msg linkdescinfomsg;
 		struct nss_wifili_mesh_capability_info cap_info;
-#ifdef NSS_FIRMWARE_VERSION_11_4
-		u8 rsvd[1668];
-#else
 		u8 rsvd[2052];
-#endif
 	} msg;
 };
 
@@ -887,9 +874,7 @@ struct nss_wifi_vdev_mcast_enhance_stats {
 	u32 mcast_rcvd_bytes;
 	u32 igmp_rcvd;
 	u32 igmp_ucast_converted;
-#ifndef NSS_FIRMWARE_VERSION_11_4
-	u32 mcast_mbr_alloc_failed;
-#endif
+	u32 mcast_mbr_alloc_failed;	/* not on 11.4 */
 };
 
 struct nss_wifi_vdev_stats_sync_msg {
@@ -928,12 +913,11 @@ struct nss_wifi_vdev_stats_sync_msg {
 	u32 rx_decrypt_err;
 	u32 rx_mic_err;
 	u32 mcbc_exc_host_fail_cnt;
-#ifndef NSS_FIRMWARE_VERSION_11_4
+	/* not on 11.4 */
 	u32 addr4_exc_fail;
 	u32 addr4_exc_pass;
 	u32 eapol_over_nl_exc_fail_cnt;
 	u32 eapol_over_nl_exc_pass_cnt;
-#endif
 };
 
 struct nss_wifi_vdev_msg {

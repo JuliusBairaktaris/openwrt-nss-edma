@@ -347,9 +347,20 @@ struct nss_msg_seen {
 
 struct nss_soc;
 
+/* Where a firmware line's messages differ from the layouts in nss_fw.h. */
+struct nss_fw_line {
+	const char *name;
+	u32 peer_msg_len;
+	u32 soc_stats_skip;	/* bytes missing before the receive counters */
+	u32 vdev_stats_len;
+	u32 vdev_stats_hole;	/* first word the line lacks inside the block */
+	bool mesh;
+};
+
 struct nss_core {
 	struct device *dev;
 	const struct nss_soc *soc;
+	const struct nss_fw_line *fw;
 	void __iomem *nphys;
 	void __iomem *qgic;
 	void __iomem *imem;
@@ -494,7 +505,6 @@ int nss_wifili_vdev_cmd(struct nss_core *core, int if_num, u32 cmd, u32 value);
 
 struct nss_wifi_mesh_ops;
 
-#ifdef NSS_FIRMWARE_VERSION_11_4
 bool nss_mesh_probe(struct nss_core *core);
 int nss_mesh_add(struct nss_core *core, struct net_device *dev, int link,
 		 const u8 *mac, const struct nss_wifi_mesh_ops *ops, void *priv);
@@ -509,28 +519,6 @@ bool nss_mesh_recv(struct nss_core *core, struct napi_struct *napi,
 		   const struct n2h_descriptor *desc, struct sk_buff *skb);
 void nss_mesh_print(struct seq_file *s);
 void nss_mesh_exit(void);
-#else
-static inline bool nss_mesh_probe(struct nss_core *core) { return false; }
-static inline void nss_mesh_stop(struct nss_core *core, int link) {}
-static inline void nss_mesh_del(struct nss_core *core, int link) {}
-static inline void nss_mesh_reset(void) {}
-static inline int nss_mesh_ifnum(int ifindex) { return -ENODEV; }
-static inline bool nss_mesh_notify(struct nss_core *core,
-				   const struct nss_cmn_msg *ncm, u32 len)
-{
-	return false;
-}
-
-static inline bool nss_mesh_recv(struct nss_core *core, struct napi_struct *napi,
-				 const struct n2h_descriptor *desc,
-				 struct sk_buff *skb)
-{
-	return false;
-}
-
-static inline void nss_mesh_print(struct seq_file *s) {}
-static inline void nss_mesh_exit(void) {}
-#endif
 int nss_phys_arm(struct nss_core *core, unsigned long mask);
 int nss_phys_msg(struct nss_core *core, int if_num, u32 type,
 		 const void *body, size_t len);

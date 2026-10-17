@@ -5,8 +5,6 @@ PKG_NAME:=nss-wifi-drv
 PKG_RELEASE:=1
 PKG_LICENSE:=GPL-2.0-only
 
-PKG_CONFIG_DEPENDS:=CONFIG_NSS_FIRMWARE_VERSION_11_4
-
 include $(INCLUDE_DIR)/package.mk
 
 define KernelPackage/nss-wifi-drv
@@ -30,7 +28,8 @@ define KernelPackage/nss-wifi-drv/description
 
   The module does not autoload: the nss-wifi service loads it and boots a
   core when nss-wifi.general.offload is 1, the default. The wired ports
-  never depend on it.
+  never depend on it. nss-wifi.general.firmware picks the firmware line,
+  12.5 by default or 11.4 for 802.11s mesh.
 endef
 
 define Build/Prepare
@@ -39,9 +38,7 @@ define Build/Prepare
 endef
 
 define Build/Compile
-	+$(KERNEL_MAKE) M="$(PKG_BUILD_DIR)" \
-		CONFIG_NSS_FIRMWARE_VERSION_11_4=$(CONFIG_NSS_FIRMWARE_VERSION_11_4) \
-		modules
+	+$(KERNEL_MAKE) M="$(PKG_BUILD_DIR)" modules
 endef
 
 # The WLAN driver describes its rings through this, and is built by another
