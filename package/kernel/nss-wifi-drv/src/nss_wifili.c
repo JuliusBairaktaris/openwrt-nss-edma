@@ -620,16 +620,12 @@ static unsigned int nss_wifili_ap_opmode = NSS_WIFI_VDEV_OPMODE_AP;
 module_param_named(ap_opmode, nss_wifili_ap_opmode, uint, 0644);
 MODULE_PARM_DESC(ap_opmode, "operating mode an access point's virtual device is given");
 
-/* One per WLAN interface. Two radios with a handful of access points each is
- * what this hardware is asked for; the limit is here so a leak shows up as a
- * refusal rather than as an interface number nobody owns.
+/* One per WLAN interface, and one per station plus one per access point vdev:
+ * what ath11k allows on IPQ8074 and IPQ6018, 16 vdevs and 512 stations on
+ * each of two radios. A WLAN interface or station beyond these gets no data.
  */
-#define NSS_WIFILI_VDEV_MAX	16
-
-/* Stations. The record the firmware keeps for one is host memory, so this
- * bounds what a leak can cost rather than what the radio can hold.
- */
-#define NSS_WIFILI_PEER_MAX	64
+#define NSS_WIFILI_VDEV_MAX	(2 * 16)
+#define NSS_WIFILI_PEER_MAX	(2 * 512 + NSS_WIFILI_VDEV_MAX)
 
 /* Give a dynamic interface number back to the firmware. */
 static void nss_wifili_vdev_free(struct nss_core *core, int if_num)
