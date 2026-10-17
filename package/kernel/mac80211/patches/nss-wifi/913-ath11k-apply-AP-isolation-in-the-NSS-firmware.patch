@@ -1,0 +1,26 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] ath11k: apply AP isolation in the NSS firmware
+
+The NSS firmware forwards frames between the stations of an access point
+vdev, where mac80211's AP isolation does not reach. Send the vdev the
+client isolation command when AP isolation changes.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
+index ad3bddf..2fcd870 100644
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -3871,6 +3871,11 @@ static void ath11k_mac_op_bss_info_changed(struct ieee80211_hw *hw,
+ 			   vif->addr, arvif->arp_ns_offload.ipv4_addr);
+ 	}
+ 
++	/* The firmware forwards between the stations of a BSS itself. */
++	if (changed & BSS_CHANGED_AP_ISOLATE && arvif->nss_ifnum >= 0 &&
++	    nss_wifi_vdev_ap_isolate(arvif->nss_ifnum, info->ap_isolate))
++		ath11k_warn(ar->ab, "failed to set AP isolation in the NSS firmware\n");
++
+ 	mutex_unlock(&ar->conf_mutex);
+ }
+ 
