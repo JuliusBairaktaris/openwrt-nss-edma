@@ -3272,12 +3272,11 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s,
 		if (!READ_ONCE(soc->used) || soc->gone || soc->started)
 			continue;
 
-		/* A resume restarts what was running before the core halted;
+		/* A resume restarts every instance whose description is complete;
 		 * an explicit start also picks up an instance described later.
+		 * A resume must never start a partially described instance: the
+		 * firmware sizes its pools from the pdev count it was given.
 		 */
-		if (resume && !soc->was_started)
-			continue;
-
 		if (!soc->desc.target_type) {
 			seq_printf(s,
 				   "wifili: soc %u has no target type, not started\n",
@@ -3286,7 +3285,7 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s,
 		}
 
 		if (soc->pdevs_seen != soc->desc.num_pdevs) {
-			if (nss_wifili_start_gate) {
+			if (resume || nss_wifili_start_gate) {
 				seq_printf(s,
 					   "wifili: soc %u waiting for radios %u/%u\n",
 					   soc->desc.if_num, soc->pdevs_seen,
