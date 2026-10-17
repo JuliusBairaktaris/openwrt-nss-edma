@@ -1,0 +1,119 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] ath11k: report what the NSS firmware counts for a station
+
+Offloaded frames never pass mac80211, so a station's inactive time grows
+from association and hostapd disassociates it every ap_max_inactivity
+seconds, busy or not. The NSS firmware pushes per-peer counts. A count of
+acknowledged frames is now reported to mac80211 as an acked transmit
+status, which mac80211 takes as activity, and the counts fill the
+station's packet, byte, retry and failure statistics. Mesh peers get no
+status, because the mesh path metric is built from the rates of reported
+frames and an aggregate count carries none.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -568,6 +568,12 @@ struct ath11k_sta {
+ 	struct rate_info last_txrate;
+ 	/* set only while the NSS firmware takes the data frames */
+ 	struct rate_info rxrate;
++	u64 nss_tx_packets;
++	u64 nss_tx_bytes;
++	u64 nss_tx_retries;
++	u64 nss_tx_failed;
++	u64 nss_rx_packets;
++	u64 nss_rx_bytes;
+ 	u64 rx_duration;
+ 	u64 tx_duration;
+ 	u8 rssi_comb;
+--- a/drivers/net/wireless/ath/ath11k/dp.c
++++ b/drivers/net/wireless/ath/ath11k/dp.c
+@@ -959,6 +959,54 @@ static void ath11k_nss_link_desc_return(
+ 				      HAL_WBM_REL_BM_ACT_PUT_IN_IDLE);
+ }
+ 
++/* Offloaded frames never reach mac80211, so the firmware's counts are the only
++ * record of a station's traffic. mac80211 takes an acknowledged frame as
++ * activity; without one, hostapd drops a busy station as inactive.
++ */
++static void ath11k_nss_peer_stats(void *priv, u16 peer_id,
++				  const struct nss_wifi_peer_stats *st)
++{
++	struct ieee80211_tx_info info = { .flags = IEEE80211_TX_STAT_ACK };
++	struct ieee80211_tx_status status = { .info = &info };
++	struct ath11k_base *ab = priv;
++	struct ath11k_peer *peer;
++	struct ath11k_sta *arsta;
++	struct ath11k *ar;
++	bool mesh;
++
++	info.status.rates[0].idx = -1;
++
++	rcu_read_lock();
++	spin_lock_bh(&ab->base_lock);
++	peer = ath11k_peer_find_by_id(ab, peer_id);
++	if (!peer || !peer->sta) {
++		spin_unlock_bh(&ab->base_lock);
++		rcu_read_unlock();
++		return;
++	}
++
++	arsta = ath11k_sta_to_arsta(peer->sta);
++	arsta->nss_tx_packets += st->tx_packets;
++	arsta->nss_tx_bytes += st->tx_bytes;
++	arsta->nss_tx_retries += st->tx_retries;
++	arsta->nss_tx_failed += st->tx_failed;
++	arsta->nss_rx_packets += st->rx_packets;
++	arsta->nss_rx_bytes += st->rx_bytes;
++
++	status.sta = peer->sta;
++	ar = ab->pdevs[peer->pdev_idx].ar;
++	mesh = arsta->arvif->vif->type == NL80211_IFTYPE_MESH_POINT;
++	spin_unlock_bh(&ab->base_lock);
++
++	/* The mesh path metric is built from the rates of reported frames,
++	 * which an aggregate count does not carry.
++	 */
++	if (st->tx_acked && !mesh)
++		ieee80211_tx_status_ext(ar->hw, &status);
++
++	rcu_read_unlock();
++}
++
+ static void ath11k_nss_wifi_describe(struct ath11k_base *ab)
+ {
+ 	struct ath11k_dp *dp = &ab->dp;
+@@ -995,6 +1043,7 @@ static void ath11k_nss_wifi_describe(str
+ 	soc->reset = ath11k_nss_reset;
+ 	soc->link_desc_return = ath11k_nss_link_desc_return;
+ 	soc->rx_80211 = ath11k_dp_rx_nss_80211;
++	soc->peer_stats = ath11k_nss_peer_stats;
+ 
+ 	for (i = 0; i < soc->num_tcl; i++) {
+ 		ath11k_nss_wifi_ring(&soc->tcl[i], ab,
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -9699,6 +9699,21 @@ static void ath11k_mac_op_sta_statistics
+ 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_BITRATE);
+ 	}
+ 
++	if (ar->ab->nss_offload) {
++		sinfo->tx_packets = arsta->nss_tx_packets;
++		sinfo->tx_bytes = arsta->nss_tx_bytes;
++		sinfo->tx_retries = arsta->nss_tx_retries;
++		sinfo->tx_failed = arsta->nss_tx_failed;
++		sinfo->rx_packets = arsta->nss_rx_packets;
++		sinfo->rx_bytes = arsta->nss_rx_bytes;
++		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_PACKETS) |
++				 BIT_ULL(NL80211_STA_INFO_TX_BYTES64) |
++				 BIT_ULL(NL80211_STA_INFO_TX_RETRIES) |
++				 BIT_ULL(NL80211_STA_INFO_TX_FAILED) |
++				 BIT_ULL(NL80211_STA_INFO_RX_PACKETS) |
++				 BIT_ULL(NL80211_STA_INFO_RX_BYTES64);
++	}
++
+ 	ath11k_mac_put_chain_rssi(sinfo, arsta, "ppdu", false);
+ 
+ 	mutex_lock(&ar->conf_mutex);
