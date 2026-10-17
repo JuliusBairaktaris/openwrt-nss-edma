@@ -1,0 +1,107 @@
+From: Zheng Zhang <everything411@163.com>
+Subject: [PATCH] ath11k: hand the register window to the NSS firmware
+
+The NSS firmware addresses ring registers as physical addresses, but a PCI
+radio's registers live behind a BAR window: the offset this driver keeps is
+not the offset the hardware sees. Record the window's physical base on both
+buses, map a PCI offset through the static window selection, and leave an
+AHB offset alone.
+
+The base is checked before the radio is described. A QCN9074 above 4 GiB
+cannot be named in the firmware's 32-bit register fields, so probe fails
+rather than handing over a truncated address.
+
+Assisted-by: DeepSeek-V4.1-Flash-1017
+Signed-off-by: Zheng Zhang <everything411@163.com>
+---
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -969,6 +969,7 @@
+ 	void __iomem *mem;
+ 	void __iomem *mem_ce;
+ 	unsigned long mem_len;
+-
++	dma_addr_t mem_pa;
++
+ 	struct {
+ 		enum ath11k_bus bus;
+--- a/drivers/net/wireless/ath/ath11k/ahb.c
++++ b/drivers/net/wireless/ath/ath11k/ahb.c
+@@ -960,5 +960,6 @@
+ 	ab->mem = mem;
+ 	ab->mem_len = resource_size(mem_res);
+-
++	ab->mem_pa = mem_res->start;
++
+ 	return 0;
+ }
+--- a/drivers/net/wireless/ath/ath11k/pci.c
++++ b/drivers/net/wireless/ath/ath11k/pci.c
+@@ -72,6 +72,15 @@
+ 		return ATH11K_PCI_WINDOW_START;
+ }
+-
++
++static u32 ath11k_pci_get_window_offset(struct ath11k_base *ab, u32 offset)
++{
++	if (!ab->hw_params.static_window_map)
++		return offset;
++
++	return ath11k_pci_get_window_start(ab, offset) +
++	       (offset & ATH11K_PCI_WINDOW_RANGE_MASK);
++}
++
+ static inline void ath11k_pci_select_window(struct ath11k_pci *ab_pci, u32 offset)
+ {
+ 	struct ath11k_base *ab = ab_pci->ab;
+@@ -914,6 +923,7 @@
+ 	.stop = ath11k_pcic_stop,
+ 	.read32 = ath11k_pcic_read32,
+ 	.write32 = ath11k_pcic_write32,
++	.get_window_offset = ath11k_pci_get_window_offset,
+ 	.read = ath11k_pcic_read,
+ 	.power_down = ath11k_pci_power_down,
+ 	.power_up = ath11k_pci_power_up,
+@@ -995,6 +1005,14 @@
+ 		goto err_free_core;
+ 	}
+-
++
++	ab->mem_pa = pci_resource_start(pdev, ATH11K_PCI_BAR_NUM);
++	if (ab->mem_pa > 0xffffffff) {
++		ath11k_err(ab, "PCI BAR starts above 4 GiB: %pad\n",
++			   &ab->mem_pa);
++		ret = -ERANGE;
++		goto err_pci_free_region;
++	}
++
+ 	ath11k_dbg(ab, ATH11K_DBG_BOOT, "pci probe %04x:%04x %04x:%04x\n",
+ 		   pdev->vendor, pdev->device,
+ 		   pdev->subsystem_vendor, pdev->subsystem_device);
+--- a/drivers/net/wireless/ath/ath11k/hif.h
++++ b/drivers/net/wireless/ath/ath11k/hif.h
+@@ -12,6 +12,7 @@
+ struct ath11k_hif_ops {
+ 	u32 (*read32)(struct ath11k_base *ab, u32 address);
+ 	void (*write32)(struct ath11k_base *ab, u32 address, u32 data);
++	u32 (*get_window_offset)(struct ath11k_base *ab, u32 offset);
+ 	int (*read)(struct ath11k_base *ab, void *buf, u32 start, u32 end);
+ 	void (*irq_enable)(struct ath11k_base *ab);
+ 	void (*irq_disable)(struct ath11k_base *ab);
+@@ -109,6 +110,15 @@
+ 	ab->hif.ops->write32(ab, address, data);
+ }
+-
++
++static inline u32 ath11k_hif_get_window_offset(struct ath11k_base *ab,
++					       u32 offset)
++{
++	if (!ab->hif.ops->get_window_offset)
++		return offset;
++
++	return ab->hif.ops->get_window_offset(ab, offset);
++}
++
+ static inline int ath11k_hif_read(struct ath11k_base *ab, void *buf,
+ 				  u32 start, u32 end)
+ {
