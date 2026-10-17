@@ -3111,10 +3111,15 @@ static void nss_wifili_soc_recount(struct nss_core *core)
 /* Take one instance off the firmware's rings.
  *
  * The order is the vendor stack's: STOP, one PDEV_DEINIT per radio (naming
- * the radio's own id, not the dynamic node), then SOC_RESET.  The dynamic
- * nodes are given back afterwards, and only then is the transmit-descriptor
- * memory released.
+ * the radio's own id, not the dynamic node), then SOC_RESET for the internal
+ * instance.  The external instance is only one wifili soc on a node that also
+ * carries the internal one; its SOC_RESET tears down the whole node on this
+ * firmware and would take the AHB instance with it.  The dynamic nodes are
+ * given back afterwards, and only then is the transmit-descriptor memory
+ * released.
  */
+static void nss_wifili_peer_drop_soc(struct nss_core *core, int soc_id);
+
 static void nss_wifili_stop_soc(struct nss_core *core,
 				struct nss_wifili_soc_state *soc)
 {
@@ -3128,6 +3133,7 @@ static void nss_wifili_stop_soc(struct nss_core *core,
 	 * message; drop the records without touching hardware.
 	 */
 	if (!core->running) {
+		nss_wifili_peer_drop_soc(core, soc - nss_wifili_socs);
 		for (i = 0; i < soc->pdevs_seen; i++)
 			soc->radio_if[i] = -1;
 		nss_wifili_mem_put(core, &soc->txdesc);
@@ -3163,12 +3169,25 @@ static void nss_wifili_stop_soc(struct nss_core *core,
 				 soc->desc.if_num, soc->pdevs[i].radio_id, ret);
 	}
 
-	memset(m, 0, sizeof(*m));
-	m->cm.interface = soc->desc.if_num;
-	m->cm.type = NSS_WIFILI_SOC_RESET_MSG;
-	ret = nss_msg_send(core, m, offsetof(struct nss_wifili_msg, msg));
-	dev_info(core->dev, "wifili: soc %u reset rc %d\n",
-		 soc->desc.if_num, ret);
+	/* The firmware has let go of this instance's peers (or the WLAN
+	 * driver reset it); do not send deletes to a stopped soc.  The QCN
+	 * reset path otherwise leaves records that the next vdev unregister
+	 * tries to delete against a dead instance.
+	 */
+	nss_wifili_peer_drop_soc(core, soc - nss_wifili_socs);
+
+	/* Internal only: this resets the whole wifili node.  An external
+	 * SOC_RESET would also take the internal AHB instance down.
+	 */
+	if (soc->desc.if_num == NSS_INTERFACE_WIFILI) {
+		memset(m, 0, sizeof(*m));
+		m->cm.interface = soc->desc.if_num;
+		m->cm.type = NSS_WIFILI_SOC_RESET_MSG;
+		ret = nss_msg_send(core, m,
+				   offsetof(struct nss_wifili_msg, msg));
+		dev_info(core->dev, "wifili: soc %u reset rc %d\n",
+			 soc->desc.if_num, ret);
+	}
 
 	for (i = 0; i < soc->pdevs_seen; i++) {
 		nss_wifili_radio_dealloc(core, soc->radio_if[i],
@@ -3190,6 +3209,27 @@ static void nss_wifili_stop_soc(struct nss_core *core,
 	nss_wifili_soc_recount(core);
 
 	kfree(m);
+}
+
+/* Drop every peer record of one instance without sending a delete: the
+ * firmware has already stopped/reset this soc, so a delete would be refused
+ * and the record kept.  The DMA is ours and is freed here.
+ */
+static void nss_wifili_peer_drop_soc(struct nss_core *core, int soc_id)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(nss_wifili_peer_tbl); i++) {
+		if (!nss_wifili_peer_tbl[i].mem ||
+		    nss_wifili_peer_tbl[i].soc_id != soc_id)
+			continue;
+
+		dma_free_coherent(core->dev, nss_wifili_peer_tbl[i].size,
+				  nss_wifili_peer_tbl[i].mem,
+				  nss_wifili_peer_tbl[i].dma);
+		nss_wifili_peer_tbl[i].mem = NULL;
+		nss_me_peer_gone(nss_wifili_peer_tbl[i].mac);
+	}
 }
 
 void nss_wifili_stop_all(void)
