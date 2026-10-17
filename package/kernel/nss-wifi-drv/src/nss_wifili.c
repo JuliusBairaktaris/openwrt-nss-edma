@@ -541,6 +541,59 @@ void nss_wifili_stats_print(struct seq_file *s)
 		   st.rxwbm_stats.err_src_invalid);
 }
 
+/* Readiness is a property of the descriptions, not of the core: the service
+ * waits for it before it is allowed to start anything.
+ */
+static bool nss_wifili_ready_locked(void)
+{
+	struct nss_wifili_soc_state *soc;
+	bool any = false;
+	int i;
+
+	for (i = 0; i < NSS_WIFI_MAX_SOCS; i++) {
+		soc = &nss_wifili_socs[i];
+		if (!soc->used)
+			continue;
+		if (soc->gone || soc->pdevs_seen != soc->desc.num_pdevs)
+			return false;
+		any = true;
+	}
+
+	return any;
+}
+
+bool nss_wifili_ready(void)
+{
+	guard(mutex)(&nss_wifili_lock);
+
+	return nss_wifili_ready_locked();
+}
+
+void nss_wifili_socs_print(struct seq_file *s)
+{
+	struct nss_wifili_soc_state *soc;
+	int i;
+
+	guard(mutex)(&nss_wifili_lock);
+
+	for (i = 0; i < NSS_WIFI_MAX_SOCS; i++) {
+		soc = &nss_wifili_socs[i];
+		if (!soc->used)
+			continue;
+
+		seq_printf(s,
+			   "id %d if_num %u target %u target_type %u dyn %u dyn_type %u pdevs %u/%u started %u probed %u was_started %u gone %u\n",
+			   i, soc->desc.if_num, soc->desc.target_type,
+			   soc->desc.target_type, soc->desc.dyn_type,
+			   soc->desc.dyn_type, soc->pdevs_seen,
+			   soc->desc.num_pdevs, soc->started ? 1 : 0,
+			   soc->probed ? 1 : 0, soc->was_started ? 1 : 0,
+			   soc->gone ? 1 : 0);
+	}
+
+	seq_printf(s, "ready %u\n", nss_wifili_ready_locked() ? 1 : 0);
+}
+
 static void nss_wifili_peer_stats(const struct nss_cmn_msg *ncm, u32 len)
 {
 	struct nss_wifili_soc_state *soc;
@@ -3030,6 +3083,32 @@ static void nss_wifili_stop_soc(struct nss_core *core,
 	nss_wifili_soc_recount(core);
 
 	kfree(m);
+}
+
+void nss_wifili_stop_all(void)
+{
+	struct nss_core *core;
+	int i;
+
+	guard(mutex)(&nss_wifili_lock);
+
+	core = nss_wifili_core;
+	if (!core) {
+		for (i = 0; i < NSS_WIFI_MAX_SOCS; i++) {
+			nss_wifili_socs[i].started = false;
+			nss_wifili_socs[i].probed = false;
+		}
+		return;
+	}
+
+	scoped_guard(mutex, &core->lock) {
+		for (i = 0; i < NSS_WIFI_MAX_SOCS; i++)
+			if (READ_ONCE(nss_wifili_socs[i].used) &&
+			    (nss_wifili_socs[i].started ||
+			     nss_wifili_socs[i].probed))
+				nss_wifili_stop_soc(core,
+						    &nss_wifili_socs[i]);
+	}
 }
 
 static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s,

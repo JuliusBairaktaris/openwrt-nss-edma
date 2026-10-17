@@ -395,6 +395,8 @@ struct nss_core {
 	u32 faults;
 	unsigned long fault_window;
 	struct work_struct restart;
+	/* Halt-only path when fault_restart is off; the core is not booted. */
+	struct work_struct fault_stop;
 	/* Completed once no restart is pending; WLAN interfaces wait on it. */
 	struct completion resumed;
 	struct clk **aux_clks;
@@ -494,6 +496,9 @@ int nss_wifili_probe(struct nss_core *core, struct seq_file *s);
 int nss_wifili_start(struct seq_file *s);
 void nss_wifili_resume(struct nss_core *core);
 bool nss_wifili_reset(struct nss_core *core, bool started);
+void nss_wifili_socs_print(struct seq_file *s);
+bool nss_wifili_ready(void);
+void nss_wifili_stop_all(void);
 int nss_wifili_tx(struct seq_file *s);
 void nss_msg_census(const struct nss_cmn_msg *ncm);
 void nss_msg_census_print(struct seq_file *s);

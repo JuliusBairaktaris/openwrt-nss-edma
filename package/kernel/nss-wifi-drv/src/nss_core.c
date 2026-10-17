@@ -856,6 +856,13 @@ void nss_core_stop(struct nss_core *core)
 #define NSS_FAULT_WINDOW	(10 * 60 * HZ)
 #define NSS_HALT_TIMEOUT	(30 * HZ)
 
+/* Off only for a bring-up that is being watched: a fault then halts the core
+ * and stays there instead of rebooting into the same state.
+ */
+static bool nss_fault_restart = true;
+module_param_named(fault_restart, nss_fault_restart, bool, 0644);
+MODULE_PARM_DESC(fault_restart, "restart a core after a fault");
+
 /* A dead core is treated as stopped at once and halted from process context,
  * because the halt sleeps.
  */
@@ -864,7 +871,17 @@ void nss_core_fault(struct nss_core *core)
 	core->running = false;
 	qca_edma_cpu_queues_to_host(core->conduit);
 	core->faulted = true;
-	schedule_work(&core->restart);
+
+	if (nss_fault_restart) {
+		schedule_work(&core->restart);
+		return;
+	}
+
+	/* A watched bring-up: no reboot, but still take the poll off a core
+	 * that is not coming back.  That needs process context.
+	 */
+	WRITE_ONCE(core->up, false);
+	schedule_work(&core->fault_stop);
 }
 
 /* The WLAN driver has described its rings again. */
@@ -875,6 +892,19 @@ void nss_core_resume(struct nss_core *core)
 
 	reinit_completion(&core->resumed);
 	schedule_work(&core->restart);
+}
+
+static void nss_fault_stop(struct work_struct *work)
+{
+	struct nss_core *core = container_of(work, struct nss_core, fault_stop);
+
+	dev_err(core->dev, "core %u faulted; fault_restart=0, leaving it halted\n",
+		core->id);
+	core->faulted = false;
+
+	scoped_guard(mutex, &core->lock)
+		nss_core_halt(core);
+	complete_all(&core->resumed);
 }
 
 static void nss_core_restart(struct work_struct *work)
@@ -1078,6 +1108,30 @@ static int nss_wifili_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(nss_wifili);
 
+static int nss_wifili_socs_show(struct seq_file *s, void *unused)
+{
+	nss_wifili_socs_print(s);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(nss_wifili_socs);
+
+static int nss_wifili_ready_show(struct seq_file *s, void *unused)
+{
+	seq_printf(s, "%u\n", nss_wifili_ready() ? 1 : 0);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(nss_wifili_ready);
+
+static int nss_wifili_stop_set(void *data, u64 val)
+{
+	if (val)
+		nss_wifili_stop_all();
+
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(nss_wifili_stop_fops, NULL, nss_wifili_stop_set,
+			 "%llu\n");
+
 static int nss_msgs_show(struct seq_file *s, void *unused)
 {
 	nss_msg_census_print(s);
@@ -1273,6 +1327,7 @@ static int nss_probe(struct platform_device *pdev)
 	init_completion(&core->resumed);
 	complete_all(&core->resumed);
 	INIT_WORK(&core->restart, nss_core_restart);
+	INIT_WORK(&core->fault_stop, nss_fault_stop);
 	INIT_WORK(&core->arm, nss_phys_work);
 	INIT_WORK(&core->edma_reset, nss_edma_reset_work);
 
@@ -1372,6 +1427,12 @@ static int nss_probe(struct platform_device *pdev)
 	debugfs_create_file("rx", 0400, core->debugfs, core, &nss_rx_fops);
 	debugfs_create_file("wifili_start", 0400, core->debugfs, core,
 			    &nss_wifili_fops);
+	debugfs_create_file("wifili", 0400, core->debugfs, core,
+			    &nss_wifili_socs_fops);
+	debugfs_create_file("wifili_ready", 0444, core->debugfs, core,
+			    &nss_wifili_ready_fops);
+	debugfs_create_file("wifili_stop", 0200, core->debugfs, core,
+			    &nss_wifili_stop_fops);
 	debugfs_create_file("msgs", 0400, core->debugfs, core, &nss_msgs_fops);
 	debugfs_create_file("wifili_rx", 0400, core->debugfs, core,
 			    &nss_wifili_rx_fops);
@@ -1405,6 +1466,7 @@ static void nss_remove(struct platform_device *pdev)
 	scoped_guard(mutex, &core->lock)
 		nss_core_halt(core);
 	cancel_work_sync(&core->restart);
+	cancel_work_sync(&core->fault_stop);
 	complete_all(&core->resumed);
 	flush_work(&core->arm);
 	flush_work(&core->edma_reset);
