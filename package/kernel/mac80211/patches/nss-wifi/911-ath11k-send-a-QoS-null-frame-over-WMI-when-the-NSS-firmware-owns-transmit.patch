@@ -1,0 +1,222 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] ath11k: send a QoS null frame over WMI when the NSS firmware
+ owns transmit
+
+The NSS firmware returns no transmit status, so the QoS null frame of
+hostapd's inactivity poll is reported unacknowledged and a station that
+is present is disassociated. Firmware that advertises
+WMI_TLV_SERVICE_QOS_NULL_FRAME_TX_OVER_WMI sends the frame itself and
+reports the ack in a completion event laid out like the management one.
+A QoS null frame now takes the management path while the NSS firmware
+owns transmit.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -6289,8 +6289,11 @@ static int ath11k_mac_mgmt_tx_wmi(struct
+ 	if (peer_in_unassoc_pool)
+ 		ath11k_cfr_update_unassoc_pool_entry(ar, hdr->addr1);
+ 
+-	ret = ath11k_wmi_mgmt_send(ar, arvif->vdev_id, buf_id, skb,
+-				   tx_params_valid);
++	if (ieee80211_is_qos_nullfunc(hdr->frame_control))
++		ret = ath11k_wmi_qos_null_send(ar, arvif->vdev_id, buf_id, skb);
++	else
++		ret = ath11k_wmi_mgmt_send(ar, arvif->vdev_id, buf_id, skb,
++					   tx_params_valid);
+ 	if (ret) {
+ 		ath11k_warn(ar->ab, "failed to send mgmt frame: %d\n", ret);
+ 		goto err_unmap_buf;
+@@ -6555,6 +6558,19 @@ static int ath11k_mac_mgmt_tx(struct ath
+ 	return 0;
+ }
+ 
++/* The NSS firmware returns no transmit status, so a QoS null frame that asks
++ * whether a station is still there - hostapd's inactivity poll - would read
++ * as lost every time. The WLAN firmware sends it and reports the ack instead.
++ */
++static bool ath11k_mac_qos_null_over_wmi(struct ath11k *ar,
++					 struct ieee80211_hdr *hdr)
++{
++	return ar->ab->nss_offload && !ath11k_nss_host_tx &&
++	       ieee80211_is_qos_nullfunc(hdr->frame_control) &&
++	       test_bit(WMI_TLV_SERVICE_QOS_NULL_FRAME_TX_OVER_WMI,
++			ar->ab->wmi_ab.svc_map);
++}
++
+ static void ath11k_mac_op_tx(struct ieee80211_hw *hw,
+ 			     struct ieee80211_tx_control *control,
+ 			     struct sk_buff *skb)
+@@ -6581,7 +6597,8 @@ static void ath11k_mac_op_tx(struct ieee
+ 
+ 	if (info_flags & IEEE80211_TX_CTL_HW_80211_ENCAP) {
+ 		skb_cb->flags |= ATH11K_SKB_HW_80211_ENCAP;
+-	} else if (ieee80211_is_mgmt(hdr->frame_control)) {
++	} else if (ieee80211_is_mgmt(hdr->frame_control) ||
++		   ath11k_mac_qos_null_over_wmi(ar, hdr)) {
+ 		is_prb_rsp = ieee80211_is_probe_resp(hdr->frame_control);
+ 		ret = ath11k_mac_mgmt_tx(ar, skb, is_prb_rsp);
+ 		if (ret) {
+--- a/drivers/net/wireless/ath/ath11k/wmi.c
++++ b/drivers/net/wireless/ath/ath11k/wmi.c
+@@ -714,6 +714,49 @@ int ath11k_wmi_mgmt_send(struct ath11k *
+ 	return ret;
+ }
+ 
++int ath11k_wmi_qos_null_send(struct ath11k *ar, u32 vdev_id, u32 buf_id,
++			     struct sk_buff *frame)
++{
++	struct ath11k_pdev_wmi *wmi = ar->wmi;
++	struct wmi_qos_null_tx_cmd *cmd;
++	struct wmi_tlv *frame_tlv;
++	struct sk_buff *skb;
++	u32 buf_len;
++	int ret, len;
++
++	buf_len = min_t(u32, frame->len, WMI_MGMT_SEND_DOWNLD_LEN);
++	len = sizeof(*cmd) + sizeof(*frame_tlv) + roundup(buf_len, 4);
++
++	skb = ath11k_wmi_alloc_skb(wmi->wmi_ab, len);
++	if (!skb)
++		return -ENOMEM;
++
++	cmd = (struct wmi_qos_null_tx_cmd *)skb->data;
++	cmd->tlv_header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_QOS_NULL_FRAME_TX_SEND) |
++			  FIELD_PREP(WMI_TLV_LEN, sizeof(*cmd) - TLV_HDR_SIZE);
++	cmd->vdev_id = vdev_id;
++	cmd->desc_id = buf_id;
++	cmd->paddr_lo = lower_32_bits(ATH11K_SKB_CB(frame)->paddr);
++	cmd->paddr_hi = upper_32_bits(ATH11K_SKB_CB(frame)->paddr);
++	cmd->frame_len = frame->len;
++	cmd->buf_len = buf_len;
++
++	frame_tlv = (struct wmi_tlv *)(skb->data + sizeof(*cmd));
++	frame_tlv->header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_ARRAY_BYTE) |
++			    FIELD_PREP(WMI_TLV_LEN, buf_len);
++	memcpy(frame_tlv->value, frame->data, buf_len);
++	ath11k_ce_byte_swap(frame_tlv->value, buf_len);
++
++	ret = ath11k_wmi_cmd_send(wmi, skb, WMI_QOS_NULL_FRAME_TX_SEND_CMDID);
++	if (ret) {
++		ath11k_warn(ar->ab,
++			    "failed to submit WMI_QOS_NULL_FRAME_TX_SEND_CMDID cmd\n");
++		dev_kfree_skb(skb);
++	}
++
++	return ret;
++}
++
+ int ath11k_wmi_vdev_create(struct ath11k *ar, u8 *macaddr,
+ 			   struct vdev_create_params *param)
+ {
+@@ -6048,7 +6091,7 @@ static int wmi_process_mgmt_tx_comp(stru
+ }
+ 
+ static int ath11k_pull_mgmt_tx_compl_param_tlv(struct ath11k_base *ab,
+-					       struct sk_buff *skb,
++					       struct sk_buff *skb, u16 tag,
+ 					       struct wmi_mgmt_tx_compl_event *param)
+ {
+ 	const void **tb;
+@@ -6062,7 +6105,7 @@ static int ath11k_pull_mgmt_tx_compl_par
+ 		return ret;
+ 	}
+ 
+-	ev = tb[WMI_TAG_MGMT_TX_COMPL_EVENT];
++	ev = tb[tag];
+ 	if (!ev) {
+ 		ath11k_warn(ab, "failed to fetch mgmt tx compl ev");
+ 		kfree(tb);
+@@ -7715,12 +7758,13 @@ exit:
+ 	rcu_read_unlock();
+ }
+ 
+-static void ath11k_mgmt_tx_compl_event(struct ath11k_base *ab, struct sk_buff *skb)
++static void ath11k_mgmt_tx_compl_event(struct ath11k_base *ab, struct sk_buff *skb,
++				       u16 tag)
+ {
+ 	struct wmi_mgmt_tx_compl_event tx_compl_param = {};
+ 	struct ath11k *ar;
+ 
+-	if (ath11k_pull_mgmt_tx_compl_param_tlv(ab, skb, &tx_compl_param) != 0) {
++	if (ath11k_pull_mgmt_tx_compl_param_tlv(ab, skb, tag, &tx_compl_param)) {
+ 		ath11k_warn(ab, "failed to extract mgmt tx compl event");
+ 		return;
+ 	}
+@@ -8940,7 +8984,10 @@ static void ath11k_wmi_tlv_op_rx(struct
+ 		/* mgmt_rx_event() owns the skb now! */
+ 		return;
+ 	case WMI_MGMT_TX_COMPLETION_EVENTID:
+-		ath11k_mgmt_tx_compl_event(ab, skb);
++		ath11k_mgmt_tx_compl_event(ab, skb, WMI_TAG_MGMT_TX_COMPL_EVENT);
++		break;
++	case WMI_QOS_NULL_FRAME_TX_COMPLETION_EVENTID:
++		ath11k_mgmt_tx_compl_event(ab, skb, WMI_TAG_QOS_NULL_FRAME_TX_STATUS);
+ 		break;
+ 	case WMI_SCAN_EVENTID:
+ 		ath11k_scan_event(ab, skb);
+--- a/drivers/net/wireless/ath/ath11k/wmi.h
++++ b/drivers/net/wireless/ath/ath11k/wmi.h
+@@ -380,6 +380,7 @@ enum wmi_tlv_cmd_id {
+ 	WMI_BSS_COLOR_CHANGE_ENABLE_CMDID,
+ 	WMI_VDEV_BCN_OFFLOAD_QUIET_CONFIG_CMDID,
+ 	WMI_FILS_DISCOVERY_TMPL_CMDID,
++	WMI_QOS_NULL_FRAME_TX_SEND_CMDID,
+ 	WMI_ADDBA_CLEAR_RESP_CMDID = WMI_TLV_CMD(WMI_GRP_BA_NEG),
+ 	WMI_ADDBA_SEND_CMDID,
+ 	WMI_ADDBA_STATUS_CMDID,
+@@ -710,6 +711,8 @@ enum wmi_tlv_event_id {
+ 	WMI_TBTTOFFSET_EXT_UPDATE_EVENTID,
+ 	WMI_OFFCHAN_DATA_TX_COMPLETION_EVENTID,
+ 	WMI_HOST_FILS_DISCOVERY_EVENTID,
++	WMI_HOST_SWBA_V2_EVENTID,
++	WMI_QOS_NULL_FRAME_TX_COMPLETION_EVENTID,
+ 	WMI_TX_DELBA_COMPLETE_EVENTID = WMI_TLV_CMD(WMI_GRP_BA_NEG),
+ 	WMI_TX_ADDBA_COMPLETE_EVENTID,
+ 	WMI_BA_RSP_SSN_EVENTID,
+@@ -1898,6 +1901,8 @@ enum wmi_tlv_tag {
+ 	WMI_TAG_PDEV_SRG_OBSS_BSSID_ENABLE_BITMAP_CMD,
+ 	WMI_TAG_PDEV_NON_SRG_OBSS_COLOR_ENABLE_BITMAP_CMD,
+ 	WMI_TAG_PDEV_NON_SRG_OBSS_BSSID_ENABLE_BITMAP_CMD,
++	WMI_TAG_QOS_NULL_FRAME_TX_SEND = 0x3A6,
++	WMI_TAG_QOS_NULL_FRAME_TX_STATUS,
+ 	WMI_TAG_REGULATORY_RULE_EXT_STRUCT = 0x3A9,
+ 	WMI_TAG_REG_CHAN_LIST_CC_EXT_EVENT,
+ 	WMI_TAG_VDEV_SET_TPC_POWER_CMD = 0x3B5,
+@@ -2132,6 +2137,7 @@ enum wmi_tlv_service {
+ 	WMI_TLV_SERVICE_SRG_SRP_SPATIAL_REUSE_SUPPORT = 249,
+ 	WMI_TLV_SERVICE_MBSS_PARAM_IN_VDEV_START_SUPPORT = 253,
+ 	WMI_TLV_SERVICE_PASSIVE_SCAN_START_TIME_ENHANCE = 263,
++	WMI_TLV_SERVICE_QOS_NULL_FRAME_TX_OVER_WMI = 264,
+ 
+ 	/* The second 128 bits */
+ 	WMI_MAX_EXT_SERVICE = 256,
+@@ -4992,6 +4998,17 @@ struct wmi_rssi_ctl_ext {
+ 	u32 rssi_ctl_ext[MAX_ANTENNA_EIGHT - ATH_MAX_ANTENNA];
+ };
+ 
++struct wmi_qos_null_tx_cmd {
++	u32 tlv_header;
++	u32 vdev_id;
++	u32 desc_id;
++	u32 paddr_lo;
++	u32 paddr_hi;
++	u32 frame_len;
++	u32 buf_len;
++	u32 tx_params_valid;
++} __packed;
++
+ struct wmi_mgmt_tx_compl_event {
+ 	u32 desc_id;
+ 	u32 status;
+@@ -6434,6 +6451,8 @@ const void **ath11k_wmi_tlv_parse_alloc(
+ int ath11k_wmi_cmd_send(struct ath11k_pdev_wmi *wmi, struct sk_buff *skb,
+ 			u32 cmd_id);
+ struct sk_buff *ath11k_wmi_alloc_skb(struct ath11k_wmi_base *wmi_sc, u32 len);
++int ath11k_wmi_qos_null_send(struct ath11k *ar, u32 vdev_id, u32 buf_id,
++			     struct sk_buff *frame);
+ int ath11k_wmi_mgmt_send(struct ath11k *ar, u32 vdev_id, u32 buf_id,
+ 			 struct sk_buff *frame, bool tx_params_valid);
+ int ath11k_wmi_p2p_go_bcn_ie(struct ath11k *ar, u32 vdev_id,
