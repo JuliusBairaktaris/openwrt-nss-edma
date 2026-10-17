@@ -1,0 +1,76 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] ath11k: keep NSS vdevs on ethernet with a monitor interface
+
+mac80211 withdraws the encapsulation and decapsulation offloads while a
+monitor interface exists, and ath11k then sets the WLAN firmware vdev to
+native Wi-Fi. The NSS firmware vdev keeps the ethernet mode it was
+registered with and still receives every frame as ethernet, so the
+transmit descriptors it builds no longer match the WLAN vdev. Under the
+offload, set access point and station vdevs to ethernet in both
+directions whatever mac80211 grants; frames mac80211 sends as 802.11
+are already converted before they reach the NSS firmware.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
+index 2fcd870..339fc21 100644
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -7003,15 +7003,19 @@ static int ath11k_mac_setup_vdev_create_params(struct ath11k_vif *arvif,
+  * what the hardware encapsulation and decapsulation this driver has already
+  * been told to use produce.
+  */
+-/* The mode the WLAN firmware was given for this direction a moment ago, in
+- * ath11k_mac_op_update_vif_offload(). The NSS firmware has to declare the same
+- * one, and mac80211 grants the encapsulation offload rather than the driver
+- * choosing it, so it is read back here rather than derived from frame_mode.
++/*
++ * The mode the WLAN firmware is given for one direction of a vdev, which the
++ * NSS firmware has to declare as well. An NSS access point or station vdev
++ * is ethernet whatever mac80211 grants: every frame reaches the NSS firmware
++ * as ethernet, and the NSS vdev keeps the mode it was registered with while
++ * mac80211 withdraws the offload for as long as a monitor interface exists.
+  */
+ static u8 ath11k_nss_vdev_mode(struct ath11k_base *ab,
+ 			       struct ieee80211_vif *vif, u32 offload_flag)
+ {
+-	if (vif->offload_flags & offload_flag)
++	if (vif->offload_flags & offload_flag ||
++	    (ab->nss_offload && (vif->type == NL80211_IFTYPE_AP ||
++				 vif->type == NL80211_IFTYPE_STATION)))
+ 		return ATH11K_HW_TXRX_ETHERNET;
+ 	if (test_bit(ATH11K_FLAG_RAW_MODE, &ab->dev_flags))
+ 		return ATH11K_HW_TXRX_RAW;
+@@ -7112,13 +7116,8 @@ static void ath11k_mac_op_update_vif_offload(struct ieee80211_hw *hw,
+ 		vif->offload_flags &= ~(IEEE80211_OFFLOAD_ENCAP_ENABLED |
+ 					IEEE80211_OFFLOAD_DECAP_ENABLED);
+ 
+-	if (vif->offload_flags & IEEE80211_OFFLOAD_ENCAP_ENABLED)
+-		param_value = ATH11K_HW_TXRX_ETHERNET;
+-	else if (test_bit(ATH11K_FLAG_RAW_MODE, &ab->dev_flags))
+-		param_value = ATH11K_HW_TXRX_RAW;
+-	else
+-		param_value = ATH11K_HW_TXRX_NATIVE_WIFI;
+-
++	param_value = ath11k_nss_vdev_mode(ab, vif,
++					   IEEE80211_OFFLOAD_ENCAP_ENABLED);
+ 	ret = ath11k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id,
+ 					    param_id, param_value);
+ 	if (ret) {
+@@ -7128,13 +7127,8 @@ static void ath11k_mac_op_update_vif_offload(struct ieee80211_hw *hw,
+ 	}
+ 
+ 	param_id = WMI_VDEV_PARAM_RX_DECAP_TYPE;
+-	if (vif->offload_flags & IEEE80211_OFFLOAD_DECAP_ENABLED)
+-		param_value = ATH11K_HW_TXRX_ETHERNET;
+-	else if (test_bit(ATH11K_FLAG_RAW_MODE, &ab->dev_flags))
+-		param_value = ATH11K_HW_TXRX_RAW;
+-	else
+-		param_value = ATH11K_HW_TXRX_NATIVE_WIFI;
+-
++	param_value = ath11k_nss_vdev_mode(ab, vif,
++					   IEEE80211_OFFLOAD_DECAP_ENABLED);
+ 	ret = ath11k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id,
+ 					    param_id, param_value);
+ 	if (ret) {
