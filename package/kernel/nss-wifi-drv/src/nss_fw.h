@@ -546,12 +546,22 @@ struct nss_wifili_hal_srng_soc_msg {
 	u32 lmac_rings_start_id;
 };
 
+#define NSS_WIFILI_MAX_NUMBER_OF_PAGE_MSG	32
+#define NSS_WIFILI_MAX_NUMBER_OF_ADDTNL_SEG	64
+#define WIFILI_ADDTL_MEM_SEG_SET		0x2
+
+struct nss_wifili_tx_desc_addtnl_mem_msg {
+	u32 num_addtnl_addr;
+	u32 addtnl_memory_addr[NSS_WIFILI_MAX_NUMBER_OF_ADDTNL_SEG];
+	u32 addtnl_memory_size[NSS_WIFILI_MAX_NUMBER_OF_ADDTNL_SEG];
+};
+
 struct nss_wifili_tx_desc_init_msg {
 	u32 num_tx_desc;
 	u32 num_tx_desc_ext;
 	u32 num_pool;
-	u32 memory_addr[32];
-	u32 memory_size[32];
+	u32 memory_addr[NSS_WIFILI_MAX_NUMBER_OF_PAGE_MSG];
+	u32 memory_size[NSS_WIFILI_MAX_NUMBER_OF_PAGE_MSG];
 	u32 num_memaddr;
 	u32 ext_desc_page_num;
 	u32 num_tx_desc_2;
@@ -581,7 +591,7 @@ struct nss_wifili_init_msg {
 	struct nss_wifili_tx_desc_init_msg wtdim;
 	u32 target_type;
 	struct nss_wifili_rx_init_param wrip;
-	u32 rsvd[129];
+	struct nss_wifili_tx_desc_addtnl_mem_msg wtdam;
 	u32 tx_sw_internode_queue_size;
 };
 

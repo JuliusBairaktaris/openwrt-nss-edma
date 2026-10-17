@@ -44,8 +44,16 @@
  * it, and at 64 it read three times the number of frames that got through.
  * A descriptor is under 128 bytes, so this many still fit the page below.
  */
-#define NSS_WIFILI_TX_DESC		512
+#define NSS_WIFILI_TX_DESC		8192
 #define NSS_WIFILI_TX_PROCESSQ		1024
+
+/* The firmware addresses the descriptor memory by page; one page may hold at
+ * most 240 KiB (the 12-bit page field at 80 bytes per descriptor).  A larger
+ * block is handed over as several pages, as the vendor stack does; for the
+ * 8192 descriptors above that is 3 normal and 6 extension pages.
+ */
+#define NSS_WIFILI_TX_DESC_SEG_MAX	32
+#define NSS_WIFILI_TX_DESC_SEG_SIZE	(240 * 1024)
 
 /* The firmware carves both kinds out of the memory given here, at a stride
  * of its own for each, and a block smaller than the declared count leads to
@@ -57,6 +65,8 @@
 
 #define NSS_WIFILI_TX_DESC_MEM(pools, stride) \
 	PAGE_ALIGN(((NSS_WIFILI_TX_DESC + 1) * (pools)) * (stride))
+#define NSS_WIFILI_TX_DESC_TOTAL(pools, stride) \
+	((NSS_WIFILI_TX_DESC + 1) * (pools) * (stride))
 
 /* The receive buffer the hardware would be programmed with, and the tag block
  * in front of it. Both are bounds-checked by the firmware, which is why they
@@ -128,9 +138,13 @@ struct nss_wifili_soc_state {
 	 */
 	int radio_idx[NSS_WIFILI_MAX_PDEV_NUM_MSG];
 	/* The transmit descriptors are the firmware's to carve up and the
-	 * host's to provide, so each instance carries its own.
+	 * host's to provide, so each instance carries its own.  The firmware
+	 * addresses them by page, so a large pool is split into pages of at
+	 * most NSS_WIFILI_TX_DESC_SEG_SIZE.
 	 */
-	struct nss_wifili_mem txdesc, txdescext;
+	struct nss_wifili_mem txdesc[NSS_WIFILI_TX_DESC_SEG_MAX];
+	struct nss_wifili_mem txdescext[NSS_WIFILI_TX_DESC_SEG_MAX];
+	u8 n_txdesc, n_txdescext;
 	bool used;
 	bool probed, started, gone, was_started;
 };
@@ -384,6 +398,8 @@ int nss_wifi_soc_register_ex(const struct nss_wifi_soc *desc)
 	memset(soc->radio_idx, 0xff, sizeof(soc->radio_idx));
 	memset(&soc->txdesc, 0, sizeof(soc->txdesc));
 	memset(&soc->txdescext, 0, sizeof(soc->txdescext));
+	soc->n_txdesc = 0;
+	soc->n_txdescext = 0;
 	soc->probed = false;
 	soc->started = false;
 	soc->gone = false;
@@ -822,6 +838,50 @@ static void nss_wifili_mem_put(struct nss_core *core,
 
 	nss_mem_free(core, m->cpu);
 	memset(m, 0, sizeof(*m));
+}
+
+static void nss_wifili_tx_desc_free(struct nss_core *core,
+				    struct nss_wifili_mem *m, u8 *n)
+{
+	int i;
+
+	for (i = 0; i < *n; i++)
+		nss_wifili_mem_put(core, &m[i]);
+	*n = 0;
+}
+
+/* The firmware pages the descriptor memory at 240 KiB; split the pool the
+ * same way the vendor stack does.  The normal pool and the extension pool
+ * are separate allocations, and ext_desc_page_num is where the extension
+ * pool starts in the page array.
+ */
+static int nss_wifili_tx_desc_alloc(struct nss_core *core,
+				    struct nss_wifili_mem *m, u8 *n,
+				    size_t total)
+{
+	int ret;
+
+	*n = 0;
+	while (total) {
+		size_t size = min_t(size_t, total,
+				    NSS_WIFILI_TX_DESC_SEG_SIZE);
+
+		if (*n >= NSS_WIFILI_TX_DESC_SEG_MAX) {
+			ret = -ENOSPC;
+			goto err;
+		}
+		ret = nss_wifili_mem_get(core, &m[*n], size);
+		if (ret)
+			goto err;
+		(*n)++;
+		total -= size;
+	}
+
+	return 0;
+
+err:
+	nss_wifili_tx_desc_free(core, m, n);
+	return ret;
 }
 
 static void nss_wifili_srng(struct nss_wifili_hal_srng_info *r,
@@ -2766,7 +2826,7 @@ static int nss_wifili_start_soc(struct nss_core *core,
 {
 	struct nss_wifili_msg *m;
 	bool init_done = false;
-	int i, ret;
+	int i, j, ret;
 
 	if (nss_wifili_start_gate &&
 	    soc->pdevs_seen != soc->desc.num_pdevs) {
@@ -2790,19 +2850,27 @@ static int nss_wifili_start_soc(struct nss_core *core,
 
 	/* The transmit descriptors are the firmware's to carve up and the
 	 * host's to provide, so they are not part of what the WLAN driver
-	 * describes.
+	 * describes.  The firmware pages them at 240 KiB, so a larger pool is
+	 * handed over as several pages rather than one oversized block.
 	 */
-	ret = nss_wifili_mem_get(core, &soc->txdesc,
-				 NSS_WIFILI_TX_DESC_MEM(soc->pdevs_seen,
-							NSS_WIFILI_TX_DESC_STRIDE));
+	ret = nss_wifili_tx_desc_alloc(core, soc->txdesc, &soc->n_txdesc,
+				       NSS_WIFILI_TX_DESC_TOTAL(soc->pdevs_seen,
+								NSS_WIFILI_TX_DESC_STRIDE));
 	if (ret)
 		goto out;
 
-	ret = nss_wifili_mem_get(core, &soc->txdescext,
-				 NSS_WIFILI_TX_DESC_MEM(soc->pdevs_seen,
-							NSS_WIFILI_TX_DESC_EXT_STRIDE));
+	ret = nss_wifili_tx_desc_alloc(core, soc->txdescext,
+				       &soc->n_txdescext,
+				       NSS_WIFILI_TX_DESC_TOTAL(soc->pdevs_seen,
+								NSS_WIFILI_TX_DESC_EXT_STRIDE));
 	if (ret)
 		goto out;
+
+	if (soc->n_txdesc + soc->n_txdescext >
+	    NSS_WIFILI_MAX_NUMBER_OF_PAGE_MSG) {
+		ret = -ENOSPC;
+		goto out;
+	}
 
 	m->cm.interface = soc->desc.if_num;
 	m->cm.type = NSS_WIFILI_INIT_MSG;
@@ -2856,12 +2924,19 @@ static int nss_wifili_start_soc(struct nss_core *core,
 		m->msg.init.wtdim.num_tx_desc_ext_3 = NSS_WIFILI_TX_DESC;
 	}
 
-	m->msg.init.wtdim.num_memaddr = 2;
-	m->msg.init.wtdim.memory_addr[0] = soc->txdesc.dma;
-	m->msg.init.wtdim.memory_size[0] = soc->txdesc.size;
-	m->msg.init.wtdim.memory_addr[1] = soc->txdescext.dma;
-	m->msg.init.wtdim.memory_size[1] = soc->txdescext.size;
-	m->msg.init.wtdim.ext_desc_page_num = 1;
+	m->msg.init.wtdim.num_memaddr = soc->n_txdesc + soc->n_txdescext;
+	for (i = 0; i < soc->n_txdesc; i++) {
+		m->msg.init.wtdim.memory_addr[i] = soc->txdesc[i].dma;
+		m->msg.init.wtdim.memory_size[i] = soc->txdesc[i].size;
+	}
+	for (j = 0; j < soc->n_txdescext; j++) {
+		m->msg.init.wtdim.memory_addr[soc->n_txdesc + j] =
+			soc->txdescext[j].dma;
+		m->msg.init.wtdim.memory_size[soc->n_txdesc + j] =
+			soc->txdescext[j].size;
+	}
+	/* The extension pool starts after the normal pages. */
+	m->msg.init.wtdim.ext_desc_page_num = soc->n_txdesc;
 	m->msg.init.wtdim.num_tx_device_limit = NSS_WIFILI_TX_DESC *
 						soc->pdevs_seen;
 
@@ -2877,10 +2952,11 @@ static int nss_wifili_start_soc(struct nss_core *core,
 	 * handed over so a trapped address can be told apart from a stray one.
 	 */
 	dev_info(core->dev,
-		 "wifili: txdesc %pad+%zx ext %pad+%zx, %u pools, %u tcl, %u reo\n",
-		 &soc->txdesc.dma, soc->txdesc.size, &soc->txdescext.dma,
-		 soc->txdescext.size, soc->pdevs_seen, soc->desc.num_tcl,
-		 soc->desc.num_reo);
+		 "wifili: txdesc %pad+%zx ext %pad+%zx, %u/%u pages, %u pools, %u tcl, %u reo\n",
+		 &soc->txdesc[0].dma, soc->txdesc[0].size,
+		 &soc->txdescext[0].dma, soc->txdescext[0].size,
+		 soc->n_txdesc, soc->n_txdescext, soc->pdevs_seen,
+		 soc->desc.num_tcl, soc->desc.num_reo);
 	for (i = 0; i < soc->desc.num_tcl; i++)
 		dev_info(core->dev,
 			 "wifili: tcl%d id %u base %#x x%u  txcomp id %u base %#x x%u hw %#x/%#x  tclhw %#x/%#x tcle %u\n",
@@ -3076,8 +3152,8 @@ out:
 		} else {
 			soc->started = false;
 			soc->probed = false;
-			nss_wifili_mem_put(core, &soc->txdesc);
-			nss_wifili_mem_put(core, &soc->txdescext);
+			nss_wifili_tx_desc_free(core, soc->txdesc, &soc->n_txdesc);
+			nss_wifili_tx_desc_free(core, soc->txdescext, &soc->n_txdescext);
 		}
 	}
 
@@ -3136,8 +3212,8 @@ static void nss_wifili_stop_soc(struct nss_core *core,
 		nss_wifili_peer_drop_soc(core, soc - nss_wifili_socs);
 		for (i = 0; i < soc->pdevs_seen; i++)
 			soc->radio_if[i] = -1;
-		nss_wifili_mem_put(core, &soc->txdesc);
-		nss_wifili_mem_put(core, &soc->txdescext);
+		nss_wifili_tx_desc_free(core, soc->txdesc, &soc->n_txdesc);
+		nss_wifili_tx_desc_free(core, soc->txdescext, &soc->n_txdescext);
 		soc->started = false;
 		soc->probed = false;
 		soc->was_started = false;
@@ -3203,8 +3279,8 @@ static void nss_wifili_stop_soc(struct nss_core *core,
 	soc->probed = false;
 	soc->was_started = false;
 
-	nss_wifili_mem_put(core, &soc->txdesc);
-	nss_wifili_mem_put(core, &soc->txdescext);
+	nss_wifili_tx_desc_free(core, soc->txdesc, &soc->n_txdesc);
+	nss_wifili_tx_desc_free(core, soc->txdescext, &soc->n_txdescext);
 
 	nss_wifili_soc_recount(core);
 
@@ -3283,8 +3359,8 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s,
 				continue;
 			soc->started = false;
 			soc->probed = false;
-			nss_wifili_mem_put(core, &soc->txdesc);
-			nss_wifili_mem_put(core, &soc->txdescext);
+			nss_wifili_tx_desc_free(core, soc->txdesc, &soc->n_txdesc);
+			nss_wifili_tx_desc_free(core, soc->txdescext, &soc->n_txdescext);
 		}
 	}
 
