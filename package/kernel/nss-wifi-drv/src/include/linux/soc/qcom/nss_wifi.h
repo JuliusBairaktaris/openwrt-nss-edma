@@ -181,6 +181,32 @@ struct nss_wifi_mesh_ops {
 };
 
 #if IS_REACHABLE(CONFIG_NSS_WIFI_DRV)
+/*
+ * The instance-aware form of the three registration calls.
+ *
+ * soc_register_ex returns the instance id: 0 is the internal instance, 1 and
+ * 2 the two external ones.  A zero if_num maps to the internal 203; a zero
+ * dyn_type is derived from if_num (203 -> 19, 215 -> 61, 216 -> 62).
+ * Otherwise if_num 203/215/216 must be paired with dyn_type 19/61/62, and
+ * the same interface or dynamic type may not be registered twice.  The
+ * description is kept, not started.
+ *
+ * pdev_register_ex returns the radio's index in the driver's global radio
+ * table (0..5); the instance-aware vdev/mesh path will use it.  The
+ * per-instance radio count in the description bounds how many may be
+ * registered.
+ *
+ * soc_unregister_ex only withdraws that instance; it does not stop the NSS
+ * core.
+ *
+ * The older calls below stay as internal-instance wrappers for a caller that
+ * predates them; they still return 0 on success even when the underlying id
+ * is nonzero, because their callers test the return as an error.
+ */
+int nss_wifi_soc_register_ex(const struct nss_wifi_soc *soc);
+void nss_wifi_soc_unregister_ex(int soc_id);
+int nss_wifi_pdev_register_ex(int soc_id, const struct nss_wifi_pdev *pdev);
+
 int nss_wifi_soc_register(const struct nss_wifi_soc *soc);
 void nss_wifi_soc_unregister(void);
 int nss_wifi_pdev_register(const struct nss_wifi_pdev *pdev);
@@ -204,6 +230,21 @@ int nss_wifi_mesh_path(int if_num, enum nss_wifi_mesh_cmd cmd,
 		       const struct nss_wifi_mesh_path *p);
 int nss_wifi_mesh_config(int if_num, u8 ttl, u32 refresh_ms, bool forward);
 #else
+static inline int nss_wifi_soc_register_ex(const struct nss_wifi_soc *soc)
+{
+	return -ENODEV;
+}
+
+static inline void nss_wifi_soc_unregister_ex(int soc_id)
+{
+}
+
+static inline int nss_wifi_pdev_register_ex(int soc_id,
+					    const struct nss_wifi_pdev *pdev)
+{
+	return -ENODEV;
+}
+
 static inline int nss_wifi_soc_register(const struct nss_wifi_soc *soc)
 {
 	return -ENODEV;

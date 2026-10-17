@@ -114,45 +114,89 @@ struct nss_wifili_ctx {
  */
 static struct nss_core *nss_wifili_core;
 
-/* One described wifili instance. Only state 0 is populated for now; the
- * array is here so a message can find its instance by interface number
- * instead of every path assuming there is one.
+/* One described wifili instance. State 0 is the internal instance; the two
+ * external (PCIe) instances take 1 and 2. A message finds its instance by
+ * interface number instead of every path assuming there is one.
  */
 struct nss_wifili_soc_state {
 	struct nss_wifi_soc desc;
 	struct nss_wifi_pdev pdevs[NSS_WIFILI_MAX_PDEV_NUM_MSG];
 	u8 pdevs_seen;
 	int radio_if[NSS_WIFILI_MAX_PDEV_NUM_MSG];
+	/* Index in the global radio table, which unlike radio_if is not a
+	 * firmware interface number. -1 while unused.
+	 */
+	int radio_idx[NSS_WIFILI_MAX_PDEV_NUM_MSG];
 	/* The transmit descriptors are the firmware's to carve up and the
 	 * host's to provide, so each instance carries its own.
 	 */
 	struct nss_wifili_mem txdesc, txdescext;
+	bool used;
 	bool probed, started, gone, was_started;
 };
 
 static struct nss_wifili_soc_state nss_wifili_socs[NSS_WIFI_MAX_SOCS];
-static bool nss_wifili_have_soc;
+/* One bit per radio across every instance, for the vdev/mesh tables. */
+static DECLARE_BITMAP(nss_wifili_radios_used, NSS_WIFI_MAX_RADIOS);
 
-/* Only the internal instance exists this round, so 203 finds state 0 and
- * anything else finds nothing. Most callers hold nss_wifili_lock; the notify
- * path does not, and have_soc is published after the description is filled
- * and cleared before the callbacks are withdrawn, so a READ_ONCE is enough.
+/* The notify path does not take the lock, and used is published after the
+ * description is filled and cleared before the callbacks are withdrawn, so a
+ * READ_ONCE is enough there.
  */
 static struct nss_wifili_soc_state *nss_wifili_soc_lookup(u32 if_num)
 {
-	struct nss_wifili_soc_state *soc = &nss_wifili_socs[0];
+	int i;
 
-	if (!READ_ONCE(nss_wifili_have_soc))
-		return NULL;
-	if (NSS_INTERFACE_NUM_GET(if_num) != soc->desc.if_num)
-		return NULL;
+	if_num = NSS_INTERFACE_NUM_GET(if_num);
 
-	return soc;
+	for (i = 0; i < NSS_WIFI_MAX_SOCS; i++) {
+		struct nss_wifili_soc_state *soc = &nss_wifili_socs[i];
+
+		if (READ_ONCE(soc->used) &&
+		    READ_ONCE(soc->desc.if_num) == if_num)
+			return soc;
+	}
+
+	return NULL;
 }
 
+/* The first instance in the array, which is the internal one whenever it is
+ * registered: external instances are allocated at 1 and 2.
+ */
 static struct nss_wifili_soc_state *nss_wifili_soc_first(void)
 {
-	return READ_ONCE(nss_wifili_have_soc) ? &nss_wifili_socs[0] : NULL;
+	int i;
+
+	for (i = 0; i < NSS_WIFI_MAX_SOCS; i++)
+		if (READ_ONCE(nss_wifili_socs[i].used))
+			return &nss_wifili_socs[i];
+
+	return NULL;
+}
+
+static bool nss_wifili_soc_described(const struct nss_wifili_soc_state *soc)
+{
+	return soc && soc->pdevs_seen == soc->desc.num_pdevs;
+}
+
+static bool nss_wifili_described(void)
+{
+	return nss_wifili_soc_described(nss_wifili_soc_lookup(NSS_INTERFACE_WIFILI));
+}
+
+/* The pair a caller may name: 203/19 internal, 215/61 and 216/62 external. */
+static int nss_wifili_dyn_type_for(u32 if_num)
+{
+	switch (if_num) {
+	case NSS_INTERFACE_WIFILI:
+		return NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_INTERNAL;
+	case NSS_INTERFACE_WIFILI_EXTERNAL0:
+		return NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL0;
+	case NSS_INTERFACE_WIFILI_EXTERNAL1:
+		return NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL1;
+	default:
+		return -EINVAL;
+	}
 }
 
 static DEFINE_MUTEX(nss_wifili_lock);
@@ -165,74 +209,141 @@ void nss_wifili_bind(struct nss_core *core)
 
 /* Keep what the WLAN driver says; starting the firmware is a separate act,
  * because a running core takes the hardware with it.
+ *
+ * The internal instance is reserved for state 0 and the two external ones
+ * for states 1 and 2, so nss_wifili_soc_first() is the internal instance
+ * whenever it exists. A zero if_num or dyn_type is the pair the old caller
+ * sent; it maps to 203/19.
  */
-int nss_wifi_soc_register(const struct nss_wifi_soc *desc)
+int nss_wifi_soc_register_ex(const struct nss_wifi_soc *desc)
 {
-	struct nss_wifili_soc_state *soc = &nss_wifili_socs[0];
+	struct nss_wifili_soc_state *soc;
+	u32 if_num;
+	int id = -1;
+	int dyn_type;
+	int i;
 
 	guard(mutex)(&nss_wifili_lock);
 
-	if (desc->num_tcl > NSS_WIFI_MAX_TCL_RINGS ||
-	    desc->num_reo > NSS_WIFI_MAX_REO_RINGS)
+	if (!desc)
 		return -EINVAL;
 
-	/* Only the internal instance is supported this round. Refuse an
-	 * external one instead of silently overwriting the internal state;
-	 * the commit that adds PCIe instances replaces this check with the
-	 * real allocation of 215/216 and 61/62.
-	 */
-	if (desc->if_num && desc->if_num != NSS_INTERFACE_WIFILI)
-		return -EOPNOTSUPP;
-	if (desc->dyn_type &&
-	    desc->dyn_type != NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_INTERNAL)
-		return -EOPNOTSUPP;
+	if (desc->num_tcl > NSS_WIFI_MAX_TCL_RINGS ||
+	    desc->num_reo > NSS_WIFI_MAX_REO_RINGS ||
+	    desc->num_pdevs > NSS_WIFILI_MAX_PDEV_NUM_MSG)
+		return -EINVAL;
 
+	if_num = desc->if_num ? desc->if_num : NSS_INTERFACE_WIFILI;
+	dyn_type = nss_wifili_dyn_type_for(if_num);
+	if (dyn_type < 0)
+		return -EINVAL;
+	if (desc->dyn_type && desc->dyn_type != dyn_type)
+		return -EINVAL;
+
+	for (i = 0; i < NSS_WIFI_MAX_SOCS; i++) {
+		soc = &nss_wifili_socs[i];
+		if (!READ_ONCE(soc->used))
+			continue;
+		if (soc->desc.if_num == if_num || soc->desc.dyn_type == dyn_type)
+			return -EEXIST;
+	}
+
+	if (if_num == NSS_INTERFACE_WIFILI) {
+		if (READ_ONCE(nss_wifili_socs[0].used))
+			return -EEXIST;
+		id = 0;
+	} else {
+		for (i = 1; i < NSS_WIFI_MAX_SOCS; i++)
+			if (!READ_ONCE(nss_wifili_socs[i].used)) {
+				id = i;
+				break;
+			}
+		if (id < 0)
+			return -ENOSPC;
+	}
+
+	soc = &nss_wifili_socs[id];
 	soc->desc = *desc;
-	/* A caller that predates the instance fields leaves them zero. */
-	if (!soc->desc.if_num)
-		soc->desc.if_num = NSS_INTERFACE_WIFILI;
-	if (!soc->desc.dyn_type)
-		soc->desc.dyn_type =
-			NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_INTERNAL;
+	soc->desc.if_num = if_num;
+	soc->desc.dyn_type = dyn_type;
+	soc->pdevs_seen = 0;
+	memset(soc->radio_if, 0xff, sizeof(soc->radio_if));
+	memset(soc->radio_idx, 0xff, sizeof(soc->radio_idx));
+	memset(&soc->txdesc, 0, sizeof(soc->txdesc));
+	memset(&soc->txdescext, 0, sizeof(soc->txdescext));
 	soc->probed = false;
 	soc->started = false;
 	soc->gone = false;
 	soc->was_started = false;
-	soc->pdevs_seen = 0;
-	WRITE_ONCE(nss_wifili_have_soc, true);
+	WRITE_ONCE(soc->used, true);
 
-	return 0;
+	return id;
+}
+EXPORT_SYMBOL_GPL(nss_wifi_soc_register_ex);
+
+int nss_wifi_soc_register(const struct nss_wifi_soc *desc)
+{
+	int soc_id;
+
+	/* The old call is internal-only; an external instance has to use the
+	 * instance-aware form so its id is kept.
+	 */
+	if (desc && desc->if_num && desc->if_num != NSS_INTERFACE_WIFILI)
+		return -EOPNOTSUPP;
+
+	soc_id = nss_wifi_soc_register_ex(desc);
+
+	/* The old caller tests this as an error; its instance is 0. */
+	return soc_id < 0 ? soc_id : 0;
 }
 EXPORT_SYMBOL_GPL(nss_wifi_soc_register);
 
-void nss_wifi_soc_unregister(void)
+/* Withdraw one instance's records. This does not stop the NSS core: the old
+ * wrapper below does that for the internal instance, and a new caller that
+ * unregisters a started internal instance has to do the same before this.
+ */
+void nss_wifi_soc_unregister_ex(int soc_id)
 {
 	struct nss_wifili_soc_state *soc;
+	int i;
 
 	guard(mutex)(&nss_wifili_lock);
 
-	soc = nss_wifili_soc_first();
-	WRITE_ONCE(nss_wifili_have_soc, false);
-	if (soc) {
-		soc->pdevs_seen = 0;
-		soc->started = false;
-		soc->gone = true;
-	}
+	if (soc_id < 0 || soc_id >= NSS_WIFI_MAX_SOCS)
+		return;
+
+	soc = &nss_wifili_socs[soc_id];
+	if (!READ_ONCE(soc->used))
+		return;
 
 	/* The WLAN driver is about to free the rings this reaches into, and a
 	 * receive poll that read the callback a moment ago is still holding
 	 * it, so the withdrawal is not complete until that poll has ended.
-	 *
-	 * A firmware started on those rings keeps reaping them after they are
-	 * freed and after they are allocated again for the next WLAN
-	 * instance, whose entries it then resolves against descriptors it
-	 * never issued. It is stopped with them.
 	 */
-	if (soc) {
-		WRITE_ONCE(soc->desc.link_desc_return, NULL);
-		WRITE_ONCE(soc->desc.rx_80211, NULL);
-		WRITE_ONCE(soc->desc.peer_stats, NULL);
-	}
+	WRITE_ONCE(soc->desc.link_desc_return, NULL);
+	WRITE_ONCE(soc->desc.rx_80211, NULL);
+	WRITE_ONCE(soc->desc.peer_stats, NULL);
+
+	for (i = 0; i < soc->pdevs_seen; i++)
+		if (soc->radio_idx[i] >= 0)
+			clear_bit(soc->radio_idx[i], nss_wifili_radios_used);
+
+	soc->pdevs_seen = 0;
+	memset(soc->radio_if, 0xff, sizeof(soc->radio_if));
+	memset(soc->radio_idx, 0xff, sizeof(soc->radio_idx));
+	soc->started = false;
+	soc->gone = true;
+	WRITE_ONCE(soc->used, false);
+}
+EXPORT_SYMBOL_GPL(nss_wifi_soc_unregister_ex);
+
+void nss_wifi_soc_unregister(void)
+{
+	/* The old caller owns the core the internal instance was started on;
+	 * clearing the instance alone would leave the firmware on its rings.
+	 */
+	nss_wifi_soc_unregister_ex(0);
+
 	if (!nss_wifili_core)
 		return;
 	if (nss_wifili_core->wifili_started)
@@ -242,24 +353,33 @@ void nss_wifi_soc_unregister(void)
 }
 EXPORT_SYMBOL_GPL(nss_wifi_soc_unregister);
 
-static bool nss_wifili_described(void)
-{
-	struct nss_wifili_soc_state *soc = nss_wifili_soc_first();
-
-	return soc && soc->pdevs_seen == soc->desc.num_pdevs;
-}
-
-int nss_wifi_pdev_register(const struct nss_wifi_pdev *pdev)
+int nss_wifi_pdev_register_ex(int soc_id, const struct nss_wifi_pdev *pdev)
 {
 	struct nss_wifili_soc_state *soc;
+	int radio;
 
 	guard(mutex)(&nss_wifili_lock);
 
-	soc = nss_wifili_soc_first();
-	if (!soc || soc->pdevs_seen >= ARRAY_SIZE(soc->pdevs))
+	if (!pdev || soc_id < 0 || soc_id >= NSS_WIFI_MAX_SOCS)
 		return -EINVAL;
 
-	soc->pdevs[soc->pdevs_seen++] = *pdev;
+	soc = &nss_wifili_socs[soc_id];
+	if (!READ_ONCE(soc->used))
+		return -ENODEV;
+
+	if (soc->pdevs_seen >= soc->desc.num_pdevs ||
+	    soc->pdevs_seen >= ARRAY_SIZE(soc->pdevs))
+		return -ENOSPC;
+
+	for (radio = 0; radio < NSS_WIFI_MAX_RADIOS; radio++)
+		if (!test_and_set_bit(radio, nss_wifili_radios_used))
+			break;
+	if (radio >= NSS_WIFI_MAX_RADIOS)
+		return -ENOSPC;
+
+	soc->pdevs[soc->pdevs_seen] = *pdev;
+	soc->radio_idx[soc->pdevs_seen] = radio;
+	soc->pdevs_seen++;
 
 	pr_info("nss-wifi-drv: radio %u rxdma id %u base %#x x%u hw %#x/%#x swdesc %u\n",
 		pdev->radio_id, pdev->rxdma.id, pdev->rxdma.base,
@@ -267,12 +387,26 @@ int nss_wifi_pdev_register(const struct nss_wifi_pdev *pdev)
 		pdev->rxdma.hwreg[1], pdev->num_rx_swdesc);
 
 	/* After a reset of the WLAN driver, which is the last thing it does
-	 * before its interfaces come back.
+	 * before its interfaces come back. Only the internal instance is
+	 * started this round, so only it can be resumed.
 	 */
-	if (nss_wifili_core && nss_wifili_described())
+	if (nss_wifili_core &&
+	    soc->desc.if_num == NSS_INTERFACE_WIFILI &&
+	    nss_wifili_soc_described(soc))
 		nss_core_resume(nss_wifili_core);
 
-	return 0;
+	return radio;
+}
+EXPORT_SYMBOL_GPL(nss_wifi_pdev_register_ex);
+
+int nss_wifi_pdev_register(const struct nss_wifi_pdev *pdev)
+{
+	int radio = nss_wifi_pdev_register_ex(0, pdev);
+
+	/* The old caller tests this as an error; its radios are not indexed
+	 * by this return value.
+	 */
+	return radio < 0 ? radio : 0;
 }
 EXPORT_SYMBOL_GPL(nss_wifi_pdev_register);
 
@@ -287,7 +421,7 @@ bool nss_wifili_reset(struct nss_core *core, bool started)
 
 	guard(mutex)(&nss_wifili_lock);
 
-	soc = nss_wifili_soc_first();
+	soc = nss_wifili_soc_lookup(NSS_INTERFACE_WIFILI);
 	if (!core->wifi_on || core->wifili_started != started ||
 	    (!started && !core->running) ||
 	    !soc || !soc->desc.reset)
@@ -964,7 +1098,7 @@ int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
 	if (!core || !core->wifili_started)
 		return -EAGAIN;
 
-	soc = nss_wifili_soc_first();
+	soc = nss_wifili_soc_lookup(NSS_INTERFACE_WIFILI);
 	if (!soc || radio >= soc->pdevs_seen || soc->radio_if[radio] < 0)
 		return -ENODEV;
 
@@ -1056,7 +1190,7 @@ int nss_wifi_mesh_register(struct net_device *dev, u8 radio, u32 vdev_id,
 	if (!core->mesh_capable)
 		return -EOPNOTSUPP;
 
-	soc = nss_wifili_soc_first();
+	soc = nss_wifili_soc_lookup(NSS_INTERFACE_WIFILI);
 	if (!soc || radio >= soc->pdevs_seen || soc->radio_if[radio] < 0)
 		return -ENODEV;
 
@@ -1327,7 +1461,7 @@ static struct nss_wifili_peer nss_wifili_peer_tbl[NSS_WIFILI_PEER_MAX];
 static int nss_wifili_soc_msg(struct nss_core *core, u32 type,
 			      const void *body, size_t len)
 {
-	struct nss_wifili_soc_state *soc = nss_wifili_soc_first();
+	struct nss_wifili_soc_state *soc = nss_wifili_soc_lookup(NSS_INTERFACE_WIFILI);
 	struct nss_wifili_msg *m;
 	int ret;
 
@@ -1790,7 +1924,7 @@ static void nss_me_mld(int if_num, struct sk_buff *skb)
 bool nss_wifili_rx_80211(u32 if_num, struct net_device *dev,
 			 struct sk_buff *skb, struct napi_struct *napi)
 {
-	struct nss_wifili_soc_state *soc = nss_wifili_soc_first();
+	struct nss_wifili_soc_state *soc = nss_wifili_soc_lookup(NSS_INTERFACE_WIFILI);
 	bool (*rx)(void *priv, struct net_device *dev, struct sk_buff *skb,
 		   struct napi_struct *napi);
 
@@ -2207,7 +2341,7 @@ MODULE_PARM_DESC(mem_profile, "memory profile the firmware sizes its pools from"
 static int nss_wifili_radio_buf_cfg(struct nss_core *core, int if_num,
 				    u32 bufs)
 {
-	struct nss_wifili_soc_state *soc = nss_wifili_soc_first();
+	struct nss_wifili_soc_state *soc = nss_wifili_soc_lookup(NSS_INTERFACE_WIFILI);
 	struct nss_wifili_msg *m __free(kfree) = kzalloc(sizeof(*m), GFP_KERNEL);
 	u32 range;
 	int ret;
@@ -2574,7 +2708,22 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 		return -ENODEV;
 
 	soc = nss_wifili_soc_first();
-	if (!soc || !soc->pdevs_seen) {
+	if (!soc) {
+		seq_puts(s, "no WLAN driver has described its rings\n");
+		return 0;
+	}
+
+	/* Only the internal instance is started this round. An external
+	 * description is kept for the commit that adds per-instance start;
+	 * starting it here would put 215/216 and 61/62 on the internal core
+	 * path before that path knows what to do with them.
+	 */
+	if (soc->desc.if_num != NSS_INTERFACE_WIFILI) {
+		seq_puts(s, "wifili: only the internal instance is started this round\n");
+		return 0;
+	}
+
+	if (!soc->pdevs_seen) {
 		seq_puts(s, "no WLAN driver has described its rings\n");
 		return 0;
 	}
