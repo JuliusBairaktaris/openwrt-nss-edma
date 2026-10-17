@@ -15,14 +15,14 @@ for (const [k, v] of Object.entries(F))
 
 // Dropdown answers the routing rules match on must still be offerable.
 for (const opt of ['qosmio/openwrt-ipq image', 'Official OpenWrt image (no NSS)', 'Another NSS build',
-	'Prebuilt release image (Qualcommax NSS Builder)', 'Self-built from this repo (nss-edma-rework)',
+	'Prebuilt release image (Qualcommax NSS Builder)', 'Self-built from this repo (ppe-nss)',
 	'Yes — and an official OpenWrt image is broken the same way', 'Not tested yet'])
 	assert.ok(form.includes(opt), `bug.yml no longer offers "${opt}"`);
 
 const good = {
 	[F.image]: 'Prebuilt release image (Qualcommax NSS Builder)',
 	[F.gate]: 'No — with the offload off the box is fine',
-	[F.state]: '```text\n{"kernel":"6.18.1",...}\nnss.general.enabled=\'1\'\nNSS offload status: up\n```',
+	[F.state]: '```text\nppe-help 1 report, 2026-10-17 04:00 UTC, sections: system\nboard: Xiaomi AX3600\n```',
 	[F.what]: 'The WAN port stops transmitting after a few hours and never comes back.',
 	[F.steps]: '1. Flash the release image\n2. Enable SQM on wan\n3. Run iperf3 -c host -R for an hour',
 	[F.expected]: 'Traffic keeps flowing.',
@@ -36,7 +36,7 @@ const body = (over = {}) => Object.entries({ ...good, ...over })
 // parseForm: sections, fences and unanswered optionals
 const p = parseForm(body({ [F.diffconfig]: '_No response_' }));
 assert.strictEqual(p[F.diffconfig], '');
-assert.ok(p[F.state].startsWith('{"kernel"'), 'code fence not stripped');
+assert.ok(p[F.state].startsWith('ppe-help'), 'code fence not stripped');
 
 assert.strictEqual(triage('not an issue form at all'), null);
 assert.strictEqual(triage(body()).verdict, 'ok', JSON.stringify(triage(body()).comment));
@@ -66,9 +66,8 @@ const incomplete = (over, needle) => {
 };
 
 incomplete({ [F.gate]: 'Not tested yet' }, 'Whose bug this is');
-incomplete({ [F.state]: 'see attached screenshot' }, '`ubus call system board`');
-incomplete({ [F.state]: good[F.state].replace('NSS offload status: up', '') }, '`nss-status -d`');
-incomplete({ [F.image]: 'Self-built from this repo (nss-edma-rework)' }, 'Diffconfig');
+incomplete({ [F.state]: 'see attached screenshot' }, '`ppe-help`');
+incomplete({ [F.image]: 'Self-built from this repo (ppe-nss)' }, 'Diffconfig');
 incomplete({ [F.what]: 'N/A' }, 'What happens');
 incomplete({ [F.steps]: 'browsing the web' }, 'Steps to reproduce');
 incomplete({ [F.regression]: '' }, 'Last image that worked');

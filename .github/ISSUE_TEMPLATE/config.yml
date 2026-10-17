@@ -11,8 +11,8 @@ contact_links:
     url: https://github.com/qosmio/openwrt-ipq/issues
     about: A different NSS build with a different driver stack. Its bugs belong to it.
   - name: Help, configuration and general NSS questions
-    url: https://forum.openwrt.org/t/ipq807x-nss-build/148529
+    url: https://forum.openwrt.org/t/qualcommax-nss-build/148529
     about: The forum thread. Questions answered there stay findable for the next person.
   - name: Documentation and known limitations
-    url: https://github.com/JuliusBairaktaris/openwrt-nss-edma/wiki
+    url: https://github.com/JuliusBairaktaris/openwrt-ppe-nss/wiki
     about: Hardware support, runtime operation, SQM, and what is deliberately not supported.

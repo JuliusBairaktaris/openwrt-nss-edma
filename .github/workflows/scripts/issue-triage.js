@@ -92,19 +92,18 @@ function triage(body) {
 	const junk = (k) => !f[k] || JUNK.test(f[k]);
 
 	if (/not tested yet/i.test(f[F.gate] || ''))
-		ask('**Whose bug this is.** Run `uci set nss.general.enabled=\'0\'; uci commit nss; reboot` ' +
+		ask('**Whose bug this is.** Run `uci set nss-wifi.general.offload=\'0\'; ' +
+			'uci set firewall.@defaults[0].flow_offloading_hw=\'0\'; uci commit; reboot` ' +
 			'and retry. Still broken? Flash the official OpenWrt image for the device and retry once ' +
 			'more. Then pick the answer that matches - that one line decides whether this is fixable here at all.');
 
 	const state = f[F.state] || '';
 	const cmds = [
-		['`ubus call system board`', /"kernel"/],
-		['`uci show nss`', /nss\.general/],
-		['`nss-status -d`', /NSS offload status:/],
+		['`ppe-help`', /ppe-help \S+ report/],
 	].filter(([, m]) => !m.test(state)).map(([c]) => c);
 	if (cmds.length)
 		ask(`**Build and runtime state** is missing the output of ${cmds.join(', ')}. ` +
-			'Paste it whole - the version, the offload state and the port counters are read from it.');
+			'Paste it whole - the image, the offload state and the port counters are read from it.');
 
 	if (/self-built/i.test(f[F.image] || '') && !f[F.diffconfig])
 		ask('**Diffconfig.** A self-built image is only reproducible with the config that built it: ' +

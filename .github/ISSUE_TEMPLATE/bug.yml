@@ -28,11 +28,11 @@ body:
     attributes:
       label: Before filing
       options:
-        - label: I searched the open **and closed** issues and the [wiki](https://github.com/JuliusBairaktaris/openwrt-nss-edma/wiki) — this is neither already reported nor a documented limitation.
+        - label: I searched the open **and closed** issues and the [wiki](https://github.com/JuliusBairaktaris/openwrt-ppe-nss/wiki) — this is neither already reported nor a documented limitation.
           required: true
         - label: I understand that **NSS firmware 11.4 and 802.11s mesh offload are provided as is**. They live in a closed firmware line that cannot be changed here; a bug in them may be diagnosed and still never fixed, and this issue may be closed on that ground.
           required: true
-        - label: This is a bug report, not a configuration or support question (those belong in the [forum thread](https://forum.openwrt.org/t/ipq807x-nss-build/148529)).
+        - label: This is a bug report, not a configuration or support question (those belong in the [forum thread](https://forum.openwrt.org/t/qualcommax-nss-build/148529)).
           required: true
 
   - type: dropdown
@@ -45,7 +45,7 @@ body:
         one per IPQ807x device, rebuilt as this tree moves.
       options:
         - Prebuilt release image (Qualcommax NSS Builder)
-        - Self-built from this repo (nss-edma-rework)
+        - Self-built from this repo (ppe-nss)
         - Self-built with Qualcommax NSS Builder
         - qosmio/openwrt-ipq image
         - Official OpenWrt image (no NSS)
@@ -58,10 +58,11 @@ body:
     attributes:
       label: Does it still happen with the offload off
       description: |
-        `uci set nss.general.enabled='0'; uci commit nss; reboot` leaves the box on the
-        plain EDMA datapath — the same one an official OpenWrt image runs. If it is
-        still broken there, flash the official OpenWrt image for the device and try
-        once more: that answer is what decides whose bug this is.
+        `uci set nss-wifi.general.offload='0'; uci set firewall.@defaults[0].flow_offloading_hw='0'; uci commit; reboot`
+        keeps Wi-Fi on the host and routes wired traffic in software, the same paths an
+        official OpenWrt image runs. If it is still broken there, flash the official
+        OpenWrt image for the device and try once more: that answer decides whose bug
+        this is.
       options:
         - No — with the offload off the box is fine
         - Yes — and an official OpenWrt image is broken the same way
@@ -85,13 +86,11 @@ body:
     attributes:
       label: Build and runtime state
       description: |
-        Paste the output of, over SSH on the affected box:
+        Paste the whole output of `ppe-help`, run over SSH on the affected box. It
+        removes passphrases, PPPoE credentials, public addresses and most of each MAC
+        address; read it before posting. If it is too long, attach the file it saves.
 
-        ```sh
-        ubus call system board; uci show nss; nss-status -d
-        ```
-
-        A screenshot is not usable. If a command is missing, say so instead of dropping it.
+        A screenshot is not usable.
       render: text
     validations:
       required: true
