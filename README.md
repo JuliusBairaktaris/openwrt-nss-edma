@@ -1,52 +1,59 @@
-# OpenWrt with PPE and NSS hardware offload for IPQ807x and IPQ60xx
+# OpenWrt with PPE and NSS offload for IPQ807x and IPQ60xx
 
-This is OpenWrt main with hardware offload for IPQ807x and IPQ60xx
-(IPQ6018) routers, such as the Xiaomi AX3600, Redmi AX6, Linksys MX4300
-and MR7350, and GL.iNet GL-AX1800. It runs on the upstream `qca_edma` and
-`qca_ppe` ethernet and DSA drivers on kernel 6.18 and uses only in-kernel
-offload interfaces: no ECM, no NSS qdiscs and no vendor NSS host driver.
+OpenWrt main with hardware offload for Qualcomm IPQ807x and IPQ60xx routers
+in the `qualcommax` target, such as the Xiaomi AX3600, Redmi AX6, Linksys
+MX4300 and MR7350, Dynalink DL-WRX36 and GL.iNet GL-AX1800. It runs
+OpenWrt's upstream `qca_edma` and `qca_ppe` ethernet and DSA drivers on
+kernel 6.18 and uses only in-kernel offload interfaces: no ECM, no NSS
+qdiscs and no vendor NSS host driver.
 
-Wired traffic is offloaded by the PPE: routed IPv4/IPv6 and NAT through
-the fw4 flowtable (`flow_offloading_hw`), PPPoE and 802.1Q VLAN,
-bridging and multicast snooping through switchdev, and SQM through tc
-qdisc offload (tbf/ets). The NSS firmware is driven by `nss-wifi-drv`, a
-small host driver that offloads ath11k Wi-Fi flows from the same
-flowtable. The NSS Wi-Fi path is on by default on IPQ807x. IPQ60xx
-radios stay on the host path.
+| Traffic | Engine | Kernel interface |
+|---|---|---|
+| Routed IPv4/IPv6, NAT, PPPoE, 802.1Q VLAN | PPE | fw4 flowtable (`flow_offloading_hw`) |
+| Bridging, VLAN filtering, multicast snooping | PPE | switchdev |
+| SQM shaping and queue classes | PPE | tc qdisc and flower offload, DCB |
+| Wi-Fi data path of the SoC radios | NSS | `nss-wifi-drv`, ath11k |
+| Routed and bridged flows with a Wi-Fi end | NSS | fw4 flowtable, bridge conntrack |
+| Routed multicast to Wi-Fi | NSS | kernel multicast routing (MFC) |
+| Routed flows over a cellular modem (raw-IP device) | NSS | fw4 flowtable |
 
-IPQ60xx support is new and lightly tested. The maintainer has no IPQ60xx
-hardware, so reports from IPQ60xx users are welcome.
+The PPE is the packet engine in the SoC's switch; `qca_ppe` programs it
+without firmware. `nss-wifi-drv` is a small host driver that boots the NSS
+firmware and hands it the ath11k rings. The Wi-Fi offload is on by default
+and is turned off with:
+
+```sh
+uci set nss-wifi.general.offload='0'; uci commit nss-wifi; reboot
+```
+
+The Xiaomi AX3600 is the test board. Other boards are built but not tested
+by the maintainer, and IPQ60xx is not tested at all. Reports are welcome.
 
 ## Images
 
-Prebuilt images for every IPQ807x board, and every IPQ60xx board with an
-NSS node in its device tree, are on the
+Prebuilt sysupgrade images for 41 IPQ807x and 24 IPQ60xx boards are on the
 [Qualcommax_NSS_Builder releases](https://github.com/JuliusBairaktaris/Qualcommax_NSS_Builder/releases)
-page. The `ppe-nss` releases are the default. The `ppe-nss-mesh` releases
-carry the same boards on NSS firmware 11.4, the last line that supports
-802.11s mesh. Mesh is only partly offloaded so far.
+page. Take `ppe-nss-*`, or `ppe-nss-mesh-*` for 802.11s mesh (NSS firmware
+11.4).
 
 ## Documentation
 
 The [wiki](https://github.com/JuliusBairaktaris/openwrt-ppe-nss/wiki)
-covers the offload, SQM, hardware support and known limitations.
+covers installing, each part of the offload, SQM, building, bug reports,
+limitations and a FAQ.
 
 ## Branches
 
 | Branch | Contents |
 |---|---|
 | `ppe-nss` | The default. `ppe-flow-offload` plus the NSS Wi-Fi series. |
-| `ppe-flow-offload` | [openwrt/openwrt](https://github.com/openwrt/openwrt) `main` plus the PPE flowtable, tc and switchdev offload series ([openwrt/openwrt#24806](https://github.com/openwrt/openwrt/pull/24806); its first commits are [#25700](https://github.com/openwrt/openwrt/pull/25700)). No NSS. |
+| `ppe-flow-offload` | [openwrt/openwrt](https://github.com/openwrt/openwrt) `main` plus the PPE flowtable, tc and switchdev offload ([openwrt/openwrt#24806](https://github.com/openwrt/openwrt/pull/24806); its first commits are [#25700](https://github.com/openwrt/openwrt/pull/25700)). No NSS. |
 | `nss-edma-rework` | Archived. The vendor NSS stack (qca-nss-drv, ECM, NSS qdiscs). Final state: tag `archive/nss-edma-rework-final`. |
 
-The NSS Wi-Fi series on `ppe-nss` adds:
-
-1. `qca_edma` and `qca_ppe` changes that let the NSS firmware share the
-   EDMA and PPE with the host driver, and the NSS device tree nodes.
-2. `nss-wifi-drv` and the ath11k patches that hand the data-path rings
-   to the NSS firmware.
-
-The only package taken from the
+The NSS Wi-Fi series on `ppe-nss` adds the NSS device tree nodes, the
+`qca_edma` and `qca_ppe` changes that let the NSS firmware share the EDMA
+and PPE with the host, `nss-wifi-drv`, and the ath11k patches that hand the
+data-path rings to the firmware. The only package taken from the
 [nss-packages](https://github.com/JuliusBairaktaris/nss-packages) feed
 (branch `edma-nss`) is `nss-firmware`.
 
@@ -58,30 +65,23 @@ cd openwrt-ppe-nss
 cp feeds.conf.default feeds.conf
 echo "src-git nss https://github.com/JuliusBairaktaris/nss-packages.git;edma-nss" >> feeds.conf
 ./scripts/feeds update -a && ./scripts/feeds install -a
-# Apply a seed config:
-# Normal Wi-Fi offload:
-cat seeds/qualcommax-nss-wifi.seed >> .config
-# OR Wi-Fi offload + 802.11s mesh (firmware 11.4):
-# cat seeds/qualcommax-nss-wifi-mesh.seed >> .config
-
+cat seeds/qualcommax-nss-wifi.seed >> .config        # or qualcommax-nss-wifi-mesh.seed
 make defconfig
-make -j$(nproc)
+make -j"$(nproc)"
 ```
 
-Seed configurations are provided in [`seeds/`](seeds/):
-- [`qualcommax-nss-wifi.seed`](seeds/qualcommax-nss-wifi.seed): Stock qualcommax (IPQ807x / IPQ60xx) plus `kmod-nss-wifi-drv`, `ATH11K_NSS_WIFI`, and NSS firmware 12.5.
-- [`qualcommax-nss-wifi-mesh.seed`](seeds/qualcommax-nss-wifi-mesh.seed): Wi-Fi offload + 802.11s mesh (`wpad-mesh-openssl`) on NSS firmware 11.4.
+The seeds in [`seeds/`](seeds/) select `kmod-nss-wifi-drv`,
+`ATH11K_NSS_WIFI` and the NSS firmware: 12.5 in `qualcommax-nss-wifi.seed`,
+11.4 with `wpad-mesh-openssl` in `qualcommax-nss-wifi-mesh.seed`.
 
-The `hw_ppe.qos` SQM script and the PPE QoS LuCI page come from feed
-patches in the builder; its
+`hw_ppe.qos` for SQM and the PPE QoS LuCI page come from a feed patch and
+a luci fork in the builder. Its
 [README](https://github.com/JuliusBairaktaris/Qualcommax_NSS_Builder#build-it-yourself)
-has the full steps.
+and the wiki's [Building](https://github.com/JuliusBairaktaris/openwrt-ppe-nss/wiki/Building)
+page build the exact release images.
 
-The image boots with the PPE offload and the NSS Wi-Fi offload on. The
-Wi-Fi offload is chosen before the radios probe and turned off with
-`uci set nss-wifi.general.offload=0; uci commit nss-wifi; reboot`. The
-flag is cleared at boot and set again two minutes after a bring-up that
-succeeds, so a bring-up that hangs the board costs one boot.
+`ppe-nss` is rebased often. Update with
+`git fetch origin && git reset --hard origin/ppe-nss`, not `git pull`.
 
 ## Acknowledgements
 
@@ -99,4 +99,4 @@ succeeds, so a bring-up that hangs the board costs one boot.
 
 ## License
 
-GPL-2.0, see [LICENSE](LICENSE). The NSS firmware keeps its own license.
+GPL-2.0, see [COPYING](COPYING). The NSS firmware keeps its own license.
