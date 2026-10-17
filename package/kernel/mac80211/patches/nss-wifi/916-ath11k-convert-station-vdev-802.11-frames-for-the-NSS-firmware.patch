@@ -1,0 +1,44 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] ath11k: convert station vdev 802.11 frames for the NSS firmware
+
+Frames mac80211 sends as 802.11, which include every EAPOL frame, are
+converted to ethernet before they go to the NSS firmware. The conversion
+takes the receiver's interface type and is always given a station's, and
+ieee80211_data_to_8023() rejects a ToDS frame for a station. On a
+station vdev every such frame is dropped and the 4-way handshake never
+completes. Pass an access point's interface type for a station vdev.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
+index 339fc21..1aa3679 100644
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -6613,11 +6613,12 @@ static void ath11k_mac_op_tx(struct ieee80211_hw *hw,
+ 	 * The conversion is the subsystem's own, and it is written for the
+ 	 * receiving side: it refuses a frame travelling away from the
+ 	 * distribution system on an access point, which is every frame an
+-	 * access point sends. A frame leaving here is bit for bit the frame a
+-	 * station receives, so it is converted as that station would - the
+-	 * address it is told to expect is the frame's own first address,
+-	 * which is what makes the check it performs vacuous rather than
+-	 * wrong.
++	 * access point sends. A frame leaving here is bit for bit the frame
++	 * its receiver gets, so it is converted as the receiver would: as a
++	 * station for an access point's frame, as an access point for a
++	 * station's - the address it is told to expect is the frame's own
++	 * first address, which is what makes the check it performs vacuous
++	 * rather than wrong.
+ 	 */
+ 	/* A mesh device carries 802.11, without the QoS control the
+ 	 * hardware inserts itself.
+@@ -6644,6 +6645,8 @@ static void ath11k_mac_op_tx(struct ieee80211_hw *hw,
+ 
+ 		if (!(info_flags & IEEE80211_TX_CTL_HW_80211_ENCAP) &&
+ 		    ieee80211_data_to_8023(skb, hdr->addr1,
++					   vif->type == NL80211_IFTYPE_STATION ?
++					   NL80211_IFTYPE_AP :
+ 					   NL80211_IFTYPE_STATION)) {
+ 			ieee80211_free_txskb(ar->hw, skb);
+ 			return;
