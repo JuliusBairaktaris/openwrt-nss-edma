@@ -514,9 +514,10 @@ int nss_wifili_vdev_cmd(struct nss_core *core, int if_num, u32 cmd, u32 value);
 
 struct nss_wifi_mesh_ops;
 
-bool nss_mesh_probe(struct nss_core *core);
+bool nss_mesh_probe(struct nss_core *core, u32 if_num);
 int nss_mesh_add(struct nss_core *core, struct net_device *dev, int link,
-		 const u8 *mac, const struct nss_wifi_mesh_ops *ops, void *priv);
+		 const u8 *mac, const struct nss_wifi_mesh_ops *ops, void *priv,
+		 int soc_id);
 int nss_mesh_attach(struct nss_core *core, int link);
 void nss_mesh_stop(struct nss_core *core, int link);
 void nss_mesh_del(struct nss_core *core, int link);
