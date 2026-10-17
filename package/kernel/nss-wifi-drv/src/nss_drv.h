@@ -92,7 +92,15 @@ unsigned int nss_pool_ceiling(void);
 #define NSS_INTERFACE_VAP_BASE	200
 
 #define NSS_INTERFACE_WIFILI	203
+/* The external wifili instances, for radios outside the SoC (QCN9074). */
+#define NSS_INTERFACE_WIFILI_EXTERNAL0	215
+#define NSS_INTERFACE_WIFILI_EXTERNAL1	216
 #define NSS_INTERFACE_MAX	228
+
+/* One internal wifili instance and at most two external ones. */
+#define NSS_WIFI_MAX_SOCS	3
+/* The global radio table these instances share. */
+#define NSS_WIFI_MAX_RADIOS	6
 
 /* Interrupt causes, one GIC line each: there are no mask or status registers
  * on this SoC, so the cause is fixed when the line is claimed.

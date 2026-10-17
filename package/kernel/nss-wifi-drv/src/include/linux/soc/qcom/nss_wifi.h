@@ -113,6 +113,19 @@ struct nss_wifi_soc {
 	 */
 	void (*peer_stats)(void *priv, u16 peer_id,
 			   const struct nss_wifi_peer_stats *st);
+
+	/*
+	 * The wifili instance this description belongs to: 203 with dynamic
+	 * node type 19 for radios inside the SoC, 215/61 and 216/62 for
+	 * external (PCIe) cards. Zero asks for the internal pair, which is
+	 * what a caller that does not know about these fields sends.
+	 *
+	 * Appended rather than inserted so the offsets of the description
+	 * above do not move; the driver and its callers are still built from
+	 * this header together.
+	 */
+	u32 if_num;
+	u32 dyn_type;
 };
 
 /*

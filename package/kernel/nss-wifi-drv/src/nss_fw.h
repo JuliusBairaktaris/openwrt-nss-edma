@@ -54,6 +54,9 @@ enum nss_dynamic_interface_type {
 	NSS_DYNAMIC_INTERFACE_TYPE_PPPOE = 8,
 	NSS_DYNAMIC_INTERFACE_TYPE_VLAN = 17,
 	NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_INTERNAL = 19,
+	/* Radios on a PCIe card use the external wifili instances. */
+	NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL0 = 61,
+	NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL1 = 62,
 	NSS_DYNAMIC_INTERFACE_TYPE_GENERIC_REDIR_N2H = 32,
 	NSS_DYNAMIC_INTERFACE_TYPE_GENERIC_REDIR_H2N = 33,
 	NSS_DYNAMIC_INTERFACE_TYPE_WIFI_MESH_INNER = 70,
@@ -501,8 +504,12 @@ struct nss_ipv6_msg {
 /* The wifili node: the Wi-Fi SoC and its radios. */
 
 #define NSS_WIFILI_INIT_MSG			0
+/* Teardown of one wifili instance: stop, deinit its radios, reset it. */
+#define NSS_WIFILI_SOC_RESET_MSG		1
 #define NSS_WIFILI_PDEV_INIT_MSG		2
+#define NSS_WIFILI_PDEV_DEINIT_MSG		3
 #define NSS_WIFILI_START_MSG			4
+#define NSS_WIFILI_STOP_MSG			5
 #define NSS_WIFILI_PEER_CREATE_MSG		6
 #define NSS_WIFILI_PEER_DELETE_MSG		7
 #define NSS_WIFILI_STATS_MSG			10
@@ -587,6 +594,11 @@ struct nss_wifili_pdev_init_msg {
 	u32 target_pdev_id;
 	u8 scheme_id;
 	u8 reserved[3];
+};
+
+/* Names the radio's own id, not the dynamic node's interface number. */
+struct nss_wifili_pdev_deinit_msg {
+	u32 ifnum;
 };
 
 struct nss_wifili_peer_msg {
