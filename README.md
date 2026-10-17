@@ -45,6 +45,10 @@ The [wiki](https://github.com/JuliusBairaktaris/openwrt-ppe-nss/wiki)
 covers installing, each part of the offload, SQM, building, bug reports,
 limitations and a FAQ.
 
+Coming from an edma-nss image with settings kept? The image does not convert
+the old configuration; follow
+[Migrating from edma-nss](https://github.com/JuliusBairaktaris/openwrt-ppe-nss/wiki/Migrating-from-edma-nss).
+
 ## Branches
 
 | Branch | Contents |
