@@ -36,7 +36,7 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  static void ath11k_dp_htt_htc_tx_complete(struct ath11k_base *ab,
  					  struct sk_buff *skb)
  {
-@@ -869,6 +875,173 @@ done:
+@@ -869,6 +875,177 @@ done:
  }
  EXPORT_SYMBOL(ath11k_dp_service_srng);
  
@@ -109,6 +109,8 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +	u32 reg_base;
 +	int i;
 +
++	ab->nss_soc_id = -1;
++
 +	if (!ath11k_nss_target(ab))
 +		return;
 +
@@ -165,7 +167,8 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +	ath11k_nss_wifi_ring(&soc->reo_exception, ab,
 +			     dp->reo_except_ring.ring_id, reg_base);
 +
-+	if (nss_wifi_soc_register(soc))
++	ab->nss_soc_id = nss_wifi_soc_register_ex(soc);
++	if (ab->nss_soc_id < 0)
 +		ath11k_warn(ab, "NSS firmware would not take the ring description\n");
 +
 +	kfree(soc);
@@ -203,7 +206,8 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +	pdev.num_rx_swdesc = 3 * DP_RXDMA_BUF_RING_SIZE;
 +	pdev.target_pdev_id = ar->pdev->pdev_id;
 +
-+	if (nss_wifi_pdev_register(&pdev))
++	ar->nss_radio_idx = nss_wifi_pdev_register_ex(ab->nss_soc_id, &pdev);
++	if (ar->nss_radio_idx < 0)
 +		ath11k_warn(ab, "NSS firmware would not take radio %d\n", id);
 +}
 +
@@ -234,13 +238,53 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  	}
  
  	return 0;
-@@ -1025,6 +1208,9 @@ void ath11k_dp_free(struct ath11k_base *
+@@ -1025,6 +1208,12 @@ void ath11k_dp_free(struct ath11k_base *
  	struct ath11k_dp *dp = &ab->dp;
  	int i;
  
-+	if (ath11k_nss_target(ab))
++	if (ab->nss_soc_id == 0)
 +		nss_wifi_soc_unregister();
++	else if (ab->nss_soc_id > 0)
++		nss_wifi_soc_unregister_ex(ab->nss_soc_id);
++	ab->nss_soc_id = -1;
 +
  	ath11k_dp_link_desc_cleanup(ab, dp->link_desc_banks,
  				    HAL_WBM_IDLE_LINK, &dp->wbm_idle_ring);
  
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -728,5 +728,7 @@ struct ath11k {
+ 	u8 pdev_idx;
+ 	u8 lmac_id;
++	/* Index in the driver's global radio table, -1 if not registered. */
++	int nss_radio_idx;
+ 
+ 	struct completion peer_assoc_done;
+ 	struct completion peer_delete_done;
+@@ -935,5 +937,7 @@ struct ath11k_base {
+ 	struct completion fw_ready;
+ 	int num_radios;
++	/* Instance id from nss_wifi_soc_register_ex(), -1 if none. */
++	int nss_soc_id;
+ 	/* HW channel counters frequency value in hertz common to all MACs */
+ 	u32 cc_freq_hz;
+ 
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -2880,6 +2880,7 @@ struct ath11k_base *ath11k_core_alloc(struct device *dev, size_t priv_size,
+ 	init_completion(&ab->restart_completed);
+ 
+ 	ab->dev = dev;
++	ab->nss_soc_id = -1;
+ 	ab->hif.bus = bus;
+ 
+ 	return ab;
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -10803,5 +10803,6 @@ int ath11k_mac_allocate(struct ath11k_base *ab)
+ 		ar->pdev_idx = i;
+ 		ar->lmac_id = ath11k_hw_get_mac_from_pdev_id(&ab->hw_params, i);
++		ar->nss_radio_idx = -1;
+ 
+ 		ar->wmi = &ab->wmi_ab.wmi[i];
+ 		/* FIXME wmi[0] is already initialized during attach,
