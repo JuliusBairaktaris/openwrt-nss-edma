@@ -162,6 +162,7 @@ void nss_wifi_soc_unregister(void)
 	 */
 	WRITE_ONCE(nss_wifili_soc.link_desc_return, NULL);
 	WRITE_ONCE(nss_wifili_soc.rx_80211, NULL);
+	WRITE_ONCE(nss_wifili_soc.peer_stats, NULL);
 	if (!nss_wifili_core)
 		return;
 	if (nss_wifili_core->wifili_started)
@@ -274,11 +275,58 @@ void nss_wifili_stats_print(struct seq_file *s)
 		   st.rxwbm_stats.err_src_invalid);
 }
 
+static void nss_wifili_peer_stats(const struct nss_cmn_msg *ncm, u32 len)
+{
+	void (*report)(void *priv, u16 peer_id,
+		       const struct nss_wifi_peer_stats *st);
+	const struct nss_wifili_peer_stats_msg *m;
+	u32 body, n, stride, i;
+	const u8 *p;
+
+	report = READ_ONCE(nss_wifili_soc.peer_stats);
+	body = len - sizeof(*ncm);
+	if (!report || body < sizeof(*m) || ncm->len < sizeof(*m))
+		return;
+
+	/* The length names a message of one peer, whatever the count. */
+	stride = ncm->len - sizeof(*m);
+	if (stride < sizeof(m->wpcs[0]))
+		return;
+
+	m = (const void *)(ncm + 1);
+	n = min_t(u32, m->npeers, (body - sizeof(*m)) / stride);
+
+	for (i = 0, p = (const u8 *)m->wpcs; i < n; i++, p += stride) {
+		const struct nss_wifili_peer_ctrl_stats *c = (const void *)p;
+		struct nss_wifi_peer_stats st = {
+			.tx_packets = c->tx.tx_ucast_cnt + c->tx.tx_mcast_cnt +
+				      c->tx.tx_bcast_cnt,
+			.tx_bytes = c->tx.tx_ucast_bytes + c->tx.tx_mcast_bytes +
+				    c->tx.tx_bcast_bytes,
+			.tx_acked = c->tx.tx_success_cnt,
+			.tx_retries = c->tx.retries,
+			.rx_packets = c->rx.rx_recvd,
+			.rx_bytes = c->rx.rx_recvd_bytes,
+		};
+		int j;
+
+		for (j = 0; j < ARRAY_SIZE(c->tx.drop_stats); j++)
+			st.tx_failed += c->tx.drop_stats[j];
+
+		report(nss_wifili_soc.priv, c->peer_id, &st);
+	}
+}
+
 void nss_wifili_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
 		       u32 len)
 {
 	void (*home)(void *priv, const u32 *buf_addr_info);
 	const struct nss_wifili_msg *m;
+
+	if (ncm->type == NSS_WIFILI_PEER_STATS_MSG) {
+		nss_wifili_peer_stats(ncm, len);
+		return;
+	}
 
 	/* The firmware counts its own receive path, and those counters are the
 	 * only place that separates a radio whose buffers were never filled
