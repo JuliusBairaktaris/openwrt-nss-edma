@@ -41,7 +41,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  		peer->keys[key->keyidx] = key;
  		if (key->flags & IEEE80211_KEY_FLAG_PAIRWISE) {
  			peer->ucast_keyidx = key->keyidx;
-@@ -4660,6 +4666,36 @@ static int ath11k_mac_op_set_key(struct
+@@ -4660,6 +4666,38 @@ static int ath11k_mac_op_set_key(struct
  
  	spin_unlock_bh(&ab->base_lock);
  
@@ -69,9 +69,11 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
 +			nss_wifi_vdev_security(arvif->nss_ifnum, key->cipher);
 +
 +		if (nss_peer_id) {
-+			nss_wifi_peer_security(nss_peer_id, group, key->cipher,
-+					       mic);
-+			nss_wifi_peer_authorize(nss_peer_id);
++			nss_wifi_peer_security_ex(ar->ab->nss_soc_id,
++						  nss_peer_id, group,
++						  key->cipher, mic);
++			nss_wifi_peer_authorize_ex(ar->ab->nss_soc_id,
++						   nss_peer_id);
 +		}
 +	}
 +

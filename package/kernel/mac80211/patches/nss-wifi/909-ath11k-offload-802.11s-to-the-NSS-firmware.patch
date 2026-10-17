@@ -156,35 +156,40 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  static void ath11k_nss_vdev_register(struct ath11k_vif *arvif,
  				     struct ieee80211_vif *vif)
  {
-@@ -6996,13 +7068,20 @@ static void ath11k_nss_vdev_register(str
+@@ -6996,14 +7068,24 @@ static void ath11k_nss_vdev_register(str
  	if (!wdev || !wdev->netdev)
  		return;
  
--	ret = nss_wifi_vdev_register(wdev->netdev, ar->pdev_idx, arvif->vdev_id,
--				     vif->addr,
--				     vif->type == NL80211_IFTYPE_AP,
--				     ath11k_nss_vdev_mode(ar->ab, vif,
--							  IEEE80211_OFFLOAD_ENCAP_ENABLED),
--				     ath11k_nss_vdev_mode(ar->ab, vif,
--							  IEEE80211_OFFLOAD_DECAP_ENABLED));
+-	ret = nss_wifi_vdev_register_ex(ar->ab->nss_soc_id, wdev->netdev,
+-					ar->nss_radio_idx, arvif->vdev_id,
+-					vif->addr,
+-					vif->type == NL80211_IFTYPE_AP,
+-					ath11k_nss_vdev_mode(ar->ab, vif,
+-							     IEEE80211_OFFLOAD_ENCAP_ENABLED),
+-					ath11k_nss_vdev_mode(ar->ab, vif,
+-							     IEEE80211_OFFLOAD_DECAP_ENABLED));
 +	if (vif->type == NL80211_IFTYPE_MESH_POINT)
-+		ret = nss_wifi_mesh_register(wdev->netdev, ar->pdev_idx,
-+					     arvif->vdev_id, vif->addr,
-+					     ath11k_nss_vdev_mode(ar->ab, vif,
-+								  IEEE80211_OFFLOAD_ENCAP_ENABLED),
-+					     &ath11k_nss_mesh_ops, arvif);
++		ret = nss_wifi_mesh_register_ex(ar->ab->nss_soc_id,
++						wdev->netdev,
++						ar->nss_radio_idx,
++						arvif->vdev_id, vif->addr,
++						ath11k_nss_vdev_mode(ar->ab, vif,
++								     IEEE80211_OFFLOAD_ENCAP_ENABLED),
++						&ath11k_nss_mesh_ops, arvif);
 +	else
-+		ret = nss_wifi_vdev_register(wdev->netdev, ar->pdev_idx,
-+					     arvif->vdev_id, vif->addr,
-+					     vif->type == NL80211_IFTYPE_AP,
-+					     ath11k_nss_vdev_mode(ar->ab, vif,
-+								  IEEE80211_OFFLOAD_ENCAP_ENABLED),
-+					     ath11k_nss_vdev_mode(ar->ab, vif,
-+								  IEEE80211_OFFLOAD_DECAP_ENABLED));
++		ret = nss_wifi_vdev_register_ex(ar->ab->nss_soc_id,
++						wdev->netdev,
++						ar->nss_radio_idx,
++						arvif->vdev_id, vif->addr,
++						vif->type == NL80211_IFTYPE_AP,
++						ath11k_nss_vdev_mode(ar->ab, vif,
++								     IEEE80211_OFFLOAD_ENCAP_ENABLED),
++						ath11k_nss_vdev_mode(ar->ab, vif,
++								     IEEE80211_OFFLOAD_DECAP_ENABLED));
  	if (ret < 0) {
  		ath11k_warn(ar->ab, "failed to give vdev %d to the NSS firmware: %d\n",
  			    arvif->vdev_id, ret);
-@@ -10127,6 +10206,7 @@ static int ath11k_mac_op_sta_state(struc
+@@ -10127,6 +10206,7 @@ static int ath11k_mac_op_sta_state(struct
  	enum ieee80211_ap_reg_power power_type;
  	struct cur_regulatory_info *reg_info;
  	struct ath11k_peer *peer;
@@ -192,7 +197,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  	int ret = 0;
  
  	/* cancel must be done outside the mutex to avoid deadlock */
-@@ -10195,9 +10275,17 @@ static int ath11k_mac_op_sta_state(struc
+@@ -10195,9 +10275,18 @@ static int ath11k_mac_op_sta_state(struct
  		peer = ath11k_peer_find(ar->ab, arvif->vdev_id, sta->addr);
  		if (peer)
  			peer->is_authorized = true;
@@ -205,7 +210,8 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
 +		 */
 +		if (ar->ab->nss_offload && peer_id &&
 +		    vif->type == NL80211_IFTYPE_MESH_POINT)
-+			nss_wifi_peer_authorize(peer_id);
++			nss_wifi_peer_authorize_ex(ar->ab->nss_soc_id,
++						   peer_id);
 +
  		if (vif->type == NL80211_IFTYPE_STATION && arvif->is_up) {
  			ret = ath11k_wmi_set_peer_param(ar, sta->addr,
