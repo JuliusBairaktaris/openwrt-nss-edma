@@ -59,6 +59,25 @@ void *nss_mem_alloc(struct nss_core *core, size_t size, u32 align,
 	return cpu;
 }
 
+/* Return one block before the core halts.  The list node has to come out with
+ * the memory, or nss_mem_free_all() frees it a second time.
+ */
+void nss_mem_free(struct nss_core *core, void *cpu)
+{
+	struct nss_alloc *a, *tmp;
+
+	list_for_each_entry_safe(a, tmp, &core->allocs, node) {
+		if (a->cpu != cpu)
+			continue;
+
+		dma_free_coherent(core->dev, a->size, a->cpu, a->dma);
+		list_del(&a->node);
+		kfree(a);
+
+		return;
+	}
+}
+
 void nss_mem_free_all(struct nss_core *core)
 {
 	struct nss_alloc *a, *tmp;

@@ -754,6 +754,7 @@ struct nss_wifili_msg {
 	union {
 		struct nss_wifili_init_msg init;
 		struct nss_wifili_pdev_init_msg pdevmsg;
+		struct nss_wifili_pdev_deinit_msg pdevdeinit;
 		struct nss_wifili_stats_sync_msg wlsoc_stats;
 		struct nss_wifili_stats_cfg_msg scm;
 		struct nss_wifili_radio_cfg_msg radiocfgmsg;
