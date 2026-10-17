@@ -3514,11 +3514,35 @@ static void ppe_rss_hash_init(struct qca_ppe_priv *priv)
  * download when the rule is on the uplink, and nothing else. A bridged
  * transfer to a Wi-Fi client crosses this port unmarked and is not held.
  */
+/* The CPU port's bands as ppe_qm_init() writes them: priorities 0-3, 4-7 and
+ * 8 up to its first three queues.
+ */
+static void ppe_cpu_pri_map_set(struct qca_ppe_priv *priv)
+{
+	int pri;
+
+	for (pri = 0; pri < 16; pri++) {
+		u32 cls = FIELD_PREP(PPE_QM_PRI_CLASS,
+				     min(pri / PPE_FLOW_SPREAD_QUEUES, 2));
+
+		/* Profiles 0 and 15 both resolve to the CPU port. */
+		regmap_write(priv->regmap, PPE_QM_UCAST_PRI_MAP(pri), cls);
+		regmap_write(priv->regmap, PPE_QM_UCAST_PRI_MAP(15 * 16 + pri),
+			     cls);
+	}
+}
+
 static int ppe_cpu_port_dl_set(struct qca_ppe_priv *priv, u64 rate_bps)
 {
 	struct ppe_port_shaper *sh = &priv->shaper[QCA_PPE_CPU_PORT];
 	u32 depth = div_u64(rate_bps * 10, BITS_PER_BYTE * 1000);
 	int ret;
+
+	/* The NSS firmware writes its own priority map for this port when it
+	 * boots, which puts the mark and the small-frame priority in one
+	 * queue. The band split is put back before the band is shaped.
+	 */
+	ppe_cpu_pri_map_set(priv);
 
 	/* A user port's queue depth comes from its tbf limit. Nothing can put a
 	 * tbf on this port, so the depth is the driver's to choose, and it is
