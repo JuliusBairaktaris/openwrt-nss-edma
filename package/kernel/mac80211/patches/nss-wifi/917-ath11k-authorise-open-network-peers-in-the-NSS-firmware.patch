@@ -1,0 +1,31 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] ath11k: authorise open-network peers in the NSS firmware
+
+The NSS firmware drops the frames of a peer it has not been told is
+authorised, and it is told when a key is installed or, for a mesh peer,
+when the station is authorised. A peer on an open access point or
+station vdev installs no key. Authorise every peer in the firmware when
+mac80211 authorises the station.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
+index 1aa3679..c4f0346 100644
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -10281,11 +10281,10 @@ static int ath11k_mac_op_sta_state(struct ieee80211_hw *hw,
+ 
+ 		spin_unlock_bh(&ar->ab->base_lock);
+ 
+-		/* An open mesh installs no key, which is where the firmware
+-		 * is otherwise told a peer may pass frames.
++		/* An open network installs no key, which is where the
++		 * firmware is otherwise told a peer may pass frames.
+ 		 */
+-		if (ar->ab->nss_offload && peer_id &&
+-		    vif->type == NL80211_IFTYPE_MESH_POINT)
++		if (ar->ab->nss_offload && peer_id)
+ 			nss_wifi_peer_authorize(peer_id);
+ 
+ 		if (vif->type == NL80211_IFTYPE_STATION && arvif->is_up) {
