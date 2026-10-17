@@ -1,0 +1,683 @@
+#!/bin/sh
+# ppe-help: one paste-ready diagnostic report for the PPE and NSS offload.
+# Reads state only: nothing here writes uci, sysfs, debugfs or a register.
+
+VERSION=1
+
+usage() {
+	cat <<EOF
+Usage: ppe-help [section...] [option...]
+
+Collects a diagnostic report, prints it and saves it to /tmp/ppe-help-<time>.txt.
+Without a section every section is collected.
+
+Sections:
+  -system    board, image, kernel, memory, crash records, filtered dmesg/logread
+  -ethernet  DSA ports, link state, EDMA conduit, PPE tables and counters
+  -switch    external switch (qca8k on RT-AX89X), 10G and SFP ports
+  -offload   firewall flow offload, nft flowtable, conntrack, PPE flow counters
+  -nss       NSS core, nss-wifi-drv and firmware state
+  -wifi      radios, stations, ath11k state, wireless config
+  -sqm       qdisc tree (offloaded and software), SQM and ppe-qos config
+  -wan       WAN interfaces, PPPoE, cellular
+
+Options:
+  -nossid    also hide SSIDs and mesh IDs
+  -h         this help
+
+Keys, passwords, PPPoE credentials and public IP addresses are removed and
+MAC addresses shortened automatically. Read the report before posting it.
+EOF
+}
+
+SECTIONS=
+HIDE_SSID=0
+for a in "$@"; do
+	a=${a#-}
+	a=${a#-}
+	case "$a" in
+	h|help) usage; exit 0 ;;
+	nossid|hide-ssid) HIDE_SSID=1 ;;
+	all) SECTIONS= ;;
+	system|ethernet|switch|offload|nss|wifi|sqm|wan)
+		SECTIONS="$SECTIONS $a" ;;
+	eth) SECTIONS="$SECTIONS ethernet" ;;
+	*) echo "ppe-help: unknown argument '$a'" >&2; usage >&2; exit 1 ;;
+	esac
+done
+[ -n "$SECTIONS" ] || SECTIONS="system ethernet switch offload nss wifi sqm wan"
+
+OUT=/tmp/ppe-help-$(date +%Y%m%d-%H%M%S).txt
+UPTIME=$(cut -d. -f1 /proc/uptime)
+
+has() { command -v "$1" >/dev/null 2>&1; }
+sec() { printf '\n==================== %s ====================\n' "$1"; }
+hint() { echo "hint: $*"; }
+
+# Prints the command line and its output; a missing tool is reported once.
+run() {
+	printf '\n$ %s\n' "$1"
+	has "${1%% *}" || { echo "(${1%% *} not installed)"; return; }
+	eval "$1" 2>&1
+}
+
+# show FILE [LINES]: a file, whole or its first LINES lines.
+show() {
+	printf '\n# %s\n' "$1"
+	[ -r "$1" ] || { echo "(not present)"; return; }
+	if [ -n "$2" ]; then
+		head -n "$2" "$1" 2>&1
+		[ "$(wc -l < "$1")" -gt "$2" ] 2>/dev/null &&
+			echo "... ($(wc -l < "$1") lines)"
+	else
+		cat "$1" 2>&1
+	fi
+}
+
+nonzero() { awk 'NF >= 2 && $NF != "0" && $NF != "0:"'; }
+
+# Table rows whose counters are all zero carry nothing; headers stay.
+nzrows() {
+	awk '$1 !~ /^[0-9]+$/ { print; next }
+	     { for (i = 2; i <= NF; i++) if ($i ~ /^[0-9]+$/ && $i != 0) { print; next } }'
+}
+
+# Per-peer churn the NSS driver logs on every Wi-Fi (re)association.
+CHURN='peer [0-9a-fx:]+: id [0-9]+ (released|ast_idx)|protects frames with'
+
+rd() { cat "$1" 2>/dev/null; }
+
+# DSA conduits carry a tagging protocol; their user ports have a lower link
+# to them and a switch port name. Nothing about the port set is assumed.
+dsa_conduits() {
+	for d in /sys/class/net/*; do
+		[ -e "$d/dsa/tagging" ] && echo "${d##*/}"
+	done
+}
+
+dsa_ports() {
+	for d in /sys/class/net/*; do
+		[ -e "$d/lower_$1" ] || continue
+		[ -n "$(rd "$d/phys_port_name")" ] && echo "${d##*/}"
+	done
+}
+
+all_ports() {
+	for c in $(dsa_conduits); do dsa_ports "$c"; done
+}
+
+# A conduit that is itself a switch port feeds a second, cascaded switch.
+ext_conduits() {
+	for c in $(dsa_conduits); do
+		[ -n "$(rd "/sys/class/net/$c/phys_port_name")" ] && echo "$c"
+	done
+}
+
+phy_mode() { rd "/sys/class/net/$1/of_node/phy-mode" | tr -d '\0'; }
+
+ppe_dir() {
+	for d in /sys/kernel/debug/*; do
+		[ -r "$d/offload" ] && [ -r "$d/drop_code" ] && { echo "$d"; return; }
+	done
+}
+
+uci_get() { uci -q get "$1" 2>/dev/null; }
+
+# Removes secrets and public addresses, and shortens MAC addresses and the
+# link-local addresses derived from them.
+redact() {
+	k='key|key[1-4]|psk|password|passwd|sae_password|wpa_passphrase|wpa_psk'
+	k="$k|auth_secret|acct_secret|dae_secret|secret|private_key|public_key"
+	k="$k|preshared_key|priv_key|username|pin|token|api_key|apikey|duid"
+	k="$k|dhcp_default_duid|clientid|serial"
+	s='ssid|mesh_id'
+	[ "$HIDE_SSID" = 1 ] && k="$k|$s"
+	sed -E \
+		-e "s/^([^= ]*\.($k))=.*/\1='<redacted>'/" \
+		-e "s/^([[:space:]]*(option|list)[[:space:]]+($k))[[:space:]].*/\1 '<redacted>'/" \
+		-e "s/(\"($k)\"[[:space:]]*:[[:space:]]*)\"[^\"]*\"/\1\"<redacted>\"/g" \
+		-e "s/^($k)=.*/\1=<redacted>/" |
+	if [ "$HIDE_SSID" = 1 ]; then
+		sed -E -e 's/(ESSID: ).*/\1"<redacted>"/' \
+			-e 's/^([[:space:]]*ssid )[^ ].*/\1<redacted>/' \
+			-e 's/(Mesh ID: |MESH ID ).*/\1<redacted>/'
+	else
+		cat
+	fi |
+	awk '
+	function private4(a, b) {
+		return a == 10 || a == 127 || a == 0 || a >= 224 ||
+		       (a == 172 && b >= 16 && b <= 31) ||
+		       (a == 192 && b == 168) || (a == 169 && b == 254) ||
+		       (a == 100 && b >= 64 && b <= 127)
+	}
+	# Replaces each match of re in line through fix(), skipping a match
+	# glued to a longer token on its left.
+	function subst(line, re, kind,    out, pre, m, p, n) {
+		out = ""
+		while (match(line, re)) {
+			pre = substr(line, 1, RSTART - 1)
+			m = substr(line, RSTART, RLENGTH)
+			line = substr(line, RSTART + RLENGTH)
+			p = substr(pre, length(pre), 1)
+			n = substr(line, 1, 2)
+			if (kind == "v4" && (p ~ /[0-9.]/ || n ~ /^\.[0-9]/ || n ~ /^[0-9]/)) {
+				out = out pre m
+				continue
+			}
+			if (kind != "v4" && p ~ /[0-9a-fA-F:]/) {
+				out = out pre m
+				continue
+			}
+			out = out pre fix(m, kind)
+		}
+		return out line
+	}
+	function fix(m, kind,    f, c) {
+		if (kind == "mac") {
+			c = split(m, f, ":")
+			return f[1] ":" f[2] ":" f[3] ":xx:xx:" f[6]
+		}
+		if (kind == "v4") {
+			split(m, f, ".")
+			if (private4(f[1] + 0, f[2] + 0))
+				return m
+			return "x.x.x." f[4]
+		}
+		c = split(m, f, ":")
+		if (kind == "ll")
+			return "fe80::x:" f[c]
+		return f[1] ":x:x::" (c > 2 ? f[c] : "")
+	}
+	{
+		l = subst($0, "[0-9a-fA-F][0-9a-fA-F](:[0-9a-fA-F][0-9a-fA-F]){5}", "mac")
+		l = subst(l, "[fF][eE]80::[0-9a-fA-F:]*[0-9a-fA-F]", "ll")
+		l = subst(l, "[23][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F:]*", "v6")
+		l = subst(l, "[0-9][0-9]?[0-9]?\\.[0-9][0-9]?[0-9]?\\.[0-9][0-9]?[0-9]?\\.[0-9][0-9]?[0-9]?", "v4")
+		print l
+	}'
+}
+
+s_system() {
+	sec system
+	run "ubus call system board"
+	[ -s /etc/board.json ] ||
+		hint "/etc/board.json is missing or empty (seen after a power cut); netifd then builds no switch ports and Wi-Fi fails with a misleading error. Restore it: rm /etc/board.json; /bin/board_detect; reboot"
+	show /etc/openwrt_release
+	run "uname -a"
+	printf '\nuptime %ss, load %s\n' "$UPTIME" "$(cut -d' ' -f1-3 /proc/loadavg)"
+	for f in machine soc_id revision; do
+		printf 'soc %s: %s\n' "$f" "$(rd /sys/devices/soc0/$f)"
+	done
+	show /proc/cmdline
+	printf '\n# /proc/meminfo\n'
+	grep -E '^(MemTotal|MemFree|MemAvailable|Buffers|Cached|Slab|SReclaimable|SUnreclaim|KernelStack|PageTables|CmaTotal|CmaFree|SwapTotal|SwapFree):' /proc/meminfo
+	avail=$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo)
+	[ "${avail:-0}" -lt 61440 ] &&
+		hint "MemAvailable is below 60 MB; include this report and say which services you added"
+	run "df -h / /overlay /tmp"
+	ov=$(df /overlay 2>/dev/null | awk 'NR == 2 { sub("%", "", $5); print $5 }')
+	[ "${ov:-0}" -ge 90 ] && hint "/overlay is ${ov}% full; uci commits and logs fail silently on a full overlay"
+	printf '\n# temperatures (milli-degC)\n'
+	for h in /sys/class/hwmon/hwmon*; do
+		[ -r "$h/temp1_input" ] && printf '%s %s\n' "$(rd "$h/name")" "$(rd "$h/temp1_input")"
+	done
+	printf '\n# cpu frequency (kHz)\n'
+	for c in /sys/devices/system/cpu/cpu[0-9]*/cpufreq; do
+		[ -r "$c/scaling_cur_freq" ] && printf '%s %s %s\n' "${c%/cpufreq}" "$(rd "$c/scaling_cur_freq")" "$(rd "$c/scaling_governor")"
+	done | sed 's,/sys/devices/system/cpu/,,'
+	printf '\n# packages\n'
+	if has apk; then
+		apk list -I 2>/dev/null | grep -E '^(kmod-nss|nss-|ath11k-firmware|kmod-ath1|wpad|hostapd|sqm-scripts|ppe-|luci-app-(sqm|ppe)|kmod-qca|kmod-phy|kmod-sfp|mwan3|kmod-usb-net|umbim|uqmi|modemmanager|kmod-mhi|irqbalance|firewall4|ethtool|tc-|kmod-sched-cake|ppe-help)' |
+			cut -d' ' -f1
+	elif has opkg; then
+		opkg list-installed | grep -E '^(kmod-nss|nss-|ath11k-firmware|wpad|sqm|ppe-|mwan3|firewall4|irqbalance)'
+	fi
+	if has fw_printenv; then
+		printf '\n$ fw_printenv (boot partition only)\n'
+		fw_printenv 2>/dev/null | grep -iE '^(boot_part|flag_|bootcount|upgrade_available|active|altboot)' | head -n 10
+	fi
+	[ -e /etc/config/nss ] || [ -e /etc/config/ecm ] &&
+		hint "/etc/config/nss or /etc/config/ecm is left over from the archived nss-edma image; reset to defaults or remove the old NSS sections (they also turned flow offload off)"
+
+	printf '\n# crash records\n'
+	ls -l /sys/fs/pstore 2>/dev/null
+	if [ -d /root/pstore ]; then
+		newest=$(ls -dt /root/pstore/*/ 2>/dev/null | head -n 1)
+		echo "boot_id now: $(cut -c1-8 /proc/sys/kernel/random/boot_id)"
+		ls -dt /root/pstore/*/ 2>/dev/null | head -n 5
+		if [ -n "$newest" ]; then
+			ls -l "$newest"
+			for f in "$newest"dmesg-ramoops-*; do
+				[ -r "$f" ] || continue
+				hint "a kernel panic was recorded in $f; attach that whole file and $(ls "$newest"console-ramoops-* 2>/dev/null | head -n 1)"
+				printf '\n# %s (last 80 lines)\n' "$f"
+				tail -n 80 "$f"
+				break
+			done
+		fi
+	fi
+
+	printf '\n$ dmesg (filtered, last 120)\n'
+	dmesg | grep -iE 'qca_ppe|qca-ppe|qca_edma|qca-edma|ppe|edma|nss|ath1[01]k|wcss|q6v5|qca8k|qca8[03]|aqr|aquantia|sfp|uniphy|pcs|usxgmii|link is|link up|link down|rmnet|qmi|mhi|warn|bug|oops|call trace|cut here|panic|trap|refcount|unable to handle|soft lockup|hung task|rcu.*stall|out of memory|oom|own address as source|deferred|failed|error|timed out' |
+		grep -vE "$CHURN" | tail -n 120
+	cnt=$(dmesg | grep -cE 'cut here|Oops|BUG:|Internal error|Unable to handle kernel')
+	echo "warnings/oopses this boot: $cnt"
+	[ "$cnt" -gt 0 ] && hint "the kernel logged $cnt warning or oops traces this boot; the full trace is in dmesg above or in logread"
+	dmesg | grep -q 'own address as source address' &&
+		hint "a bridge received its own source address: a cable loop or two bridged ports on the same segment"
+	dmesg | grep -qE 'refused: 5$' &&
+		hint "'refused: 5' messages come from an old image; update to the current release"
+	if has logread; then
+		printf '\n$ logread (filtered, last 80)\n'
+		logread 2>/dev/null | grep -iE 'kern\.(warn|err|crit|alert|emerg)|netifd|pppd|nss|ppe|sqm|fw4|firewall|hostapd|wpa_supplicant|odhcp|procd|ath1[01]k|modem|qmi|mbim|rmnet|mwan|igmp|daemon\.(err|crit|warn)' |
+			grep -vE 'dnsmasq\[[0-9]+\]: (query|reply|forwarded|cached|config)|DHCP(ACK|REQUEST|OFFER|DISCOVER)|hostapd' |
+			grep -vE "$CHURN" | tail -n 80
+	fi
+}
+
+port_line() {
+	d=/sys/class/net/$1
+	printf '%-12s %-4s conduit=%s oper=%s carrier=%s speed=%s duplex=%s mtu=%s master=%s flaps=%s mode=%s\n' \
+		"$1" "$(rd $d/phys_port_name)" "$2" "$(rd $d/operstate)" "$(rd $d/carrier)" \
+		"$(rd $d/speed)" "$(rd $d/duplex)" "$(rd $d/mtu)" \
+		"$(basename "$(readlink $d/master 2>/dev/null)" 2>/dev/null)" \
+		"$(rd $d/carrier_changes)" "$(phy_mode "$1")"
+}
+
+port_detail() {
+	p=$1
+	printf '\n--- %s\n' "$p"
+	if has ethtool; then
+		partner=$(ethtool "$p" 2>/dev/null | awk '
+			/Link partner advertised link modes/ { on = 1; sub(/.*modes:/, "") }
+			on && /:/ && !/modes:/ { on = 0 }
+			on { for (i = 1; i <= NF; i++) m = m " " $i }
+			END { print m }')
+		ethtool "$p" 2>&1 | grep -E 'Speed|Duplex|Auto-negotiation:|Link detected|Port:|PHYAD'
+		echo "partner modes:${partner:- none}"
+		ethtool --show-eee "$p" 2>/dev/null | grep -E 'EEE status'
+		echo "pause $(ethtool -a "$p" 2>/dev/null | grep -E 'RX:|TX:' | tr -s '\t\n' '  ')"
+		echo "ethtool -S (packets, errors, drops):"
+		ethtool -S "$p" 2>/dev/null | grep -E '^ *(rx|tx)_(packets|bytes):|err|drop|fcs|crc|align|collision|pause|runt|frag|jabber|oversize|undersize|too_long|overflow|discard|fail' |
+			grep -v 'tx_queue' | nonzero
+	fi
+	sp=$(rd /sys/class/net/$p/speed)
+	if [ "$(rd /sys/class/net/$p/carrier)" = 1 ] && [ "${sp:-0}" -gt 0 ] && [ "$sp" -lt 1000 ]; then
+		case "$partner" in
+		*1000baseT/Full*|*2500base*|*10000base*)
+			hint "$p linked at $sp Mb/s although both ends support gigabit: check the cable (a broken pair falls back to 100)" ;;
+		esac
+	fi
+	mtu=$(rd /sys/class/net/$p/mtu)
+	[ "${mtu:-1500}" -gt 1500 ] && hint "$p has MTU $mtu; jumbo frames are not offloaded and take the host path"
+}
+
+s_ethernet() {
+	sec ethernet
+	printf '\n# DSA topology\n'
+	for c in $(dsa_conduits); do
+		echo "conduit $c tagging=$(rd /sys/class/net/$c/dsa/tagging) oper=$(rd /sys/class/net/$c/operstate) mtu=$(rd /sys/class/net/$c/mtu)"
+		for p in $(dsa_ports "$c"); do port_line "$p" "$c"; done
+	done
+	[ -z "$(dsa_conduits)" ] && hint "no DSA switch found: the qca_ppe switch did not probe (see dmesg above)"
+	for c in $(dsa_conduits); do
+		for p in $(dsa_ports "$c"); do port_detail "$p"; done
+	done
+
+	for c in $(dsa_conduits); do
+		[ -n "$(rd /sys/class/net/$c/phys_port_name)" ] && continue
+		printf '\n--- conduit %s\n' "$c"
+		run "ethtool -i $c | grep -E 'driver|version|bus-info'"
+		printf '\nethtool -S %s (non-zero):\n' "$c"
+		ethtool -S "$c" 2>/dev/null | nonzero
+		run "ethtool -k $c | grep -E '^(rx-checksumming|tx-checksumming|scatter-gather|tcp-segmentation-offload|generic-receive-offload|receive-hashing|rx-gro-list|hw-tc-offload):'"
+		run "ethtool -l $c | sed -n '/Current/,\$p' | grep -v n/a"
+		run "ethtool -g $c | sed -n '/Current/,\$p' | grep -E '^(RX|TX):'"
+		run "ethtool -c $c | grep -E '^(rx|tx)-(usecs|frames):'"
+		printf '\n# rps\n'
+		for q in /sys/class/net/$c/queues/rx-*; do
+			echo "${q##*/} rps_cpus=$(rd $q/rps_cpus)"
+		done
+		echo "rps_default_mask=$(rd /proc/sys/net/core/rps_default_mask)"
+	done
+	printf '\n# EDMA interrupts\n'
+	grep -E 'edma|ppe' /proc/interrupts
+	ps=$(uci_get network.@globals[0].packet_steering)
+	echo "packet_steering=${ps:-unset (1)}"
+	[ "$ps" = 0 ] && hint "packet_steering is 0; host-path traffic then stays on one CPU (about 20% less throughput into Wi-Fi). Set it to 1"
+
+	if has devlink; then
+		run "devlink dev"
+		run "devlink port"
+		run "devlink dev param show"
+		run "devlink resource show $(devlink dev 2>/dev/null | grep -m1 ppe)"
+		printf '\n$ devlink -s trap show (traps that counted)\n'
+		devlink -s trap show 2>/dev/null | awk '$1 == "name" { n = $2 " " $3 " " $4 " " $7 " " $8 }
+			$3 == "packets" && $4 != 0 { print n ": packets " $4 " dropped " $6 }' | head -n 40
+	fi
+
+	d=$(ppe_dir)
+	if [ -n "$d" ]; then
+		for f in drop_code queue_drops bm l3_interface ingress egress policer acl queues; do
+			printf '\n# %s (non-zero rows)\n' "$d/$f"
+			nzrows < "$d/$f"
+		done
+	else
+		echo "(no PPE debugfs)"
+	fi
+	printf '\n# port clocks\n'
+	awk '$1 ~ /^gcc_(nss|uniphy[0-9])_port[0-9]_(rx|tx)_clk$/ { printf "%s on=%s rate=%s\n", $1, $2, $5 }' \
+		/sys/kernel/debug/clk/clk_summary 2>/dev/null
+
+	for b in /sys/class/net/*/bridge; do
+		[ -d "$b" ] || continue
+		br=${b%/bridge}; br=${br##*/}
+		printf '\n# bridge %s vlan_filtering=%s mcast_snooping=%s ports: %s\n' "$br" \
+			"$(rd $b/vlan_filtering)" "$(rd $b/multicast_snooping)" \
+			"$(ls /sys/class/net/$br/brif 2>/dev/null | tr '\n' ' ')"
+	done
+	has bridge && run "bridge -d vlan show"
+	show /proc/net/vlan/config
+	[ -n "$(all_ports)" ] && run "ethtool -d $(all_ports | head -n 1) | head -n 20"
+}
+
+s_switch() {
+	sec switch
+	ext=$(ext_conduits)
+	if [ -z "$ext" ]; then
+		echo "no cascaded switch on this board"
+	fi
+	for c in $ext; do
+		printf '\n# switch behind %s, tagging %s\n' "$c" "$(rd /sys/class/net/$c/dsa/tagging)"
+		port_line "$c" "-"
+		for p in $(dsa_ports "$c"); do port_line "$p" "$c"; done
+		has ip && run "ip -d link show $c | head -n 4"
+		for p in $(dsa_ports "$c"); do port_detail "$p"; done
+		printf '\n# 802.1Q uppers of %s and its ports\n' "$c"
+		for p in $c $(dsa_ports "$c"); do
+			ls -d /sys/class/net/$p/upper_* 2>/dev/null | sed 's,.*/upper_,,' | sed "s,^,$p -> ,"
+		done
+		printf '\n$ dmesg | grep qca8k\n'
+		dmesg | grep -iE 'qca8k|qca8337|8021q' | tail -n 40
+	done
+
+	# Multi-gigabit and SFP ports, wherever they hang.
+	for p in $(all_ports); do
+		m=$(phy_mode "$p")
+		case "$m" in
+		usxgmii|10gbase-r|10gbase-kr|2500base-x|5gbase-r|10g-qxgmii|xgmii) ;;
+		*) [ -e "/sys/class/net/$p/of_node/sfp" ] || continue ;;
+		esac
+		printf '\n# %s (%s)\n' "$p" "$m"
+		if [ -e "/sys/class/net/$p/of_node/sfp" ]; then
+			has ethtool && ethtool -m "$p" 2>&1 | grep -E 'Identifier|Connector|Transceiver type|Vendor name|Vendor PN|Length|Laser wavelength|BR, Nominal|Module temperature|Laser bias|output power|input power|Cannot|Operation' | head -n 16
+		fi
+		ethtool "$p" 2>/dev/null | grep -E 'Speed|Duplex|Link detected|Auto-negotiation|partner advertised'
+		printf '$ dmesg | grep %s\n' "$p"
+		dmesg | grep -E "$p|aqr|Aquantia|sfp" | tail -n 25
+	done
+	printf '\n# PHY temperatures (milli-degC)\n'
+	for h in /sys/class/hwmon/hwmon*; do
+		case "$(rd $h/name)" in
+		*aqr*|*aquantia*|*sfp*|*phy*) printf '%s %s\n' "$(rd $h/name)" "$(rd $h/temp1_input)" ;;
+		esac
+	done
+}
+
+s_offload() {
+	sec offload
+	if has uci; then
+		printf '\n$ uci show firewall (defaults and zones)\n'
+		uci -q show firewall | awk -F'[.=]' 'NF == 3 { keep = ($3 == "defaults" || $3 == "zone") } keep'
+	fi
+	fo=$(uci_get firewall.@defaults[0].flow_offloading)
+	fh=$(uci_get firewall.@defaults[0].flow_offloading_hw)
+	ft=$(nft list flowtables 2>/dev/null)
+	run "nft list flowtables"
+	[ "$fo" = 1 ] ||
+		hint "flow offload is off: uci set firewall.@defaults[0].flow_offloading=1; uci set firewall.@defaults[0].flow_offloading_hw=1; uci commit firewall; fw4 reload. A config kept from an nss-edma image has it off"
+	[ "$fo" = 1 ] && [ "$fh" != 1 ] &&
+		hint "only software flow offload is on: wired flows run on the CPU, not in the PPE. Set firewall.@defaults[0].flow_offloading_hw=1"
+	[ "$fo" = 1 ] && [ -z "$ft" ] && has nft &&
+		hint "flow offload is set in uci but fw4 created no flowtable; run fw4 check and fw4 reload"
+	[ "$fh" = 1 ] && [ -n "$ft" ] && ! echo "$ft" | grep -q 'flags offload' &&
+		hint "the flowtable has no 'flags offload', so it is the software flowtable; check fw4 check for errors"
+	has nft && run "nft list ruleset | grep -n 'flow add'"
+	printf '\n# conntrack\n'
+	echo "count $(rd /proc/sys/net/netfilter/nf_conntrack_count) max $(rd /proc/sys/net/netfilter/nf_conntrack_max)"
+	if [ -r /proc/net/nf_conntrack ]; then
+		echo "offloaded (software) $(grep -c '\[OFFLOAD\]' /proc/net/nf_conntrack) hardware $(grep -c '\[HW_OFFLOAD\]' /proc/net/nf_conntrack) unreplied $(grep -c UNREPLIED /proc/net/nf_conntrack)"
+		printf '\n# first offloaded entries\n'
+		grep -E 'OFFLOAD' /proc/net/nf_conntrack | head -n 12
+	fi
+	d=$(ppe_dir)
+	if [ -n "$d" ]; then
+		show "$d/offload"
+		n=$(awk '$1 == "offloaded" { print $2 }' "$d/offload")
+		[ "${n:-0}" = 0 ] && [ "$fh" = 1 ] && [ "$UPTIME" -gt 600 ] &&
+			hint "the PPE has not offloaded a single flow since boot although hardware offload is on; check that the LAN and WAN ports are listed in the flowtable devices above"
+		tf=$(awk '$1 == "table_full" { print $2 }' "$d/offload")
+		[ "${tf:-0}" -gt 0 ] && hint "the PPE flow table was full $tf times; those flows stay on the CPU"
+		show "$d/flows" 25
+		echo "PPE flow entries: $(($(wc -l < "$d/flows") - 1))"
+	fi
+	printf '\n# sysctl\n'
+	for s in net.ipv4.conf.all.send_redirects net.ipv4.ip_forward net.ipv6.conf.all.forwarding \
+		 net.netfilter.nf_conntrack_tcp_be_liberal net.netfilter.nf_flowtable_tcp_timeout \
+		 net.netfilter.nf_flowtable_udp_timeout; do
+		f=/proc/sys/$(echo "$s" | tr . /)
+		[ -r "$f" ] && echo "$s = $(rd $f)"
+	done
+	for b in /sys/class/net/*/bridge; do
+		[ -d "$b" ] || continue
+		br=${b%/bridge}; br=${br##*/}
+		n=$(ip -4 addr show dev "$br" 2>/dev/null | grep -c 'inet ')
+		r=$(rd /proc/sys/net/ipv4/conf/$br/send_redirects)
+		[ "$n" -gt 1 ] && [ "$r" = 1 ] &&
+			hint "$br carries $n IPv4 subnets and sends ICMP redirects; hosts then talk past the router and those flows are never offloaded. Use separate bridges or set net.ipv4.conf.$br.send_redirects=0"
+	done
+	{ [ -e /etc/config/mwan3 ] || has mwan3; } && [ "$fh" = 1 ] &&
+		hint "mwan3 with hardware flow offload is untested; reproduce without mwan3 before reporting"
+}
+
+s_nss() {
+	sec nss
+	if lsmod 2>/dev/null | grep -q '^nss_wifi_drv'; then
+		echo "nss_wifi_drv loaded"
+	elif find /lib/modules -name 'nss-wifi-drv.ko' 2>/dev/null | grep -q .; then
+		echo "nss-wifi-drv installed, not loaded"
+	else
+		echo "nss-wifi-drv not installed: this image has no NSS Wi-Fi offload"
+	fi
+	printf '\n# firmware\n'
+	for f in /lib/firmware/qca-nss*.bin; do
+		[ -r "$f" ] || continue
+		echo "$f $(grep -ao 'NSS\.FW\.[0-9A-Za-z._-]*' "$f" 2>/dev/null | head -n 1)"
+	done
+	run "uci show nss-wifi"
+	for m in nss_wifi_drv ath11k; do
+		printf '\n# /sys/module/%s/parameters\n' "$m"
+		for p in /sys/module/$m/parameters/*; do
+			[ -r "$p" ] && echo "${p##*/}=$(rd $p)"
+		done
+	done
+	off=$(uci_get nss-wifi.general.offload)
+	core=
+	for d in /sys/kernel/debug/*.nss; do
+		[ -d "$d" ] || continue
+		core=$d
+		printf '\n# core %s boot=%s fw_ports=%s\n' "${d##*/}" "$(rd $d/boot)" "$(rd $d/fw_ports)"
+		# msg_probe, wifili_start and wifili_tx send to the firmware when read.
+		# The rx file also dumps raw message words, which carry addresses.
+		printf '\n# %s/rx (counters)\n' "$d"
+		grep -vE '^(ext|msg) |^ +last:' "$d/rx" 2>/dev/null
+		for f in msgs wifili_rx wifi_me mesh; do show "$d/$f" 60; done
+		show "$d/flows" 60
+		show "$d/mcast" 40
+		printf '\n# %s/log (last 60)\n' "$d"
+		tail -n 60 "$d/log" 2>/dev/null
+	done
+	if [ -e /etc/config/nss-wifi ]; then
+		if [ "$off" != 1 ] && [ "$UPTIME" -lt 150 ] && [ -n "$core" ] && [ "$(rd $core/boot)" = 1 ]; then
+			hint "uptime is ${UPTIME}s: the offload flag is cleared during bring-up and set again 120 s after a successful boot; run ppe-help again in two minutes"
+		elif [ "$off" != 1 ]; then
+			hint "the Wi-Fi offload is off (nss-wifi.general.offload=${off:-unset}). If you did not turn it off, the last bring-up did not survive 2 minutes and disarmed itself; see logread -e nss-wifi"
+		elif [ -z "$core" ] && grep -qsE 'qcom,ipq(8074|6018)-wifi' /proc/device-tree/soc*/wifi@*/compatible; then
+			hint "the offload is on but no NSS core device exists; the device tree has no NSS node or nss-wifi-drv failed to probe"
+		elif [ -n "$core" ] && [ "$(rd $core/boot)" != 1 ]; then
+			hint "the offload is on but the NSS core is not running; see logread -e nss-wifi and dmesg | grep nss-wifi-drv"
+		fi
+	fi
+	if has iw && iw dev 2>/dev/null | grep -q 'type mesh point'; then
+		grep -aqs 'NSS\.FW\.11\.4' /lib/firmware/qca-nss0-retail.bin ||
+			hint "a mesh interface exists but the firmware is not 11.4; mesh is offloaded only on the ppe-nss-mesh images"
+	fi
+	printf '\n# NSS temperatures (milli-degC)\n'
+	for h in /sys/class/hwmon/hwmon*; do
+		case "$(rd $h/name)" in nss*) printf '%s %s\n' "$(rd $h/name)" "$(rd $h/temp1_input)" ;; esac
+	done
+	printf '\n$ dmesg | grep nss-wifi-drv (last 50, %s peer events left out)\n' \
+		"$(dmesg | grep -cE "$CHURN")"
+	dmesg | grep -E 'nss-wifi-drv|\.nss:' | grep -vE "$CHURN" | tail -n 50
+	if has logread; then
+		printf '\n$ logread -e nss-wifi\n'
+		logread -e nss-wifi 2>/dev/null | grep -vE "$CHURN" | tail -n 20
+	fi
+}
+
+s_wifi() {
+	sec wifi
+	run "uci export wireless"
+	for r in $(uci -q show wireless 2>/dev/null | sed -n "s/^wireless\.\([^.]*\)=wifi-device$/\1/p"); do
+		used=0
+		for i in $(uci -q show wireless | sed -n "s/^wireless\.\([^.]*\)\.device='$r'$/\1/p"); do
+			[ "$(uci_get wireless.$i.disabled)" = 1 ] || used=1
+		done
+		[ $used = 1 ] || continue
+		[ "$(uci_get wireless.$r.disabled)" = 1 ] && hint "radio $r has an enabled network but the radio itself is disabled"
+		[ -z "$(uci_get wireless.$r.country)" ] && hint "radio $r has no country set; it then runs the world regulatory domain with reduced channels and power"
+	done
+	run "iwinfo"
+	run "iw dev"
+	run "iw reg get | head -n 12"
+	if has iw; then
+		for i in $(iw dev 2>/dev/null | awk '$1 == "Interface" { print $2 }'); do
+			n=$(iw dev "$i" station dump 2>/dev/null | grep -c '^Station')
+			printf '\n# %s: %s stations\n' "$i" "$n"
+			iw dev "$i" station dump 2>/dev/null |
+				grep -E '^Station|signal:|tx bitrate|rx bitrate|tx retries|tx failed|connected time|inactive time|expected throughput' |
+				head -n 90
+		done
+	fi
+	for d in /sys/kernel/debug/ath11k/*; do
+		[ -r "$d/soc_dp_stats" ] && show "$d/soc_dp_stats"
+	done
+	lsmod 2>/dev/null | grep -q '^ath10k' &&
+		echo "ath10k radio present: it stays on the host path"
+	printf '\n# radio temperatures (milli-degC)\n'
+	for h in /sys/class/hwmon/hwmon*; do
+		case "$(rd $h/name)" in wcss*|ath1*) printf '%s %s\n' "$(rd $h/name)" "$(rd $h/temp1_input)" ;; esac
+	done
+	printf '\n$ dmesg | grep ath11k (last 60)\n'
+	dmesg | grep -iE 'ath1[01]k|wcss|q6v5|fw_version|fw_build' | tail -n 60
+	if has logread; then
+		log=$(logread 2>/dev/null)
+		printf '\n# hostapd events this log\n'
+		for e in AP-STA-CONNECTED AP-STA-DISCONNECTED 'due to inactivity' DFS-CAC-START DFS-RADAR-DETECTED CTRL-EVENT-CHANNEL-SWITCH 'handshake failed' AP-DISABLED; do
+			echo "$e: $(echo "$log" | grep -c "$e")"
+		done
+		[ "$(echo "$log" | grep -c DFS-RADAR-DETECTED)" -gt 0 ] &&
+			hint "radar was detected: the 5 GHz radio left its channel; choose a non-DFS channel if outages line up"
+		printf '\n$ logread | grep hostapd (last 30)\n'
+		echo "$log" | grep -E 'hostapd|wpa_supplicant' | grep -vE 'RADIUS: starting accounting|EAPOL-4WAY-HS-COMPLETED|pairwise key handshake completed' | tail -n 30
+	fi
+}
+
+s_sqm() {
+	sec sqm
+	run "uci show sqm"
+	run "uci show ppe-qos | grep -vE '@(dscp|rule)\['"
+	run "tc -s qdisc show | head -n 100"
+	if has tc; then
+		for i in $(tc qdisc show 2>/dev/null | awk '$2 == "ingress" { print $5 }' | sort -u); do
+			printf '\n$ tc filter show dev %s ingress (%s filters, %s in hardware)\n' "$i" \
+				"$(tc filter show dev "$i" ingress 2>/dev/null | grep -c 'handle')" \
+				"$(tc filter show dev "$i" ingress 2>/dev/null | grep -c 'in_hw')"
+			tc filter show dev "$i" ingress 2>/dev/null | grep -E 'not_in_hw' | head -n 20
+		done
+	fi
+	d=$(ppe_dir)
+	[ -n "$d" ] && show "$d/queue_drops"
+	ifs=
+	for s in $(uci -q show sqm 2>/dev/null | sed -n "s/^sqm\.\([^.]*\)=queue$/\1/p"); do
+		[ "$(uci_get sqm.$s.enabled)" = 1 ] || continue
+		i=$(uci_get sqm.$s.interface)
+		sc=$(uci_get sqm.$s.script)
+		case " $ifs " in
+		*" $i "*) hint "more than one enabled SQM section names $i; only one of them takes effect" ;;
+		esac
+		ifs="$ifs $i"
+		case "$sc" in
+		hw_ppe.qos) ;;
+		nss*.qos) hint "SQM section $s uses $sc from the archived nss-edma image; switch it to hw_ppe.qos" ;;
+		*)
+			hint "SQM section $s shapes $i in software ($sc): every flow through $i then runs on the CPU. hw_ppe.qos shapes in the PPE"
+			tc qdisc show dev "$i" 2>/dev/null | grep -q offloaded &&
+				hint "$i has both an offloaded PPE shaper and the software SQM section $s; keep one"
+			;;
+		esac
+	done
+}
+
+s_wan() {
+	sec wan
+	nets=$(uci -q show firewall 2>/dev/null | awk -F= '/\.name=.wan.$/ { sub(/\.name$/, "", $1); print $1 }' |
+		while read -r z; do uci_get "$z.network"; done)
+	[ -n "$nets" ] || nets=wan
+	echo "WAN zone networks: $nets"
+	run "uci show network | grep -E '\.(proto|device|ifname|ipv6|mtu|peerdns|reqprefix|vid|type|ports|apn|pdptype|service)='"
+	up=0
+	for n in $nets; do
+		st=$(ifstatus "$n" 2>/dev/null) || continue
+		printf '\n$ ifstatus %s\n' "$n"
+		echo "$st" | grep -vE '^[[:space:]]*([][{}],?)?[[:space:]]*$'
+		[ "$(echo "$st" | jsonfilter -e '@.up' 2>/dev/null)" = true ] && up=1
+		dev=$(echo "$st" | jsonfilter -e '@.l3_device' 2>/dev/null)
+		[ -n "$dev" ] && run "ip -s link show $dev"
+	done
+	[ $up = 1 ] || hint "no network of the wan zone ($nets) is up"
+	show /proc/net/pppoe
+	for d in /sys/class/net/*; do
+		n=${d##*/}
+		case "$n" in
+		wwan*|rmnet*|mhi*|usb*|qmimux*) run "ip -d -s link show $n"; [ -r "$d/qmi/raw_ip" ] && echo "raw_ip=$(rd $d/qmi/raw_ip)" ;;
+		esac
+	done
+	ls /dev/cdc-wdm* /dev/wwan* /dev/ttyUSB* 2>/dev/null
+	has mmcli && run "mmcli -L"
+	run "ip -4 route show table all | grep -vE '^(local|broadcast)'"
+	run "ip -6 route show | head -n 20"
+	if has logread; then
+		printf '\n$ logread | grep pppd (last 30)\n'
+		logread 2>/dev/null | grep -E 'pppd|PADO|PADI|LCP|qmi|mbim|ModemManager' | tail -n 30
+	fi
+}
+
+main() {
+	echo "ppe-help $VERSION report, $(date -u '+%Y-%m-%d %H:%M UTC'), sections:$SECTIONS"
+	echo "board: $(rd /tmp/sysinfo/model) ($(rd /tmp/sysinfo/board_name))"
+	echo "image: $(. /etc/openwrt_release 2>/dev/null; echo "$DISTRIB_DESCRIPTION")"
+	for s in $SECTIONS; do "s_$s"; done
+}
+
+main 2>&1 | redact | tee "$OUT"
+sum=$(grep '^hint:' "$OUT")
+{
+	printf '\n==================== summary ====================\n'
+	echo "${sum:-no known misconfiguration found}"
+	sz=$(wc -c < "$OUT")
+	[ "$sz" -gt 30000 ] &&
+		echo "the report is $sz bytes, more than one forum post holds: attach the file, or post sections one at a time (ppe-help -wifi, ppe-help -ethernet, ...)"
+	echo "report saved to $OUT; read it before posting"
+} | tee -a "$OUT"
