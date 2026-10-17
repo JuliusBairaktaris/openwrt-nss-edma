@@ -1,0 +1,50 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Arm one offload attempt.  The next boot runs it with mode already set to
+# host, so a hang leaves the boot after that one on the host path.
+
+set -u
+
+STAGE=/etc/nss-wifi.stage
+ATTEMPTS=/etc/nss-wifi.attempts
+
+mode=$(uci -q get nss-wifi.general.mode 2>/dev/null)
+if [ -z "$mode" ]; then
+	# An old offload=1 is not an armed attempt; host stays the default.
+	mode=host
+fi
+no_ahb=$(uci -q get nss-wifi.general.no_ahb 2>/dev/null)
+[ -n "$no_ahb" ] || no_ahb=0
+
+if [ "$mode" != host ]; then
+	echo "nss-wifi: mode is '$mode', not host; disarm it first" >&2
+	exit 1
+fi
+
+qcn=0
+grep -qs '^0x1104$' /sys/bus/pci/devices/*/device 2>/dev/null && qcn=1
+
+if [ "$no_ahb" = 1 ]; then
+	if [ "$qcn" != 1 ]; then
+		echo "nss-wifi: no_ahb=1 requires a QCN9074; not arming" >&2
+		exit 1
+	fi
+	echo "nss-wifi: no_ahb=1, QCN9074 target 26; the service requires it" >&2
+elif [ "$qcn" = 1 ]; then
+	echo "nss-wifi: QCN9074 present; no_ahb=0 offloads both the AHB radio and the QCN9074." >&2
+	echo "          The service requires target 26 before it boots; set no_ahb=1 for QCN-only." >&2
+fi
+
+if ! uci -q set nss-wifi.general.mode=offload-once ||
+   ! uci -q commit nss-wifi; then
+	echo "nss-wifi: could not set mode=offload-once" >&2
+	exit 1
+fi
+
+printf 'armed\n' > "$STAGE" || exit 1
+printf '0 0\n' > "$ATTEMPTS" || exit 1
+sync
+
+logger -t nss-wifi "offload armed; rebooting"
+echo "nss-wifi: offload armed; rebooting"
+reboot
