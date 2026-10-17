@@ -1171,6 +1171,24 @@ int nss_wifi_vdev_security(int if_num, u32 cipher)
 }
 EXPORT_SYMBOL_GPL(nss_wifi_vdev_security);
 
+/* An access point vdev forwards between its own stations unless told not to,
+ * so AP isolation has to reach it.
+ */
+int nss_wifi_vdev_ap_isolate(int if_num, bool isolate)
+{
+	struct nss_core *core;
+
+	guard(mutex)(&nss_wifili_lock);
+
+	core = nss_wifili_core;
+	if (!core || !core->wifili_started || if_num < 0)
+		return -ENODEV;
+
+	return nss_wifili_vdev_cmd(core, if_num,
+				   NSS_WIFI_VDEV_CFG_AP_BRIDGE_CMD, !isolate);
+}
+EXPORT_SYMBOL_GPL(nss_wifi_vdev_ap_isolate);
+
 /* Tell the firmware about a station.
  *
  * The firmware keeps its own record of a peer, in memory the host owns and
