@@ -228,6 +228,8 @@ void nss_wifi_vdev_unregister(struct net_device *dev);
 int nss_wifi_vdev_tx(int if_num, struct sk_buff *skb);
 int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
 			 u16 hw_ast_idx, u32 tx_ast_hash);
+void nss_wifi_peer_delete_ex(int soc_id, u32 vdev_id, const u8 *mac,
+			     u16 peer_id);
 void nss_wifi_peer_delete(u32 vdev_id, const u8 *mac, u16 peer_id);
 int nss_wifi_vdev_security(int if_num, u32 cipher);
 int nss_wifi_vdev_ap_isolate(int if_num, bool isolate);
@@ -327,6 +329,11 @@ static inline int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
 				       u16 hw_ast_idx, u32 tx_ast_hash)
 {
 	return -ENODEV;
+}
+
+static inline void nss_wifi_peer_delete_ex(int soc_id, u32 vdev_id,
+					   const u8 *mac, u16 peer_id)
+{
 }
 
 static inline void nss_wifi_peer_delete(u32 vdev_id, const u8 *mac,

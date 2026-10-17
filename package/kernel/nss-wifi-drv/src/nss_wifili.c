@@ -1548,7 +1548,8 @@ int nss_wifi_mesh_register(struct net_device *dev, u8 radio, u32 vdev_id,
 }
 EXPORT_SYMBOL_GPL(nss_wifi_mesh_register);
 
-static void nss_wifili_peer_flush(struct nss_core *core, u32 vdev_id);
+static void nss_wifili_peer_flush(struct nss_core *core, int soc_id,
+				  u32 vdev_id);
 
 void nss_wifi_vdev_unregister(struct net_device *dev)
 {
@@ -1563,6 +1564,8 @@ void nss_wifi_vdev_unregister(struct net_device *dev)
 
 	for (i = 0; i < ARRAY_SIZE(nss_wifili_vdev_tbl); i++) {
 		int if_num = nss_wifili_vdev_tbl[i].if_num;
+		int soc_id = nss_wifili_vdev_tbl[i].soc_id;
+		u32 vdev_id = nss_wifili_vdev_tbl[i].vdev_id;
 
 		if (nss_wifili_vdev_tbl[i].dev != dev)
 			continue;
@@ -1585,7 +1588,7 @@ void nss_wifi_vdev_unregister(struct net_device *dev)
 		nss_wifili_vdev_tbl[i].if_num = -1;
 		nss_wifili_vdev_tbl[i].soc_id = -1;
 
-		nss_wifili_peer_flush(core, nss_wifili_vdev_tbl[i].vdev_id);
+		nss_wifili_peer_flush(core, soc_id, vdev_id);
 		nss_mesh_stop(core, if_num);
 
 		/* Down before the node goes: a virtual device released while
@@ -1820,6 +1823,7 @@ int nss_wifi_peer_create_ex(int soc_id, u32 vdev_id, const u8 *mac,
 	 */
 	for (i = 0; i < ARRAY_SIZE(nss_wifili_peer_tbl); i++)
 		if (nss_wifili_peer_tbl[i].mem &&
+		    nss_wifili_peer_tbl[i].soc_id == soc_id &&
 		    nss_wifili_peer_tbl[i].vdev_id == vdev_id &&
 		    ether_addr_equal(nss_wifili_peer_tbl[i].mac, mac))
 			nss_wifili_peer_release(core, i);
@@ -1922,12 +1926,14 @@ static void nss_wifili_peer_release(struct nss_core *core, int i)
  * peer released that way is never named here, and both this table and the
  * firmware's would keep it for as long as the driver stayed loaded.
  */
-static void nss_wifili_peer_flush(struct nss_core *core, u32 vdev_id)
+static void nss_wifili_peer_flush(struct nss_core *core, int soc_id,
+				  u32 vdev_id)
 {
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(nss_wifili_peer_tbl); i++)
 		if (nss_wifili_peer_tbl[i].mem &&
+		    nss_wifili_peer_tbl[i].soc_id == soc_id &&
 		    nss_wifili_peer_tbl[i].vdev_id == vdev_id)
 			nss_wifili_peer_release(core, i);
 }
@@ -2018,7 +2024,8 @@ int nss_wifi_peer_authorize(u16 peer_id)
 }
 EXPORT_SYMBOL_GPL(nss_wifi_peer_authorize);
 
-void nss_wifi_peer_delete(u32 vdev_id, const u8 *mac, u16 peer_id)
+void nss_wifi_peer_delete_ex(int soc_id, u32 vdev_id, const u8 *mac,
+			     u16 peer_id)
 {
 	struct nss_core *core;
 	int i;
@@ -2031,12 +2038,22 @@ void nss_wifi_peer_delete(u32 vdev_id, const u8 *mac, u16 peer_id)
 
 	for (i = 0; i < ARRAY_SIZE(nss_wifili_peer_tbl); i++) {
 		if (!nss_wifili_peer_tbl[i].mem ||
+		    nss_wifili_peer_tbl[i].soc_id != soc_id ||
+		    nss_wifili_peer_tbl[i].vdev_id != vdev_id ||
 		    nss_wifili_peer_tbl[i].peer_id != peer_id)
+			continue;
+		if (mac && !ether_addr_equal(nss_wifili_peer_tbl[i].mac, mac))
 			continue;
 
 		nss_wifili_peer_release(core, i);
 		return;
 	}
+}
+EXPORT_SYMBOL_GPL(nss_wifi_peer_delete_ex);
+
+void nss_wifi_peer_delete(u32 vdev_id, const u8 *mac, u16 peer_id)
+{
+	nss_wifi_peer_delete_ex(0, vdev_id, mac, peer_id);
 }
 EXPORT_SYMBOL_GPL(nss_wifi_peer_delete);
 
@@ -2326,6 +2343,8 @@ static void nss_me_msg_fill(struct nss_wifi_vdev_me_snptbl_grp_mbr_add_msg *a,
 static int nss_me_peer_id(int if_num, const u8 *mac)
 {
 	int i, v;
+	int soc_id;
+	u32 vdev_id;
 
 	for (v = 0; v < ARRAY_SIZE(nss_wifili_vdev_tbl); v++)
 		if (nss_wifili_vdev_tbl[v].dev &&
@@ -2334,9 +2353,13 @@ static int nss_me_peer_id(int if_num, const u8 *mac)
 	if (v == ARRAY_SIZE(nss_wifili_vdev_tbl))
 		return -ENODEV;
 
+	soc_id = nss_wifili_vdev_tbl[v].soc_id;
+	vdev_id = nss_wifili_vdev_tbl[v].vdev_id;
+
 	for (i = 0; i < ARRAY_SIZE(nss_wifili_peer_tbl); i++)
 		if (nss_wifili_peer_tbl[i].mem &&
-		    nss_wifili_peer_tbl[i].vdev_id == nss_wifili_vdev_tbl[v].vdev_id &&
+		    nss_wifili_peer_tbl[i].soc_id == soc_id &&
+		    nss_wifili_peer_tbl[i].vdev_id == vdev_id &&
 		    ether_addr_equal(nss_wifili_peer_tbl[i].mac, mac))
 			return nss_wifili_peer_tbl[i].peer_id;
 

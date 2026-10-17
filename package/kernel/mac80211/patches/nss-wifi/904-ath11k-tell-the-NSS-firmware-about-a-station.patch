@@ -29,7 +29,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/peer.c
  #include "peer.h"
  #include "debug.h"
  
-@@ -353,6 +355,24 @@ int ath11k_peer_delete(struct ath11k *ar
+@@ -353,6 +355,25 @@ int ath11k_peer_delete(struct ath11k *ar
  
  	lockdep_assert_held(&ar->conf_mutex);
  
@@ -48,13 +48,14 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/peer.c
 +		spin_unlock_bh(&ar->ab->base_lock);
 +
 +		if (peer)
-+			nss_wifi_peer_delete(vdev_id, addr, peer_id);
++			nss_wifi_peer_delete_ex(ar->ab->nss_soc_id, vdev_id,
++						addr, peer_id);
 +	}
 +
  	ret = __ath11k_peer_delete(ar, vdev_id, addr);
  	if (ret)
  		return ret;
-@@ -372,6 +392,7 @@ int ath11k_peer_create(struct ath11k *ar
+@@ -372,6 +393,7 @@ int ath11k_peer_create(struct ath11k *ar
  {
  	struct ath11k_peer *peer;
  	struct ath11k_sta *arsta;
@@ -62,7 +63,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/peer.c
  	int ret, fbret;
  
  	lockdep_assert_held(&ar->conf_mutex);
-@@ -457,9 +478,35 @@ int ath11k_peer_create(struct ath11k *ar
+@@ -457,9 +479,35 @@ int ath11k_peer_create(struct ath11k *ar
  
  	ar->num_peers++;
  
