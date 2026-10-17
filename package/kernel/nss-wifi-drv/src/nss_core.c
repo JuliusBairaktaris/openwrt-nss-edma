@@ -842,15 +842,6 @@ clk:
 	return ret;
 }
 
-/* For the WLAN driver, whose rings the firmware reaps: they are about to go,
- * and the firmware has no way to be told that short of stopping.
- */
-void nss_core_stop(struct nss_core *core)
-{
-	guard(mutex)(&core->lock);
-	nss_core_halt(core);
-}
-
 /* A core that faults this often is left halted and the host routes. */
 #define NSS_FAULTS_MAX		3
 #define NSS_FAULT_WINDOW	(10 * 60 * HZ)

@@ -235,13 +235,11 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  	}
  
  	return 0;
-@@ -1025,6 +1208,12 @@ void ath11k_dp_free(struct ath11k_base *
+@@ -1025,6 +1208,10 @@ void ath11k_dp_free(struct ath11k_base *
  	struct ath11k_dp *dp = &ab->dp;
  	int i;
  
-+	if (ab->nss_soc_id == 0)
-+		nss_wifi_soc_unregister();
-+	else if (ab->nss_soc_id > 0)
++	if (ab->nss_soc_id >= 0)
 +		nss_wifi_soc_unregister_ex(ab->nss_soc_id);
 +	ab->nss_soc_id = -1;
 +

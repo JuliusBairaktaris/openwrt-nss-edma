@@ -210,6 +210,8 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s,
 				   bool resume);
 static void nss_wifili_stop_soc(struct nss_core *core,
 				struct nss_wifili_soc_state *soc);
+static void nss_wifili_stop_all_locked(struct nss_core *core);
+static void nss_wifili_soc_recount(struct nss_core *core);
 
 /* The targets the firmware enumerates; QCN9074 is the first one whose
  * instance is chosen by the driver rather than named by the caller.
@@ -238,19 +240,7 @@ static DEFINE_MUTEX(nss_wifili_lock);
 /* Translate the old internal-only vdev/mesh radio argument (a per-soc index)
  * into the global radio index the instance-aware calls use.
  */
-static int nss_wifili_internal_radio_global(u8 radio)
-{
-	struct nss_wifili_soc_state *soc;
-	int global = -1;
 
-	guard(mutex)(&nss_wifili_lock);
-
-	soc = nss_wifili_soc_lookup(NSS_INTERFACE_WIFILI);
-	if (soc && radio < soc->pdevs_seen)
-		global = soc->radio_idx[radio];
-
-	return global;
-}
 
 void nss_wifili_bind(struct nss_core *core)
 {
@@ -410,23 +400,6 @@ int nss_wifi_soc_register_ex(const struct nss_wifi_soc *desc)
 }
 EXPORT_SYMBOL_GPL(nss_wifi_soc_register_ex);
 
-int nss_wifi_soc_register(const struct nss_wifi_soc *desc)
-{
-	int soc_id;
-
-	/* The old call is internal-only; an external instance has to use the
-	 * instance-aware form so its id is kept.
-	 */
-	if (desc && desc->if_num && desc->if_num != NSS_INTERFACE_WIFILI)
-		return -EOPNOTSUPP;
-
-	soc_id = nss_wifi_soc_register_ex(desc);
-
-	/* The old caller tests this as an error; its instance is 0. */
-	return soc_id < 0 ? soc_id : 0;
-}
-EXPORT_SYMBOL_GPL(nss_wifi_soc_register);
-
 /* Withdraw one instance's records. This does not stop the NSS core: the old
  * wrapper below does that for the internal instance, and a new caller that
  * unregisters a started internal instance has to do the same before this.
@@ -454,16 +427,31 @@ void nss_wifi_soc_unregister_ex(int soc_id)
 	WRITE_ONCE(soc->desc.rx_80211, NULL);
 	WRITE_ONCE(soc->desc.peer_stats, NULL);
 
-	/* A started instance has to be taken off the firmware's rings before
-	 * its memory is released.  The core is halted by the old wrapper, not
-	 * here: this only tears down one instance.
-	 */
 	core = nss_wifili_core;
-	if (core && (soc->started || soc->probed)) {
+	if (core) {
 		scoped_guard(mutex, &core->lock) {
-			nss_wifili_stop_soc(core, soc);
+			if (soc_id == 0) {
+				/* The internal instance's stop is a whole-node
+				 * reset.  Take every external instance off the
+				 * firmware's rings first; the NSS core itself is
+				 * shared with the rest of the datapath and is
+				 * not stopped here.
+				 */
+				nss_wifili_stop_all_locked(core);
+			} else if (soc->started || soc->probed) {
+				nss_wifili_stop_soc(core, soc);
+			}
 		}
 	}
+
+	/* The internal reset stopped the external instances too.  Keep them
+	 * from being resumed by a later NSS start; a WLAN driver that comes
+	 * back re-registers its instance and clears this.
+	 */
+	if (soc_id == 0)
+		for (i = 1; i < NSS_WIFI_MAX_SOCS; i++)
+			if (READ_ONCE(nss_wifili_socs[i].used))
+				nss_wifili_socs[i].gone = true;
 
 	for (i = 0; i < soc->pdevs_seen; i++)
 		if (soc->radio_idx[i] >= 0)
@@ -476,29 +464,11 @@ void nss_wifi_soc_unregister_ex(int soc_id)
 	soc->probed = false;
 	soc->gone = true;
 	WRITE_ONCE(soc->used, false);
+
+	if (core)
+		nss_wifili_soc_recount(core);
 }
 EXPORT_SYMBOL_GPL(nss_wifi_soc_unregister_ex);
-
-void nss_wifi_soc_unregister(void)
-{
-	struct nss_core *core = nss_wifili_core;
-	bool was_started = core && core->wifili_started;
-
-	/* The old caller owns the core the internal instance was started on;
-	 * clearing the instance alone would leave the firmware on its rings.
-	 * The stop above clears the per-instance flag, so the core-level
-	 * decision has to be taken from the state before it.
-	 */
-	nss_wifi_soc_unregister_ex(0);
-
-	if (!core)
-		return;
-	if (was_started)
-		nss_core_stop(core);
-	else
-		nss_rings_quiesce(core);
-}
-EXPORT_SYMBOL_GPL(nss_wifi_soc_unregister);
 
 int nss_wifi_pdev_register_ex(int soc_id, const struct nss_wifi_pdev *pdev)
 {
@@ -553,17 +523,6 @@ int nss_wifi_pdev_register_ex(int soc_id, const struct nss_wifi_pdev *pdev)
 	return radio;
 }
 EXPORT_SYMBOL_GPL(nss_wifi_pdev_register_ex);
-
-int nss_wifi_pdev_register(const struct nss_wifi_pdev *pdev)
-{
-	int radio = nss_wifi_pdev_register_ex(0, pdev);
-
-	/* The old caller tests this as an error; its radios are not indexed
-	 * by this return value.
-	 */
-	return radio < 0 ? radio : 0;
-}
-EXPORT_SYMBOL_GPL(nss_wifi_pdev_register);
 
 /* Reset the WLAN driver because the core runs Wi-Fi (@started): the radios
  * hold buffers it lent, freed once they have stopped, and the reset halts the
@@ -1467,19 +1426,6 @@ int nss_wifi_vdev_register_ex(int soc_id, struct net_device *dev, u8 radio,
 }
 EXPORT_SYMBOL_GPL(nss_wifi_vdev_register_ex);
 
-int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
-			   const u8 *mac, bool ap, u8 encap, u8 decap)
-{
-	int global = nss_wifili_internal_radio_global(radio);
-
-	if (global < 0)
-		return -ENODEV;
-
-	return nss_wifi_vdev_register_ex(0, dev, global, vdev_id, mac, ap,
-					 encap, decap);
-}
-EXPORT_SYMBOL_GPL(nss_wifi_vdev_register);
-
 /* A mesh interface's virtual device. It carries 802.11 both ways, and what
  * it receives goes on to the mesh decapsulation node rather than to the host,
  * so the network device is bound to the mesh nodes, not to it.
@@ -1593,20 +1539,6 @@ int nss_wifi_mesh_register_ex(int soc_id, struct net_device *dev, u8 radio,
 	return if_num;
 }
 EXPORT_SYMBOL_GPL(nss_wifi_mesh_register_ex);
-
-int nss_wifi_mesh_register(struct net_device *dev, u8 radio, u32 vdev_id,
-			   const u8 *mac, u8 mode,
-			   const struct nss_wifi_mesh_ops *ops, void *priv)
-{
-	int global = nss_wifili_internal_radio_global(radio);
-
-	if (global < 0)
-		return -ENODEV;
-
-	return nss_wifi_mesh_register_ex(0, dev, global, vdev_id, mac, mode,
-					 ops, priv);
-}
-EXPORT_SYMBOL_GPL(nss_wifi_mesh_register);
 
 static void nss_wifili_peer_flush(struct nss_core *core, int soc_id,
 				  u32 vdev_id);
@@ -1936,14 +1868,6 @@ int nss_wifi_peer_create_ex(int soc_id, u32 vdev_id, const u8 *mac,
 }
 EXPORT_SYMBOL_GPL(nss_wifi_peer_create_ex);
 
-int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
-			 u16 hw_ast_idx, u32 tx_ast_hash)
-{
-	return nss_wifi_peer_create_ex(0, vdev_id, mac, peer_id, hw_ast_idx,
-				       tx_ast_hash);
-}
-EXPORT_SYMBOL_GPL(nss_wifi_peer_create);
-
 /* The memory is freed only after the delete is answered: the firmware writes
  * into it until it has let the peer go, and a synchronous send is what makes
  * "after" mean anything here.
@@ -2039,13 +1963,6 @@ int nss_wifi_peer_security_ex(int soc_id, u16 peer_id, bool group,
 }
 EXPORT_SYMBOL_GPL(nss_wifi_peer_security_ex);
 
-int nss_wifi_peer_security(u16 peer_id, bool group, u32 cipher,
-			   const u8 *mic_key)
-{
-	return nss_wifi_peer_security_ex(0, peer_id, group, cipher, mic_key);
-}
-EXPORT_SYMBOL_GPL(nss_wifi_peer_security);
-
 /* A peer the firmware holds unauthorised has its received frames counted and
  * dropped rather than delivered.
  */
@@ -2078,12 +1995,6 @@ int nss_wifi_peer_authorize_ex(int soc_id, u16 peer_id)
 }
 EXPORT_SYMBOL_GPL(nss_wifi_peer_authorize_ex);
 
-int nss_wifi_peer_authorize(u16 peer_id)
-{
-	return nss_wifi_peer_authorize_ex(0, peer_id);
-}
-EXPORT_SYMBOL_GPL(nss_wifi_peer_authorize);
-
 void nss_wifi_peer_delete_ex(int soc_id, u32 vdev_id, const u8 *mac,
 			     u16 peer_id)
 {
@@ -2110,12 +2021,6 @@ void nss_wifi_peer_delete_ex(int soc_id, u32 vdev_id, const u8 *mac,
 	}
 }
 EXPORT_SYMBOL_GPL(nss_wifi_peer_delete_ex);
-
-void nss_wifi_peer_delete(u32 vdev_id, const u8 *mac, u16 peer_id)
-{
-	nss_wifi_peer_delete_ex(0, vdev_id, mac, peer_id);
-}
-EXPORT_SYMBOL_GPL(nss_wifi_peer_delete);
 
 int nss_wifi_vdev_tx(int if_num, struct sk_buff *skb)
 {
@@ -3308,6 +3213,21 @@ static void nss_wifili_peer_drop_soc(struct nss_core *core, int soc_id)
 	}
 }
 
+/* External first, internal last: the internal stop resets the whole
+ * wifili node, so every other instance has to be off its rings before it.
+ * The NSS core itself is not stopped; it is shared with the rest of the
+ * datapath.
+ */
+static void nss_wifili_stop_all_locked(struct nss_core *core)
+{
+	int i;
+
+	for (i = NSS_WIFI_MAX_SOCS - 1; i >= 0; i--)
+		if (READ_ONCE(nss_wifili_socs[i].used) &&
+		    (nss_wifili_socs[i].started || nss_wifili_socs[i].probed))
+			nss_wifili_stop_soc(core, &nss_wifili_socs[i]);
+}
+
 void nss_wifili_stop_all(void)
 {
 	struct nss_core *core;
@@ -3324,14 +3244,8 @@ void nss_wifili_stop_all(void)
 		return;
 	}
 
-	scoped_guard(mutex, &core->lock) {
-		for (i = 0; i < NSS_WIFI_MAX_SOCS; i++)
-			if (READ_ONCE(nss_wifili_socs[i].used) &&
-			    (nss_wifili_socs[i].started ||
-			     nss_wifili_socs[i].probed))
-				nss_wifili_stop_soc(core,
-						    &nss_wifili_socs[i]);
-	}
+	scoped_guard(mutex, &core->lock)
+		nss_wifili_stop_all_locked(core);
 }
 
 static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s,

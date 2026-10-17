@@ -73,7 +73,7 @@ struct nss_wifi_soc {
 	u16 rx_buf_len;
 	u8 num_tcl;
 	u8 num_reo;
-	/* Radios that follow with nss_wifi_pdev_register(). */
+	/* Radios that follow a pdev registration. */
 	u8 num_pdevs;
 	struct nss_wifi_ring tcl[NSS_WIFI_MAX_TCL_RINGS];
 	struct nss_wifi_ring txcomp[NSS_WIFI_MAX_TCL_RINGS];
@@ -219,27 +219,13 @@ int nss_wifi_mesh_register_ex(int soc_id, struct net_device *dev, u8 radio,
 			      u32 vdev_id, const u8 *mac, u8 mode,
 			      const struct nss_wifi_mesh_ops *ops, void *priv);
 
-int nss_wifi_soc_register(const struct nss_wifi_soc *soc);
-void nss_wifi_soc_unregister(void);
-int nss_wifi_pdev_register(const struct nss_wifi_pdev *pdev);
-int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
-			   const u8 *mac, bool ap, u8 encap, u8 decap);
 void nss_wifi_vdev_unregister(struct net_device *dev);
 int nss_wifi_vdev_tx(int if_num, struct sk_buff *skb);
-int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
-			 u16 hw_ast_idx, u32 tx_ast_hash);
 void nss_wifi_peer_delete_ex(int soc_id, u32 vdev_id, const u8 *mac,
 			     u16 peer_id);
-void nss_wifi_peer_delete(u32 vdev_id, const u8 *mac, u16 peer_id);
 int nss_wifi_vdev_security(int if_num, u32 cipher);
 int nss_wifi_vdev_ap_isolate(int if_num, bool isolate);
-int nss_wifi_peer_security(u16 peer_id, bool group, u32 cipher,
-			   const u8 *mic_key);
-int nss_wifi_peer_authorize(u16 peer_id);
 int nss_flow_setup_block(struct net_device *dev, struct flow_block_offload *f);
-int nss_wifi_mesh_register(struct net_device *dev, u8 radio, u32 vdev_id,
-			   const u8 *mac, u8 mode,
-			   const struct nss_wifi_mesh_ops *ops, void *priv);
 int nss_wifi_mesh_path(int if_num, enum nss_wifi_mesh_cmd cmd,
 		       const struct nss_wifi_mesh_path *p);
 int nss_wifi_mesh_config(int if_num, u8 ttl, u32 refresh_ms, bool forward);
@@ -258,21 +244,6 @@ static inline int nss_wifi_pdev_register_ex(int soc_id,
 {
 	return -ENODEV;
 }
-
-static inline int nss_wifi_soc_register(const struct nss_wifi_soc *soc)
-{
-	return -ENODEV;
-}
-
-static inline void nss_wifi_soc_unregister(void)
-{
-}
-
-static inline int nss_wifi_pdev_register(const struct nss_wifi_pdev *pdev)
-{
-	return -ENODEV;
-}
-
 static inline int nss_wifi_vdev_register_ex(int soc_id,
 					    struct net_device *dev, u8 radio,
 					    u32 vdev_id, const u8 *mac,
@@ -308,14 +279,6 @@ static inline int nss_wifi_mesh_register_ex(int soc_id, struct net_device *dev,
 {
 	return -ENODEV;
 }
-
-static inline int nss_wifi_vdev_register(struct net_device *dev, u8 radio,
-					 u32 vdev_id, const u8 *mac, bool ap,
-					 u8 encap, u8 decap)
-{
-	return -ENODEV;
-}
-
 static inline void nss_wifi_vdev_unregister(struct net_device *dev)
 {
 }
@@ -324,23 +287,10 @@ static inline int nss_wifi_vdev_tx(int if_num, struct sk_buff *skb)
 {
 	return -ENODEV;
 }
-
-static inline int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
-				       u16 hw_ast_idx, u32 tx_ast_hash)
-{
-	return -ENODEV;
-}
-
 static inline void nss_wifi_peer_delete_ex(int soc_id, u32 vdev_id,
 					   const u8 *mac, u16 peer_id)
 {
 }
-
-static inline void nss_wifi_peer_delete(u32 vdev_id, const u8 *mac,
-					u16 peer_id)
-{
-}
-
 static inline int nss_wifi_vdev_security(int if_num, u32 cipher)
 {
 	return -ENODEV;
@@ -350,32 +300,11 @@ static inline int nss_wifi_vdev_ap_isolate(int if_num, bool isolate)
 {
 	return -ENODEV;
 }
-
-static inline int nss_wifi_peer_security(u16 peer_id, bool group, u32 cipher,
-					 const u8 *mic_key)
-{
-	return -ENODEV;
-}
-
-static inline int nss_wifi_peer_authorize(u16 peer_id)
-{
-	return -ENODEV;
-}
-
 static inline int nss_flow_setup_block(struct net_device *dev,
 				       struct flow_block_offload *f)
 {
 	return -EOPNOTSUPP;
 }
-
-static inline int nss_wifi_mesh_register(struct net_device *dev, u8 radio,
-					 u32 vdev_id, const u8 *mac, u8 mode,
-					 const struct nss_wifi_mesh_ops *ops,
-					 void *priv)
-{
-	return -EOPNOTSUPP;
-}
-
 static inline int nss_wifi_mesh_path(int if_num, enum nss_wifi_mesh_cmd cmd,
 				     const struct nss_wifi_mesh_path *p)
 {

@@ -473,14 +473,12 @@ void nss_mem_free(struct nss_core *core, void *cpu);
 void nss_mem_free_all(struct nss_core *core);
 int nss_wifi_pool_set(struct nss_core *core, u32 payloads);
 void nss_pbuf_pool_free(struct nss_core *core);
-void nss_core_stop(struct nss_core *core);
 void nss_core_fault(struct nss_core *core);
 void nss_core_resume(struct nss_core *core);
 int nss_rings_start(struct nss_core *core);
 void nss_iface_bind(struct nss_core *core);
 void nss_iface_unbind(struct nss_core *core);
 void nss_rings_stop(struct nss_core *core);
-void nss_rings_quiesce(struct nss_core *core);
 int nss_data_send(struct nss_core *core, struct sk_buff *skb, u32 if_num,
 		  u16 flags);
 void nss_doorbell(struct nss_core *core, u32 intr);
