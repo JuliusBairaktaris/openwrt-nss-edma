@@ -1,0 +1,79 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] ath11k: classify NSS-transmitted frames as mac80211 does
+
+A frame the NSS firmware transmits takes its TID from the DSCP-to-TID
+table, which ath11k fills with DSCP >> 3. mac80211 classifies the frames
+it transmits with cfg80211_classify8021d(), so under the offload EF goes
+out as video instead of voice and AF11 as background instead of best
+effort. Fill the table with the RFC 8325 mapping that function uses
+while the offload is on. ath11k sets the TID of every frame it transmits
+itself and does not read the table.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+diff --git a/drivers/net/wireless/ath/ath11k/hal_tx.c b/drivers/net/wireless/ath/ath11k/hal_tx.c
+index b7e9b1c..762d519 100644
+--- a/drivers/net/wireless/ath/ath11k/hal_tx.c
++++ b/drivers/net/wireless/ath/ath11k/hal_tx.c
+@@ -34,6 +34,22 @@ static const u8 dscp_tid_map[DSCP_TID_MAP_TBL_ENTRY_SIZE] = {
+ 	7, 7, 7, 7, 7, 7, 7, 7,
+ };
+ 
++/*
++ * The mapping mac80211 classifies the frames it transmits with
++ * (cfg80211_classify8021d(), RFC 8325). Frames the NSS firmware transmits
++ * take their TID from this table instead.
++ */
++static const u8 dscp_tid_map_rfc8325[DSCP_TID_MAP_TBL_ENTRY_SIZE] = {
++	0, 0, 0, 0, 0, 0, 0, 0,
++	1, 1, 0, 1, 0, 1, 0, 1,
++	0, 2, 3, 2, 3, 2, 3, 2,
++	4, 3, 4, 3, 4, 3, 4, 3,
++	4, 4, 4, 4, 4, 4, 4, 4,
++	5, 5, 5, 5, 6, 5, 6, 5,
++	7, 6, 6, 6, 6, 6, 6, 6,
++	7, 7, 7, 7, 7, 7, 7, 7,
++};
++
+ void ath11k_hal_tx_cmd_desc_setup(struct ath11k_base *ab, void *cmd,
+ 				  struct hal_tx_info *ti)
+ {
+@@ -82,6 +98,7 @@ void ath11k_hal_tx_cmd_desc_setup(struct ath11k_base *ab, void *cmd,
+ 
+ void ath11k_hal_tx_set_dscp_tid_map(struct ath11k_base *ab, int id)
+ {
++	const u8 *map = ab->nss_offload ? dscp_tid_map_rfc8325 : dscp_tid_map;
+ 	u32 ctrl_reg_val;
+ 	u32 addr;
+ 	u8 hw_map_val[HAL_DSCP_TID_TBL_SIZE];
+@@ -104,21 +121,21 @@ void ath11k_hal_tx_set_dscp_tid_map(struct ath11k_base *ab, int id)
+ 	 */
+ 	for (i = 0; i < DSCP_TID_MAP_TBL_ENTRY_SIZE; i += 8) {
+ 		value = FIELD_PREP(HAL_TCL1_RING_FIELD_DSCP_TID_MAP0,
+-				   dscp_tid_map[i]) |
++				   map[i]) |
+ 			FIELD_PREP(HAL_TCL1_RING_FIELD_DSCP_TID_MAP1,
+-				   dscp_tid_map[i + 1]) |
++				   map[i + 1]) |
+ 			FIELD_PREP(HAL_TCL1_RING_FIELD_DSCP_TID_MAP2,
+-				   dscp_tid_map[i + 2]) |
++				   map[i + 2]) |
+ 			FIELD_PREP(HAL_TCL1_RING_FIELD_DSCP_TID_MAP3,
+-				   dscp_tid_map[i + 3]) |
++				   map[i + 3]) |
+ 			FIELD_PREP(HAL_TCL1_RING_FIELD_DSCP_TID_MAP4,
+-				   dscp_tid_map[i + 4]) |
++				   map[i + 4]) |
+ 			FIELD_PREP(HAL_TCL1_RING_FIELD_DSCP_TID_MAP5,
+-				   dscp_tid_map[i + 5]) |
++				   map[i + 5]) |
+ 			FIELD_PREP(HAL_TCL1_RING_FIELD_DSCP_TID_MAP6,
+-				   dscp_tid_map[i + 6]) |
++				   map[i + 6]) |
+ 			FIELD_PREP(HAL_TCL1_RING_FIELD_DSCP_TID_MAP7,
+-				   dscp_tid_map[i + 7]);
++				   map[i + 7]);
+ 		memcpy(&hw_map_val[cnt], (u8 *)&value, 3);
+ 		cnt += 3;
+ 	}
