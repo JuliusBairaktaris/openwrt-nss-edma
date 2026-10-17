@@ -33,8 +33,11 @@ by the maintainer, and IPQ60xx is not tested at all. Reports are welcome.
 
 Prebuilt sysupgrade images for 41 IPQ807x and 24 IPQ60xx boards are on the
 [Qualcommax_NSS_Builder releases](https://github.com/JuliusBairaktaris/Qualcommax_NSS_Builder/releases)
-page. Take `ppe-nss-*`, or `ppe-nss-mesh-*` for 802.11s mesh (NSS firmware
-11.4).
+page. The images carry NSS firmware 12.5 and 11.4, the last line that
+supports 802.11s mesh, and boot 12.5. Mesh users switch with
+`uci set nss-wifi.general.firmware=11.4; uci commit nss-wifi; reboot`; a
+config kept from a mesh image switches by itself. Mesh is only partly
+offloaded so far.
 
 ## Documentation
 
@@ -65,14 +68,14 @@ cd openwrt-ppe-nss
 cp feeds.conf.default feeds.conf
 echo "src-git nss https://github.com/JuliusBairaktaris/nss-packages.git;edma-nss" >> feeds.conf
 ./scripts/feeds update -a && ./scripts/feeds install -a
-cat seeds/qualcommax-nss-wifi.seed >> .config        # or qualcommax-nss-wifi-mesh.seed
+cat seeds/qualcommax-nss-wifi.seed >> .config
 make defconfig
 make -j"$(nproc)"
 ```
 
-The seeds in [`seeds/`](seeds/) select `kmod-nss-wifi-drv`,
-`ATH11K_NSS_WIFI` and the NSS firmware: 12.5 in `qualcommax-nss-wifi.seed`,
-11.4 with `wpad-mesh-openssl` in `qualcommax-nss-wifi-mesh.seed`.
+[`seeds/qualcommax-nss-wifi.seed`](seeds/qualcommax-nss-wifi.seed) selects
+`kmod-nss-wifi-drv`, `ATH11K_NSS_WIFI`, both NSS firmware lines and
+`wpad-openssl`, which supports 802.11s mesh.
 
 `hw_ppe.qos` for SQM and the PPE QoS LuCI page come from a feed patch and
 a luci fork in the builder. Its

@@ -5,4 +5,5 @@ CONFIG_ATH11K_NSS_WIFI=y
 CONFIG_PACKAGE_nss-firmware=y
 CONFIG_PACKAGE_nss-firmware-ipq807x=y
 CONFIG_PACKAGE_nss-firmware-ipq60xx=y
-CONFIG_NSS_FIRMWARE_VERSION_12_5=y
+CONFIG_PACKAGE_wpad-openssl=y
+# CONFIG_PACKAGE_wpad-basic-mbedtls is not set
