@@ -197,6 +197,13 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s,
 static void nss_wifili_stop_soc(struct nss_core *core,
 				struct nss_wifili_soc_state *soc);
 
+/* The targets the firmware enumerates; QCN9074 is the first one whose
+ * instance is chosen by the driver rather than named by the caller.
+ */
+#define NSS_WIFI_TARGET_IPQ8074	24
+#define NSS_WIFI_TARGET_IPQ6018	25
+#define NSS_WIFI_TARGET_QCN9074	26
+
 /* The pair a caller may name: 203/19 internal, 215/61 and 216/62 external. */
 static int nss_wifili_dyn_type_for(u32 if_num)
 {
@@ -237,12 +244,91 @@ void nss_wifili_bind(struct nss_core *core)
 	nss_wifili_core = core;
 }
 
+static bool nss_wifili_pair_used(u32 if_num, int dyn_type)
+{
+	int i;
+
+	for (i = 0; i < NSS_WIFI_MAX_SOCS; i++) {
+		struct nss_wifili_soc_state *soc = &nss_wifili_socs[i];
+
+		if (!READ_ONCE(soc->used))
+			continue;
+		if (soc->desc.if_num == if_num || soc->desc.dyn_type == dyn_type)
+			return true;
+	}
+
+	return false;
+}
+
+static int nss_wifili_pick_external(u32 *if_num, int *dyn_type)
+{
+	if (!nss_wifili_pair_used(NSS_INTERFACE_WIFILI_EXTERNAL0,
+				  NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL0)) {
+		*if_num = NSS_INTERFACE_WIFILI_EXTERNAL0;
+		*dyn_type = NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL0;
+		return 0;
+	}
+
+	if (!nss_wifili_pair_used(NSS_INTERFACE_WIFILI_EXTERNAL1,
+				  NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL1)) {
+		*if_num = NSS_INTERFACE_WIFILI_EXTERNAL1;
+		*dyn_type = NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL1;
+		return 0;
+	}
+
+	return -ENOSPC;
+}
+
+/* A QCN9074 names no interface: target 26 selects the first free external
+ * pair, the older targets keep the internal pair.  A zero if_num/dyn_type is
+ * still the historical internal request.
+ */
+static int nss_wifili_map_if_num(const struct nss_wifi_soc *desc,
+				 u32 *if_num, int *dyn_type)
+{
+	if (desc->if_num) {
+		*if_num = desc->if_num;
+		*dyn_type = nss_wifili_dyn_type_for(*if_num);
+		if (*dyn_type < 0)
+			return -EINVAL;
+		if (desc->dyn_type && desc->dyn_type != *dyn_type)
+			return -EINVAL;
+		if (*if_num == NSS_INTERFACE_WIFILI &&
+		    desc->target_type == NSS_WIFI_TARGET_QCN9074)
+			return -EINVAL;
+		return 0;
+	}
+
+	*dyn_type = desc->dyn_type;
+	if (*dyn_type == NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL0) {
+		*if_num = NSS_INTERFACE_WIFILI_EXTERNAL0;
+		return 0;
+	}
+	if (*dyn_type == NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL1) {
+		*if_num = NSS_INTERFACE_WIFILI_EXTERNAL1;
+		return 0;
+	}
+	if (*dyn_type && *dyn_type != NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_INTERNAL)
+		return -EINVAL;
+
+	if (desc->target_type == NSS_WIFI_TARGET_QCN9074) {
+		if (*dyn_type)
+			return -EINVAL;
+		return nss_wifili_pick_external(if_num, dyn_type);
+	}
+
+	*if_num = NSS_INTERFACE_WIFILI;
+	*dyn_type = NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_INTERNAL;
+	return 0;
+}
+
 /* Keep what the WLAN driver says; starting the firmware is a separate act,
  * because a running core takes the hardware with it.
  *
  * The internal instance is reserved for state 0 and the two external ones
  * for states 1 and 2, so the internal one is always found first. A zero
- * if_num or dyn_type is the pair the old caller sent; it maps to 203/19.
+ * if_num/dyn_type keeps the historical 203/19 request unless target 26 asks
+ * for an external pair; the selected pair is written back into the state.
  */
 int nss_wifi_soc_register_ex(const struct nss_wifi_soc *desc)
 {
@@ -250,6 +336,7 @@ int nss_wifi_soc_register_ex(const struct nss_wifi_soc *desc)
 	u32 if_num;
 	int id = -1;
 	int dyn_type;
+	int ret;
 	int i;
 
 	guard(mutex)(&nss_wifili_lock);
@@ -262,12 +349,9 @@ int nss_wifi_soc_register_ex(const struct nss_wifi_soc *desc)
 	    desc->num_pdevs > NSS_WIFILI_MAX_PDEV_NUM_MSG)
 		return -EINVAL;
 
-	if_num = desc->if_num ? desc->if_num : NSS_INTERFACE_WIFILI;
-	dyn_type = nss_wifili_dyn_type_for(if_num);
-	if (dyn_type < 0)
-		return -EINVAL;
-	if (desc->dyn_type && desc->dyn_type != dyn_type)
-		return -EINVAL;
+	ret = nss_wifili_map_if_num(desc, &if_num, &dyn_type);
+	if (ret)
+		return ret;
 
 	for (i = 0; i < NSS_WIFI_MAX_SOCS; i++) {
 		soc = &nss_wifili_socs[i];
