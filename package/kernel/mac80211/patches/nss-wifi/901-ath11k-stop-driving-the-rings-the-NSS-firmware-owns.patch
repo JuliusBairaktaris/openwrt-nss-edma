@@ -52,7 +52,7 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  static struct ath11k_hw_params ath11k_hw_params[] = {
  	{
  		.hw_rev = ATH11K_HW_IPQ8074,
-@@ -2694,6 +2710,28 @@ static int ath11k_init_hw_params(struct
+@@ -2694,6 +2710,29 @@ static int ath11k_init_hw_params(struct
  
  	ab->hw_params = *hw_params;
  
@@ -67,7 +67,8 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +	 */
 +	ab->nss_offload = ath11k_nss_offload &&
 +			  (ab->hw_rev == ATH11K_HW_IPQ8074 ||
-+			   ab->hw_rev == ATH11K_HW_IPQ6018_HW10);
++			   ab->hw_rev == ATH11K_HW_IPQ6018_HW10 ||
++			   ab->hw_rev == ATH11K_HW_QCN9074_HW10);
 +	if (ab->nss_offload && !ath11k_nss_keep_mask) {
 +		const struct ath11k_hw_ring_mask *m = ab->hw_params.ring_mask;
 +

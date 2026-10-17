@@ -1,134 +1,353 @@
 #!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-2.0-only
 # START and USE_PROCD are read by /etc/rc.common, not by this file.
 # shellcheck disable=SC2034
 # Wi-Fi data-path decision, made once before netifd builds the topology.
 #
 # The radios bind their data path at probe and never rebind, so which path
 # they take is a module parameter and not a runtime switch: it has to be
-# decided before the WLAN driver loads. That is the whole reason this service
-# exists, and it is why the bus module carries no autoload - unloading and
-# reloading the WLAN driver to change the decision is what wedges the board.
+# decided before the WLAN driver loads.  The default is host: this service
+# loads the drivers but never writes boot=1, so the NSS core stays down.
 #
-# The decision is on by default and turned off with:
-#   uci set nss-wifi.general.offload='0'; uci commit nss-wifi
-# Anything else loads the driver exactly as an image without this package
-# would. A failure once the radios have probed for the offload leaves Wi-Fi
-# down until the next boot. Wired networking never depends on either path.
-# A bring-up the board did not survive is not tried again until
-# /etc/nss-wifi.pending is removed; the setting itself is left alone.
+# An offload is an armed, one-shot experiment:
+#   nss-wifi-arm      set offload-once and reboot
+#   nss-wifi-promote  after a successful boot, make it persistent
+#
+# Before any dangerous action the service writes mode=host and syncs, so a
+# panic or hard hang leaves the next boot on the host path.  A stage file and
+# an attempt counter make that decision visible and bound a retry loop.
 
 START=19
 USE_PROCD=1
 
-# Present from the start of a bring-up until the board has survived it.
-PENDING=/etc/nss-wifi.pending
+STAGE=/etc/nss-wifi.stage
+ATTEMPTS=/etc/nss-wifi.attempts
+LEGACY_PENDING=/etc/nss-wifi.pending
 
-wifi_load_host() {
+qcn=0
+debug=1
+auto_promote=0
+no_ahb=0
+
+log() {
+	logger -t nss-wifi "$*"
+}
+
+uci_get() {
+	uci -q get "nss-wifi.general.$1" 2>/dev/null
+}
+
+set_mode() {
+	uci -q set "nss-wifi.general.mode=$1" || return 1
+	uci -q commit nss-wifi || return 1
+	sync
+}
+
+get_stage() {
+	[ -s "$STAGE" ] && cat "$STAGE"
+}
+
+set_stage() {
+	printf '%s\n' "$1" > "$STAGE" || return 1
+	sync
+}
+
+reset_attempts() {
+	printf '0 0\n' > "$ATTEMPTS"
+	sync
+}
+
+set_fault_restart() {
+	if [ "$debug" = 1 ]; then
+		echo 0 > /sys/module/nss_wifi_drv/parameters/fault_restart 2>/dev/null
+	else
+		echo 1 > /sys/module/nss_wifi_drv/parameters/fault_restart 2>/dev/null
+	fi
+}
+
+apply_params() {
+	local fw param
+
+	fw=$(uci_get firmware)
+	[ -n "$fw" ] &&
+		printf %s "$fw" > /sys/module/nss_wifi_drv/parameters/firmware 2>/dev/null
+
+	# Parameters are read when the plane is brought up, and modprobe on
+	# this image carries none:
+	#   uci add_list nss-wifi.general.param='payloads=32768'
+	for param in $(uci_get param); do
+		echo "${param#*=}" > "/sys/module/nss_wifi_drv/parameters/${param%%=*}" 2>/dev/null &&
+			log "$param"
+	done
+}
+
+detect_qcn() {
+	local d
+
+	qcn=0
+	for d in /sys/bus/pci/devices/*; do
+		[ -r "$d/device" ] || continue
+		if [ "$(cat "$d/device" 2>/dev/null)" = 0x1104 ]; then
+			qcn=1
+			return
+		fi
+	done
+}
+
+has_ahb() {
+	grep -qsE 'qcom,ipq(8074|6018)-wifi' /proc/device-tree/soc*/wifi@*/compatible
+}
+
+# The data path is bound at probe and cannot be rebound by rewriting the
+# module parameter.  A service restart after an armed boot must not try to
+# put the radios back on the host path; only a reboot can do that.
+nss_running() {
+	local d
+
+	for d in /sys/kernel/debug/*.nss; do
+		[ -d "$d" ] || continue
+		if [ -r "$d/boot" ] &&
+		   [ "$(cat "$d/boot" 2>/dev/null)" = 1 ]; then
+			return 0
+		fi
+		if [ -r "$d/wifili" ] &&
+		   grep -Eq '(^|[[:space:]])started 1([[:space:]]|$)' "$d/wifili" 2>/dev/null; then
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+load_host() {
+	modprobe nss-wifi-drv 2>/dev/null
+	set_fault_restart
+
 	modprobe ath11k 2>/dev/null
-	modprobe ath11k_ahb 2>/dev/null
+	echo 0 > /sys/module/ath11k/parameters/nss_offload 2>/dev/null
+	[ "$no_ahb" = 1 ] || modprobe ath11k_ahb 2>/dev/null
 	modprobe ath11k_pci 2>/dev/null
 }
 
-start_service() {
-	local dir fw i param
-
-	[ "$(uci -q get nss-wifi.general.offload)" = "1" ] || {
-		wifi_load_host
-		return 0
-	}
-
-	[ -e "$PENDING" ] && {
-		logger -t nss-wifi "offload skipped: $(cat "$PENDING"); rm $PENDING to try again"
-		wifi_load_host
-		return 0
-	}
-
-	# ath11k offloads only the IPQ8074 and IPQ6018 radios; elsewhere none
-	# would ever hand its rings over and the wait below would only delay
-	# the boot.
-	grep -qsE 'qcom,ipq(8074|6018)-wifi' /proc/device-tree/soc*/wifi@*/compatible || {
-		wifi_load_host
-		return 0
-	}
-
-	# Marked before anything is tried, and cleared only once the board
-	# has survived the bring-up. A bring-up that hangs the board therefore
-	# costs one boot, not every boot after it.
-	echo "the last bring-up did not complete" > "$PENDING"
-	sync
-
+load_offload() {
 	modprobe nss-wifi-drv 2>/dev/null
+	set_fault_restart
+	apply_params
 
-	# The radios are handed over below, so a board whose device tree
-	# describes no NSS core keeps them on the host path instead.
-	dir=$(ls -d /sys/kernel/debug/*.nss 2>/dev/null | head -1)
-	[ -n "$dir" ] || {
-		logger -t nss-wifi "no NSS core to boot, staying on the host path"
-		rm -f "$PENDING"
-		wifi_load_host
-		return 0
-	}
-
-	# Parameters are read when the plane is brought up below, and modprobe
-	# on this image carries none, so anything to be varied between boots is
-	# written here:
-	#   uci add_list nss-wifi.general.param='payloads=32768'
-	fw=$(uci -q get nss-wifi.general.firmware) &&
-		printf %s "$fw" > /sys/module/nss_wifi_drv/parameters/firmware
-	for param in $(uci -q get nss-wifi.general.param); do
-		echo "${param#*=}" > "/sys/module/nss_wifi_drv/parameters/${param%%=*}" 2>/dev/null &&
-			logger -t nss-wifi "$param"
-	done
-
-	# A radio reads these when it probes, and the bus module is what
-	# probes one, so they are written between the two modprobes.
 	modprobe ath11k 2>/dev/null
 	if ! echo 1 > /sys/module/ath11k/parameters/nss_offload 2>/dev/null; then
-		logger -t nss-wifi "ath11k has no offload parameter, staying on the host path"
-		rm -f "$PENDING"
-		wifi_load_host
-		return 0
+		return 1
 	fi
 	echo 2 > /sys/module/ath11k/parameters/frame_mode 2>/dev/null
-	modprobe ath11k_ahb 2>/dev/null
 
-	# A radio describes its rings from its own probe, which loading the
-	# bus module only begins, so the bring-up waits for that rather than
-	# racing it. Reading wifili_start is what sends the sequence.
-	#
-	# A radio logs its rings as it hands them over, and that line is the
-	# only thing that says the description is complete: the phy appears
-	# early in the probe, well before it. Releasing the core while a radio
-	# is still probing hangs the board.
+	[ "$no_ahb" = 1 ] || modprobe ath11k_ahb 2>/dev/null
+	modprobe ath11k_pci 2>/dev/null
+
+	return 0
+}
+
+# Only a directory whose description is complete is a candidate.  On a board
+# with a QCN9074 the description must also name target 26; if the QCN9074 was
+# not described, the service times out and boots the host path.
+select_nss_dir() {
+	local d
+
+	for d in /sys/kernel/debug/*.nss; do
+		[ -d "$d" ] || continue
+		[ -r "$d/wifili_ready" ] || continue
+		[ "$(cat "$d/wifili_ready" 2>/dev/null)" = 1 ] || continue
+		if [ "$qcn" = 1 ]; then
+			[ -r "$d/wifili" ] || continue
+			grep -Eq '(^|[[:space:]])target 26([[:space:]]|$)' "$d/wifili" 2>/dev/null || continue
+		fi
+		printf '%s\n' "$d"
+		return 0
+	done
+
+	return 1
+}
+
+offload_fail() {
+	log "$*"
+	set_mode host
+	set_stage failed
+	sync
+	log "offload failed; rebooting into the host path"
+	reboot -f
+	exit 1
+}
+
+start_offload() {
+	local dir i count last now
+
+	detect_qcn
+
+	# The firmware offloads the IPQ8074/IPQ6018 AHB radios and the QCN9074
+	# (target 26).  A QCN9074-only board sets no_ahb=1 and skips the AHB.
+	if [ "$no_ahb" = 1 ]; then
+		[ "$qcn" = 1 ] || {
+			log "no_ahb is set but there is no QCN9074; host path"
+			set_mode host
+			load_host
+			return
+		}
+	else
+		has_ahb || {
+			log "no AHB Wi-Fi radio to offload; host path"
+			set_mode host
+			load_host
+			return
+		}
+	fi
+
+	# Three attempts in ten minutes is a loop, not a bring-up.
+	read -r count last < "$ATTEMPTS" 2>/dev/null
+	case "$count" in ''|*[!0-9]*) count=0 ;; esac
+	case "$last" in ''|*[!0-9]*) last=0 ;; esac
+	now=$(date +%s)
+	if [ "$count" -ge 3 ] && [ $((now - last)) -lt 600 ]; then
+		log "too many offload attempts in 10 min; staying on the host path"
+		set_mode host
+		set_stage too-many-attempts
+		load_host
+		return
+	fi
+
+	# Disarm before anything is tried.  If this cannot be committed, do
+	# not touch the core at all.
+	if ! set_mode host; then
+		log "could not persist mode=host; not booting the core"
+		load_host
+		return
+	fi
+
+	printf '%s %s\n' "$((count + 1))" "$now" > "$ATTEMPTS"
+	sync
+	set_stage booting-offload || offload_fail "could not record the boot stage"
+	log "armed offload attempt $((count + 1)); mode is already host"
+
+	if ! load_offload; then
+		offload_fail "ath11k did not take the offload parameters"
+	fi
+
 	i=0
+	dir=
 	while [ $i -lt 60 ]; do
-		[ "$(dmesg | grep -c 'nss-wifi-drv: radio')" -gt 0 ] && break
+		dir=$(select_nss_dir) && break
+		dir=
 		sleep 1
 		i=$((i + 1))
 	done
-	sleep 3
+	[ -n "$dir" ] || offload_fail "the radios did not become ready"
 
-	echo 1 > "$dir/boot" || {
-		echo "the NSS core would not boot" > "$PENDING"
-		logger -t nss-wifi "the NSS core would not boot"
-		return 0
-	}
+	# Ready only gates the start; it is written after every description is
+	# in and before boot=1, so a partial probe cannot be started.
+	if ! echo 1 > /sys/module/nss_wifi_drv/parameters/start_gate 2>/dev/null; then
+		offload_fail "the driver has no start_gate parameter"
+	fi
+
+	if ! echo 1 > "$dir/boot"; then
+		offload_fail "the NSS core would not boot"
+	fi
 	cat "$dir/wifili_start" | logger -t nss-wifi
 
-	[ "$(cat "$dir/boot")" = "1" ] || {
-		echo "the NSS core did not stay up" > "$PENDING"
-		logger -t nss-wifi "the NSS core did not stay up"
-		return 0
-	}
+	[ "$(cat "$dir/boot" 2>/dev/null)" = 1 ] ||
+		offload_fail "the NSS core did not stay up"
+	grep -Eq '(^|[[:space:]])started 1([[:space:]]|$)' "$dir/wifili" 2>/dev/null ||
+		offload_fail "no wifili instance started"
+	if grep -Eq '(^|[[:space:]])started 0([[:space:]]|$)' "$dir/wifili" 2>/dev/null; then
+		offload_fail "not every wifili instance started"
+	fi
 
-	# Cleared only once the board has been up long enough to have survived
-	# the bring-up, not when the core reports itself started: a hang
-	# arrives after that, and clearing before it turns one bad boot into
-	# every boot.
-	(sleep 120
-	 rm -f "$PENDING"
-	 sync
-	 logger -t nss-wifi "bring-up survived, offload stays on for the next boot") &
+	# The system is still on the host path by design.  A debug image waits
+	# for a human; auto_promote is the opt-in for a soak.
+	set_stage ok
+	log "offload started on $dir; mode remains host"
+
+	if [ "$auto_promote" = 1 ]; then
+		(
+			sleep 120
+			if [ "$(cat "$dir/boot" 2>/dev/null)" = 1 ] &&
+			   [ -r "$dir/wifili" ] &&
+			   ! grep -Eq '(^|[[:space:]])started 0([[:space:]]|$)' "$dir/wifili" 2>/dev/null; then
+				set_mode offload
+				log "offload healthy after 120 s; promoted to mode=offload"
+			else
+				log "offload not healthy after 120 s; staying host"
+			fi
+		) &
+	else
+		log "run nss-wifi-promote to keep the offload across boots"
+	fi
+}
+
+start_service() {
+	local mode stage
+
+	debug=$(uci_get debug)
+	[ -n "$debug" ] || debug=1
+	auto_promote=$(uci_get auto_promote)
+	[ -n "$auto_promote" ] || auto_promote=0
+	no_ahb=$(uci_get no_ahb)
+	[ -n "$no_ahb" ] || no_ahb=0
+
+	mode=$(uci_get mode)
+	if [ -z "$mode" ]; then
+		# An old config carries only the on/off field.  It is not an
+		# instruction to try again: host is the default, and the
+		# operator has to arm deliberately.
+		mode=host
+		[ "$(uci_get offload)" = 1 ] &&
+			log "legacy offload=1 ignored; mode=host (run nss-wifi-arm)"
+	fi
+
+	stage=$(get_stage)
+
+	# Do not turn a running offload back into host by a service restart.
+	# The radios stay bound where they probed; reboot is the only switch.
+	if nss_running; then
+		log "NSS is already running; reboot to change the Wi-Fi data path"
+		return 0
+	fi
+
+	if [ -e "$LEGACY_PENDING" ]; then
+		rm -f "$LEGACY_PENDING"
+		log "legacy pending bring-up did not complete; host path"
+		set_mode host
+		set_stage incomplete
+		load_host
+		return 0
+	fi
+
+	case "$stage" in
+	incomplete|failed|too-many-attempts)
+		log "last offload stage is $stage; host path"
+		set_mode host
+		load_host
+		return 0
+		;;
+	esac
+
+	# The one invariant a hang must not be able to break: a previous boot
+	# entered the dangerous phase and did not leave it.  mode=host was
+	# already written before that phase, so never try again.
+	if [ "$stage" = booting-offload ] && [ "$mode" != offload ]; then
+		set_mode host
+		set_stage incomplete
+		log "previous offload attempt did not complete; host path"
+		load_host
+		return 0
+	fi
+
+	case "$mode" in
+	offload-once|offload)
+		start_offload
+		;;
+	*)
+		reset_attempts
+		load_host
+		;;
+	esac
 }
 
 stop_service() {

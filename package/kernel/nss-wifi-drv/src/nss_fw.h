@@ -54,6 +54,9 @@ enum nss_dynamic_interface_type {
 	NSS_DYNAMIC_INTERFACE_TYPE_PPPOE = 8,
 	NSS_DYNAMIC_INTERFACE_TYPE_VLAN = 17,
 	NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_INTERNAL = 19,
+	/* Radios on a PCIe card use the external wifili instances. */
+	NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL0 = 61,
+	NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL1 = 62,
 	NSS_DYNAMIC_INTERFACE_TYPE_GENERIC_REDIR_N2H = 32,
 	NSS_DYNAMIC_INTERFACE_TYPE_GENERIC_REDIR_H2N = 33,
 	NSS_DYNAMIC_INTERFACE_TYPE_WIFI_MESH_INNER = 70,
@@ -501,8 +504,12 @@ struct nss_ipv6_msg {
 /* The wifili node: the Wi-Fi SoC and its radios. */
 
 #define NSS_WIFILI_INIT_MSG			0
+/* Teardown of one wifili instance: stop, deinit its radios, reset it. */
+#define NSS_WIFILI_SOC_RESET_MSG		1
 #define NSS_WIFILI_PDEV_INIT_MSG		2
+#define NSS_WIFILI_PDEV_DEINIT_MSG		3
 #define NSS_WIFILI_START_MSG			4
+#define NSS_WIFILI_STOP_MSG			5
 #define NSS_WIFILI_PEER_CREATE_MSG		6
 #define NSS_WIFILI_PEER_DELETE_MSG		7
 #define NSS_WIFILI_STATS_MSG			10
@@ -539,12 +546,22 @@ struct nss_wifili_hal_srng_soc_msg {
 	u32 lmac_rings_start_id;
 };
 
+#define NSS_WIFILI_MAX_NUMBER_OF_PAGE_MSG	32
+#define NSS_WIFILI_MAX_NUMBER_OF_ADDTNL_SEG	64
+#define WIFILI_ADDTL_MEM_SEG_SET		0x2
+
+struct nss_wifili_tx_desc_addtnl_mem_msg {
+	u32 num_addtnl_addr;
+	u32 addtnl_memory_addr[NSS_WIFILI_MAX_NUMBER_OF_ADDTNL_SEG];
+	u32 addtnl_memory_size[NSS_WIFILI_MAX_NUMBER_OF_ADDTNL_SEG];
+};
+
 struct nss_wifili_tx_desc_init_msg {
 	u32 num_tx_desc;
 	u32 num_tx_desc_ext;
 	u32 num_pool;
-	u32 memory_addr[32];
-	u32 memory_size[32];
+	u32 memory_addr[NSS_WIFILI_MAX_NUMBER_OF_PAGE_MSG];
+	u32 memory_size[NSS_WIFILI_MAX_NUMBER_OF_PAGE_MSG];
 	u32 num_memaddr;
 	u32 ext_desc_page_num;
 	u32 num_tx_desc_2;
@@ -574,7 +591,7 @@ struct nss_wifili_init_msg {
 	struct nss_wifili_tx_desc_init_msg wtdim;
 	u32 target_type;
 	struct nss_wifili_rx_init_param wrip;
-	u32 rsvd[129];
+	struct nss_wifili_tx_desc_addtnl_mem_msg wtdam;
 	u32 tx_sw_internode_queue_size;
 };
 
@@ -587,6 +604,11 @@ struct nss_wifili_pdev_init_msg {
 	u32 target_pdev_id;
 	u8 scheme_id;
 	u8 reserved[3];
+};
+
+/* Names the radio's own id, not the dynamic node's interface number. */
+struct nss_wifili_pdev_deinit_msg {
+	u32 ifnum;
 };
 
 struct nss_wifili_peer_msg {
@@ -742,6 +764,7 @@ struct nss_wifili_msg {
 	union {
 		struct nss_wifili_init_msg init;
 		struct nss_wifili_pdev_init_msg pdevmsg;
+		struct nss_wifili_pdev_deinit_msg pdevdeinit;
 		struct nss_wifili_stats_sync_msg wlsoc_stats;
 		struct nss_wifili_stats_cfg_msg scm;
 		struct nss_wifili_radio_cfg_msg radiocfgmsg;

@@ -92,7 +92,15 @@ unsigned int nss_pool_ceiling(void);
 #define NSS_INTERFACE_VAP_BASE	200
 
 #define NSS_INTERFACE_WIFILI	203
+/* The external wifili instances, for radios outside the SoC (QCN9074). */
+#define NSS_INTERFACE_WIFILI_EXTERNAL0	215
+#define NSS_INTERFACE_WIFILI_EXTERNAL1	216
 #define NSS_INTERFACE_MAX	228
+
+/* One internal wifili instance and at most two external ones. */
+#define NSS_WIFI_MAX_SOCS	3
+/* The global radio table these instances share. */
+#define NSS_WIFI_MAX_RADIOS	6
 
 /* Interrupt causes, one GIC line each: there are no mask or status registers
  * on this SoC, so the cause is fixed when the line is claimed.
@@ -387,6 +395,8 @@ struct nss_core {
 	u32 faults;
 	unsigned long fault_window;
 	struct work_struct restart;
+	/* Halt-only path when fault_restart is off; the core is not booted. */
+	struct work_struct fault_stop;
 	/* Completed once no restart is pending; WLAN interfaces wait on it. */
 	struct completion resumed;
 	struct clk **aux_clks;
@@ -459,17 +469,16 @@ struct nss_core {
 int nss_meminfo_init(struct nss_core *core);
 void *nss_mem_alloc(struct nss_core *core, size_t size, u32 align,
 		    u32 *addr_out);
+void nss_mem_free(struct nss_core *core, void *cpu);
 void nss_mem_free_all(struct nss_core *core);
 int nss_wifi_pool_set(struct nss_core *core, u32 payloads);
 void nss_pbuf_pool_free(struct nss_core *core);
-void nss_core_stop(struct nss_core *core);
 void nss_core_fault(struct nss_core *core);
 void nss_core_resume(struct nss_core *core);
 int nss_rings_start(struct nss_core *core);
 void nss_iface_bind(struct nss_core *core);
 void nss_iface_unbind(struct nss_core *core);
 void nss_rings_stop(struct nss_core *core);
-void nss_rings_quiesce(struct nss_core *core);
 int nss_data_send(struct nss_core *core, struct sk_buff *skb, u32 if_num,
 		  u16 flags);
 void nss_doorbell(struct nss_core *core, u32 intr);
@@ -485,6 +494,9 @@ int nss_wifili_probe(struct nss_core *core, struct seq_file *s);
 int nss_wifili_start(struct seq_file *s);
 void nss_wifili_resume(struct nss_core *core);
 bool nss_wifili_reset(struct nss_core *core, bool started);
+void nss_wifili_socs_print(struct seq_file *s);
+bool nss_wifili_ready(void);
+void nss_wifili_stop_all(void);
 int nss_wifili_tx(struct seq_file *s);
 void nss_msg_census(const struct nss_cmn_msg *ncm);
 void nss_msg_census_print(struct seq_file *s);
@@ -505,9 +517,10 @@ int nss_wifili_vdev_cmd(struct nss_core *core, int if_num, u32 cmd, u32 value);
 
 struct nss_wifi_mesh_ops;
 
-bool nss_mesh_probe(struct nss_core *core);
+bool nss_mesh_probe(struct nss_core *core, u32 if_num);
 int nss_mesh_add(struct nss_core *core, struct net_device *dev, int link,
-		 const u8 *mac, const struct nss_wifi_mesh_ops *ops, void *priv);
+		 const u8 *mac, const struct nss_wifi_mesh_ops *ops, void *priv,
+		 int soc_id);
 int nss_mesh_attach(struct nss_core *core, int link);
 void nss_mesh_stop(struct nss_core *core, int link);
 void nss_mesh_del(struct nss_core *core, int link);

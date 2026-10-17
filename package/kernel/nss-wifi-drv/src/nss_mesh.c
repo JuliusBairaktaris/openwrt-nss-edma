@@ -37,6 +37,7 @@
 struct nss_mesh {
 	struct nss_core *core;
 	struct net_device *dev;
+	int soc_id;
 	const struct nss_wifi_mesh_ops *ops;	/* NULL: slot free */
 	void *priv;
 	int link;
@@ -139,7 +140,7 @@ static void nss_mesh_node_free(struct nss_core *core, int if_num, u32 type)
 }
 
 /* Lines that cannot forward a mesh refuse to say so. */
-bool nss_mesh_probe(struct nss_core *core)
+bool nss_mesh_probe(struct nss_core *core, u32 if_num)
 {
 	struct nss_wifili_msg *m __free(kfree) = kzalloc(sizeof(*m),
 							 GFP_KERNEL);
@@ -148,7 +149,7 @@ bool nss_mesh_probe(struct nss_core *core)
 	if (!m)
 		return false;
 
-	m->cm.interface = NSS_INTERFACE_WIFILI;
+	m->cm.interface = if_num;
 	m->cm.type = NSS_WIFILI_SEND_MESH_CAPABILITY_INFO;
 	ret = nss_msg_send(core, m, offsetof(struct nss_wifili_msg, msg) +
 				    sizeof(m->msg.cap_info));
@@ -195,7 +196,8 @@ static int nss_mesh_open(struct nss_mesh *m, u32 type)
 }
 
 int nss_mesh_add(struct nss_core *core, struct net_device *dev, int link,
-		 const u8 *mac, const struct nss_wifi_mesh_ops *ops, void *priv)
+		 const u8 *mac, const struct nss_wifi_mesh_ops *ops, void *priv,
+		 int soc_id)
 {
 	struct nss_mesh *m = NULL;
 	int i, ret = 0;
@@ -211,6 +213,7 @@ int nss_mesh_add(struct nss_core *core, struct net_device *dev, int link,
 	memset(m, 0, sizeof(*m));
 	m->core = core;
 	m->dev = dev;
+	m->soc_id = soc_id;
 	m->link = link;
 	m->ttl = NSS_MESH_TTL;
 	m->refresh = NSS_MESH_REFRESH_MS;

@@ -1,0 +1,23 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Promote an offload that has already survived a boot with stage=ok.
+
+set -u
+
+STAGE=/etc/nss-wifi.stage
+
+if [ "$(cat "$STAGE" 2>/dev/null)" != ok ]; then
+	echo "nss-wifi: last bring-up is not ok; run nss-wifi-arm first" >&2
+	exit 1
+fi
+
+if ! uci -q set nss-wifi.general.mode=offload ||
+   ! uci -q set nss-wifi.general.auto_promote=1 ||
+   ! uci -q commit nss-wifi; then
+	echo "nss-wifi: could not persist mode=offload" >&2
+	exit 1
+fi
+
+sync
+logger -t nss-wifi "offload promoted; mode=offload takes effect on the next boot"
+echo "nss-wifi: offload promoted; mode=offload on the next boot"

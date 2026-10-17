@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=nss-wifi-drv
-PKG_RELEASE:=1
+PKG_RELEASE:=3
 PKG_LICENSE:=GPL-2.0-only
 
 include $(INCLUDE_DIR)/package.mk
@@ -26,10 +26,13 @@ define KernelPackage/nss-wifi-drv/description
   data plane runs on the NSS cores instead of the host. Carries only what
   a Wi-Fi offload needs: the wired ports belong to qca_edma and qca_ppe.
 
-  The module does not autoload: the nss-wifi service loads it and boots a
-  core when nss-wifi.general.offload is 1, the default. The wired ports
-  never depend on it. nss-wifi.general.firmware picks the firmware line,
-  12.5 by default or 11.4 for 802.11s mesh.
+  The module does not autoload and the default mode is host: the nss-wifi
+  service loads the drivers but never boots a core.  `nss-wifi-arm` arms one
+  offload-once boot; `nss-wifi-promote` keeps a successful bring-up across
+  boots.  The wired ports never depend on it. nss-wifi.general.firmware picks
+  the firmware line, 12.5 by default or 11.4 for 802.11s mesh.  With
+  CONFIG_ATH11K_NSS_WIFI, ath11k_ahb/ath11k_pci do not autoload; the service
+  loads them, so disabling it requires a manual modprobe.
 endef
 
 define Build/Prepare
@@ -50,9 +53,11 @@ define Build/InstallDev
 endef
 
 define KernelPackage/nss-wifi-drv/install
-	$(INSTALL_DIR) $(1)/etc/config $(1)/etc/init.d
+	$(INSTALL_DIR) $(1)/etc/config $(1)/etc/init.d $(1)/usr/sbin
 	$(INSTALL_CONF) ./files/nss-wifi.config $(1)/etc/config/nss-wifi
 	$(INSTALL_BIN) ./files/nss-wifi.init $(1)/etc/init.d/nss-wifi
+	$(INSTALL_BIN) ./files/nss-wifi-arm $(1)/usr/sbin/nss-wifi-arm
+	$(INSTALL_BIN) ./files/nss-wifi-promote $(1)/usr/sbin/nss-wifi-promote
 	$(INSTALL_DIR) $(1)/etc/uci-defaults $(1)/usr/share/nss-wifi
 	$(INSTALL_BIN) ./files/nss-wifi.uci-defaults $(1)/etc/uci-defaults/90-nss-wifi-flowtable
 	$(INSTALL_BIN) ./files/nss-wifi.flowtable $(1)/usr/share/nss-wifi/flowtable.sh

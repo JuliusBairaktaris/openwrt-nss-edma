@@ -151,7 +151,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  		return;
  	}
  
-@@ -6881,6 +6926,56 @@ static int ath11k_mac_setup_vdev_create_
+@@ -6881,6 +6926,57 @@ static int ath11k_mac_setup_vdev_create_
  	return 0;
  }
  
@@ -189,13 +189,14 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
 +	if (!wdev || !wdev->netdev)
 +		return;
 +
-+	ret = nss_wifi_vdev_register(wdev->netdev, ar->pdev_idx, arvif->vdev_id,
-+				     vif->addr,
-+				     vif->type == NL80211_IFTYPE_AP,
-+				     ath11k_nss_vdev_mode(ar->ab, vif,
-+							  IEEE80211_OFFLOAD_ENCAP_ENABLED),
-+				     ath11k_nss_vdev_mode(ar->ab, vif,
-+							  IEEE80211_OFFLOAD_DECAP_ENABLED));
++	ret = nss_wifi_vdev_register_ex(ar->ab->nss_soc_id, wdev->netdev,
++					ar->nss_radio_idx, arvif->vdev_id,
++					vif->addr,
++					vif->type == NL80211_IFTYPE_AP,
++					ath11k_nss_vdev_mode(ar->ab, vif,
++							     IEEE80211_OFFLOAD_ENCAP_ENABLED),
++					ath11k_nss_vdev_mode(ar->ab, vif,
++							     IEEE80211_OFFLOAD_DECAP_ENABLED));
 +	if (ret < 0) {
 +		ath11k_warn(ar->ab, "failed to give vdev %d to the NSS firmware: %d\n",
 +			    arvif->vdev_id, ret);

@@ -73,7 +73,7 @@ struct nss_wifi_soc {
 	u16 rx_buf_len;
 	u8 num_tcl;
 	u8 num_reo;
-	/* Radios that follow with nss_wifi_pdev_register(). */
+	/* Radios that follow a pdev registration. */
 	u8 num_pdevs;
 	struct nss_wifi_ring tcl[NSS_WIFI_MAX_TCL_RINGS];
 	struct nss_wifi_ring txcomp[NSS_WIFI_MAX_TCL_RINGS];
@@ -113,6 +113,19 @@ struct nss_wifi_soc {
 	 */
 	void (*peer_stats)(void *priv, u16 peer_id,
 			   const struct nss_wifi_peer_stats *st);
+
+	/*
+	 * The wifili instance this description belongs to: 203 with dynamic
+	 * node type 19 for radios inside the SoC, 215/61 and 216/62 for
+	 * external (PCIe) cards. Zero asks for the internal pair, which is
+	 * what a caller that does not know about these fields sends.
+	 *
+	 * Appended rather than inserted so the offsets of the description
+	 * above do not move; the driver and its callers are still built from
+	 * this header together.
+	 */
+	u32 if_num;
+	u32 dyn_type;
 };
 
 /*
@@ -168,50 +181,104 @@ struct nss_wifi_mesh_ops {
 };
 
 #if IS_REACHABLE(CONFIG_NSS_WIFI_DRV)
-int nss_wifi_soc_register(const struct nss_wifi_soc *soc);
-void nss_wifi_soc_unregister(void);
-int nss_wifi_pdev_register(const struct nss_wifi_pdev *pdev);
-int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
-			   const u8 *mac, bool ap, u8 encap, u8 decap);
+/*
+ * The instance-aware form of the registration and per-object calls.
+ *
+ * soc_register_ex returns the instance id: 0 is the internal instance, 1 and
+ * 2 the two external ones.  A zero if_num maps to the internal 203; a zero
+ * dyn_type is derived from if_num (203 -> 19, 215 -> 61, 216 -> 62).
+ * Otherwise if_num 203/215/216 must be paired with dyn_type 19/61/62, and
+ * the same interface or dynamic type may not be registered twice.  The
+ * description is kept, not started.
+ *
+ * pdev_register_ex returns the radio's index in the driver's global radio
+ * table (0..5).  vdev_register_ex() and mesh_register_ex() take that global
+ * index as their radio argument; peer_create_ex()/security_ex() and
+ * authorize_ex() take the soc id, which decides the interface their messages
+ * carry.
+ *
+ * soc_unregister_ex only withdraws that instance; it does not stop the NSS
+ * core.
+ *
+ * The older calls below stay as internal-instance wrappers for a caller that
+ * predates them; they still return 0 on success even when the underlying id
+ * is nonzero, because their callers test the return as an error.
+ */
+int nss_wifi_soc_register_ex(const struct nss_wifi_soc *soc);
+void nss_wifi_soc_unregister_ex(int soc_id);
+int nss_wifi_pdev_register_ex(int soc_id, const struct nss_wifi_pdev *pdev);
+int nss_wifi_vdev_register_ex(int soc_id, struct net_device *dev, u8 radio,
+			      u32 vdev_id, const u8 *mac, bool ap,
+			      u8 encap, u8 decap);
+int nss_wifi_peer_create_ex(int soc_id, u32 vdev_id, const u8 *mac,
+			    u16 peer_id, u16 hw_ast_idx, u32 tx_ast_hash);
+int nss_wifi_peer_security_ex(int soc_id, u16 peer_id, bool group,
+			      u32 cipher, const u8 *mic_key);
+int nss_wifi_peer_authorize_ex(int soc_id, u16 peer_id);
+int nss_wifi_mesh_register_ex(int soc_id, struct net_device *dev, u8 radio,
+			      u32 vdev_id, const u8 *mac, u8 mode,
+			      const struct nss_wifi_mesh_ops *ops, void *priv);
+
 void nss_wifi_vdev_unregister(struct net_device *dev);
 int nss_wifi_vdev_tx(int if_num, struct sk_buff *skb);
-int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
-			 u16 hw_ast_idx, u32 tx_ast_hash);
-void nss_wifi_peer_delete(u32 vdev_id, const u8 *mac, u16 peer_id);
+void nss_wifi_peer_delete_ex(int soc_id, u32 vdev_id, const u8 *mac,
+			     u16 peer_id);
 int nss_wifi_vdev_security(int if_num, u32 cipher);
 int nss_wifi_vdev_ap_isolate(int if_num, bool isolate);
-int nss_wifi_peer_security(u16 peer_id, bool group, u32 cipher,
-			   const u8 *mic_key);
-int nss_wifi_peer_authorize(u16 peer_id);
 int nss_flow_setup_block(struct net_device *dev, struct flow_block_offload *f);
-int nss_wifi_mesh_register(struct net_device *dev, u8 radio, u32 vdev_id,
-			   const u8 *mac, u8 mode,
-			   const struct nss_wifi_mesh_ops *ops, void *priv);
 int nss_wifi_mesh_path(int if_num, enum nss_wifi_mesh_cmd cmd,
 		       const struct nss_wifi_mesh_path *p);
 int nss_wifi_mesh_config(int if_num, u8 ttl, u32 refresh_ms, bool forward);
 #else
-static inline int nss_wifi_soc_register(const struct nss_wifi_soc *soc)
+static inline int nss_wifi_soc_register_ex(const struct nss_wifi_soc *soc)
 {
 	return -ENODEV;
 }
 
-static inline void nss_wifi_soc_unregister(void)
+static inline void nss_wifi_soc_unregister_ex(int soc_id)
 {
 }
 
-static inline int nss_wifi_pdev_register(const struct nss_wifi_pdev *pdev)
+static inline int nss_wifi_pdev_register_ex(int soc_id,
+					    const struct nss_wifi_pdev *pdev)
+{
+	return -ENODEV;
+}
+static inline int nss_wifi_vdev_register_ex(int soc_id,
+					    struct net_device *dev, u8 radio,
+					    u32 vdev_id, const u8 *mac,
+					    bool ap, u8 encap, u8 decap)
 {
 	return -ENODEV;
 }
 
-static inline int nss_wifi_vdev_register(struct net_device *dev, u8 radio,
-					 u32 vdev_id, const u8 *mac, bool ap,
-					 u8 encap, u8 decap)
+static inline int nss_wifi_peer_create_ex(int soc_id, u32 vdev_id,
+					  const u8 *mac, u16 peer_id,
+					  u16 hw_ast_idx, u32 tx_ast_hash)
 {
 	return -ENODEV;
 }
 
+static inline int nss_wifi_peer_security_ex(int soc_id, u16 peer_id,
+					    bool group, u32 cipher,
+					    const u8 *mic_key)
+{
+	return -ENODEV;
+}
+
+static inline int nss_wifi_peer_authorize_ex(int soc_id, u16 peer_id)
+{
+	return -ENODEV;
+}
+
+static inline int nss_wifi_mesh_register_ex(int soc_id, struct net_device *dev,
+					    u8 radio, u32 vdev_id,
+					    const u8 *mac, u8 mode,
+					    const struct nss_wifi_mesh_ops *ops,
+					    void *priv)
+{
+	return -ENODEV;
+}
 static inline void nss_wifi_vdev_unregister(struct net_device *dev)
 {
 }
@@ -220,18 +287,10 @@ static inline int nss_wifi_vdev_tx(int if_num, struct sk_buff *skb)
 {
 	return -ENODEV;
 }
-
-static inline int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
-				       u16 hw_ast_idx, u32 tx_ast_hash)
-{
-	return -ENODEV;
-}
-
-static inline void nss_wifi_peer_delete(u32 vdev_id, const u8 *mac,
-					u16 peer_id)
+static inline void nss_wifi_peer_delete_ex(int soc_id, u32 vdev_id,
+					   const u8 *mac, u16 peer_id)
 {
 }
-
 static inline int nss_wifi_vdev_security(int if_num, u32 cipher)
 {
 	return -ENODEV;
@@ -241,32 +300,11 @@ static inline int nss_wifi_vdev_ap_isolate(int if_num, bool isolate)
 {
 	return -ENODEV;
 }
-
-static inline int nss_wifi_peer_security(u16 peer_id, bool group, u32 cipher,
-					 const u8 *mic_key)
-{
-	return -ENODEV;
-}
-
-static inline int nss_wifi_peer_authorize(u16 peer_id)
-{
-	return -ENODEV;
-}
-
 static inline int nss_flow_setup_block(struct net_device *dev,
 				       struct flow_block_offload *f)
 {
 	return -EOPNOTSUPP;
 }
-
-static inline int nss_wifi_mesh_register(struct net_device *dev, u8 radio,
-					 u32 vdev_id, const u8 *mac, u8 mode,
-					 const struct nss_wifi_mesh_ops *ops,
-					 void *priv)
-{
-	return -EOPNOTSUPP;
-}
-
 static inline int nss_wifi_mesh_path(int if_num, enum nss_wifi_mesh_cmd cmd,
 				     const struct nss_wifi_mesh_path *p)
 {

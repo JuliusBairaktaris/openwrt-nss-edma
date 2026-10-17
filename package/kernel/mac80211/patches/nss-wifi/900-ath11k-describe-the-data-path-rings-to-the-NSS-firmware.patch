@@ -27,16 +27,16 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  #include "dp_rx.h"
  #include "peer.h"
  
-+#include <linux/platform_device.h>
 +#include <linux/soc/qcom/nss_wifi.h>
 +
 +#define ATH11K_NSS_TARGET_IPQ8074	24
 +#define ATH11K_NSS_TARGET_IPQ6018	25
++#define ATH11K_NSS_TARGET_QCN9074	26
 +
  static void ath11k_dp_htt_htc_tx_complete(struct ath11k_base *ab,
  					  struct sk_buff *skb)
  {
-@@ -869,6 +875,173 @@ done:
+@@ -869,6 +875,174 @@ done:
  }
  EXPORT_SYMBOL(ath11k_dp_service_srng);
  
@@ -60,8 +60,7 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 + */
 +
 +/* The target as the firmware enumerates it, which is its own numbering and
-+ * not this driver's hardware revision. The NSS firmware drives only the
-+ * radios inside the SoC.
++ * not this driver's hardware revision.
 + */
 +static u32 ath11k_nss_target(struct ath11k_base *ab)
 +{
@@ -70,16 +69,19 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +		return ATH11K_NSS_TARGET_IPQ8074;
 +	case ATH11K_HW_IPQ6018_HW10:
 +		return ATH11K_NSS_TARGET_IPQ6018;
++	case ATH11K_HW_QCN9074_HW10:
++		return ATH11K_NSS_TARGET_QCN9074;
 +	default:
 +		return 0;
 +	}
 +}
 +
 +static void ath11k_nss_wifi_ring(struct nss_wifi_ring *r,
-+				 struct ath11k_base *ab, u32 ring_id,
-+				 u32 reg_base)
++				 struct ath11k_base *ab, u32 ring_id)
 +{
 +	struct hal_srng *srng = &ab->hal.srng_list[ring_id];
++	u32 hwreg;
++	int i;
 +
 +	r->id = srng->ring_id;
 +	r->dir = srng->ring_dir;
@@ -87,8 +89,13 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +	r->entry_size = srng->entry_size;
 +	r->flags = srng->flags;
 +	r->base = srng->ring_base_paddr;
-+	r->hwreg[0] = reg_base + srng->hwreg_base[0];
-+	r->hwreg[1] = reg_base + srng->hwreg_base[1];
++
++	for (i = 0; i < 2; i++) {
++		hwreg = srng->hwreg_base[i];
++		if (!(srng->flags & HAL_SRNG_FLAGS_LMAC_RING))
++			hwreg = ath11k_hif_get_window_offset(ab, hwreg);
++		r->hwreg[i] = (u32)ab->mem_pa + hwreg;
++	}
 +}
 +
 +/* ath11k's own hw-restart. The NSS firmware's buffers sit in these rings, so
@@ -105,25 +112,25 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +{
 +	struct ath11k_dp *dp = &ab->dp;
 +	struct nss_wifi_soc *soc;
-+	struct resource *res;
-+	u32 reg_base;
 +	int i;
 +
++	ab->nss_soc_id = -1;
++
++	if (!ab->nss_offload)
++		return;
 +	if (!ath11k_nss_target(ab))
 +		return;
-+
-+	res = platform_get_resource(to_platform_device(ab->dev),
-+				    IORESOURCE_MEM, 0);
-+	if (!res)
-+		return;
-+
-+	reg_base = res->start;
 +
 +	soc = kzalloc(sizeof(*soc), GFP_KERNEL);
 +	if (!soc)
 +		return;
 +
-+	soc->dev_base = reg_base;
++	/* Both buses record the physical base of the register window; taking
++	 * it from the platform device would fail on PCI and oops on the host
++	 * path, before the NSS driver has a chance to describe anything.
++	 */
++	soc->dev_base = (u32)ab->mem_pa;
++	soc->if_num = 0;
 +	soc->shadow_rd = ab->hal.rdp.paddr;
 +	soc->shadow_wr = ab->hal.wrp.paddr;
 +	soc->lmac_ring_start = HAL_SRNG_RING_ID_LMAC1_ID_START;
@@ -138,19 +145,17 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +
 +	for (i = 0; i < soc->num_tcl; i++) {
 +		ath11k_nss_wifi_ring(&soc->tcl[i], ab,
-+				     dp->tx_ring[i].tcl_data_ring.ring_id,
-+				     reg_base);
++				     dp->tx_ring[i].tcl_data_ring.ring_id);
 +		ath11k_nss_wifi_ring(&soc->txcomp[i], ab,
-+				     dp->tx_ring[i].tcl_comp_ring.ring_id,
-+				     reg_base);
++				     dp->tx_ring[i].tcl_comp_ring.ring_id);
 +	}
 +
 +	for (i = 0; i < soc->num_reo; i++)
 +		ath11k_nss_wifi_ring(&soc->reo_dest[i], ab,
-+				     dp->reo_dst_ring[i].ring_id, reg_base);
++				     dp->reo_dst_ring[i].ring_id);
 +
 +	ath11k_nss_wifi_ring(&soc->reo_reinject, ab,
-+			     dp->reo_reinject_ring.ring_id, reg_base);
++			     dp->reo_reinject_ring.ring_id);
 +	/* Not the release ring this driver reaps. The firmware fills the
 +	 * receive-DMA ring from its own pool and names those buffers with its
 +	 * own buffer manager, and the buffer manager is what decides which
@@ -160,12 +165,12 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +	 * a manager id is the release ring's number plus the first software
 +	 * manager, not the number itself.
 +	 */
-+	ath11k_nss_wifi_ring(&soc->rx_rel, ab, dp->rx_rel_ring.ring_id,
-+			     reg_base);
++	ath11k_nss_wifi_ring(&soc->rx_rel, ab, dp->rx_rel_ring.ring_id);
 +	ath11k_nss_wifi_ring(&soc->reo_exception, ab,
-+			     dp->reo_except_ring.ring_id, reg_base);
++			     dp->reo_except_ring.ring_id);
 +
-+	if (nss_wifi_soc_register(soc))
++	ab->nss_soc_id = nss_wifi_soc_register_ex(soc);
++	if (ab->nss_soc_id < 0)
 +		ath11k_warn(ab, "NSS firmware would not take the ring description\n");
 +
 +	kfree(soc);
@@ -176,19 +181,14 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +{
 +	struct ath11k *ar = ab->pdevs[id].ar;
 +	struct nss_wifi_pdev pdev = {};
-+	struct resource *res;
 +
-+	if (!ath11k_nss_target(ab))
++	if (!ab->nss_offload)
 +		return;
-+
-+	res = platform_get_resource(to_platform_device(ab->dev),
-+				    IORESOURCE_MEM, 0);
-+	if (!res)
++	if (!ath11k_nss_target(ab) || ab->nss_soc_id < 0)
 +		return;
 +
 +	ath11k_nss_wifi_ring(&pdev.rxdma, ab,
-+			     ar->dp.rx_refill_buf_ring.refill_buf_ring.ring_id,
-+			     res->start);
++			     ar->dp.rx_refill_buf_ring.refill_buf_ring.ring_id);
 +	pdev.radio_id = id;
 +	/* The hardware MAC this radio's address-search table belongs to. The
 +	 * transmit command carries it, and the search for a frame's peer runs
@@ -203,7 +203,8 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +	pdev.num_rx_swdesc = 3 * DP_RXDMA_BUF_RING_SIZE;
 +	pdev.target_pdev_id = ar->pdev->pdev_id;
 +
-+	if (nss_wifi_pdev_register(&pdev))
++	ar->nss_radio_idx = nss_wifi_pdev_register_ex(ab->nss_soc_id, &pdev);
++	if (ar->nss_radio_idx < 0)
 +		ath11k_warn(ab, "NSS firmware would not take radio %d\n", id);
 +}
 +
@@ -234,13 +235,51 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  	}
  
  	return 0;
-@@ -1025,6 +1208,9 @@ void ath11k_dp_free(struct ath11k_base *
+@@ -1025,6 +1208,10 @@ void ath11k_dp_free(struct ath11k_base *
  	struct ath11k_dp *dp = &ab->dp;
  	int i;
  
-+	if (ath11k_nss_target(ab))
-+		nss_wifi_soc_unregister();
++	if (ab->nss_soc_id >= 0)
++		nss_wifi_soc_unregister_ex(ab->nss_soc_id);
++	ab->nss_soc_id = -1;
 +
  	ath11k_dp_link_desc_cleanup(ab, dp->link_desc_banks,
  				    HAL_WBM_IDLE_LINK, &dp->wbm_idle_ring);
  
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -728,5 +728,7 @@ struct ath11k {
+ 	u8 pdev_idx;
+ 	u8 lmac_id;
++	/* Index in the driver's global radio table, -1 if not registered. */
++	int nss_radio_idx;
+ 
+ 	struct completion peer_assoc_done;
+ 	struct completion peer_delete_done;
+@@ -935,5 +937,7 @@ struct ath11k_base {
+ 	struct completion fw_ready;
+ 	int num_radios;
++	/* Instance id from nss_wifi_soc_register_ex(), -1 if none. */
++	int nss_soc_id;
+ 	/* HW channel counters frequency value in hertz common to all MACs */
+ 	u32 cc_freq_hz;
+ 
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -2880,6 +2880,7 @@ struct ath11k_base *ath11k_core_alloc(struct device *dev, size_t priv_size,
+ 	init_completion(&ab->restart_completed);
+ 
+ 	ab->dev = dev;
++	ab->nss_soc_id = -1;
+ 	ab->hif.bus = bus;
+ 
+ 	return ab;
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -10803,5 +10803,6 @@ int ath11k_mac_allocate(struct ath11k_base *ab)
+ 		ar->pdev_idx = i;
+ 		ar->lmac_id = ath11k_hw_get_mac_from_pdev_id(&ab->hw_params, i);
++		ar->nss_radio_idx = -1;
+ 
+ 		ar->wmi = &ab->wmi_ab.wmi[i];
+ 		/* FIXME wmi[0] is already initialized during attach,
